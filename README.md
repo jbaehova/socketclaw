@@ -1,171 +1,198 @@
 # SocketClaw
 
-**Real-time network monitoring & autonomous threat response agent**
+SocketClaw is a local-first terminal security operations cockpit. It watches
+configured hosts and logs, explains why each observation is important, stores
+the evidence in SQLite, and uses one explicitly selected OpenRouter model only
+when deeper incident analysis is requested.
 
-SocketClaw continuously monitors your network via ICMP, TCP, and log probes — then feeds every event through a LangGraph pipeline powered by Claude to classify, investigate, and respond to threats automatically.
+![SocketClaw overview](docs/screenshots/overview.svg)
 
----
+## What it does
 
-## Features
+- Runs cross-platform ping checks, bounded TCP port scans, and rotation-aware
+  log watchers in one resilient process.
+- Scores every event locally with visible detection signals; monitoring keeps
+  working without an API key or network access.
+- Presents a keyboard-first Textual interface for posture, events, hosts,
+  investigations, and settings.
+- Persists events, model usage, costs, failures, and response proposals in a
+  local SQLite database with WAL and foreign keys enabled.
+- Exports redacted Markdown or JSON incident records.
+- Connects only to OpenRouter for AI investigation. There is no Anthropic,
+  LangChain, browser dashboard, or background WebSocket service.
 
-- **Multi-probe monitoring** — ICMP ping (raw socket + subprocess fallback), async TCP port scanning, and log file watching with regex pattern matching
-- **Autonomous agent pipeline** — LangGraph StateGraph classifies events as `normal / suspicious / critical` and routes them through deep analysis, decision, and response nodes
-- **Real-time dashboard** — Gradio UI connected over WebSocket shows live event feed, agent decisions, and per-host status
-- **Custom binary protocol** — multiplexed WebSocket frames with CRC32 checksum verification over `monitoring`, `agent`, and `control` channels
-- **Persistent storage** — SQLAlchemy + aiosqlite for event logs and agent decision history
+## Requirements
 
----
+- Python 3.11 or newer
+- A terminal with color support
+- The system `ping` command for reachability checks
+- An OpenRouter API key for AI investigations (monitoring itself works without
+  one)
 
-## Architecture
+## Install
 
-```
-Probes (ICMP · TCP · Log)
-        │  asyncio.Queue
-        ▼
- WebSocket Server  ──broadcast──▶  Clients / Dashboard
-        │
-        │  agent_callback
-        ▼
-  LangGraph Pipeline
-  ┌─────────────────────────────────────┐
-  │  classify_event  (Claude)           │
-  │      ├─ normal   → log_pass         │
-  │      ├─ suspicious → deep_analyze   │
-  │      │               → decide_action│
-  │      │               → execute      │
-  │      └─ critical → emergency_response│
-  │                    → notify         │
-  └─────────────────────────────────────┘
-        │
-        ▼
-   SQLite (events + decisions)
-```
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Agent pipeline | LangGraph · Claude API (claude-sonnet-4) |
-| Network tools | LangChain `@tool` — ping, port_scan, whois, traceroute, block_ip |
-| Transport | WebSocket (`websockets`) · asyncio |
-| Probes | Raw ICMP socket · async TCP connect · log tail |
-| Storage | SQLAlchemy 2.0 · aiosqlite |
-| Dashboard | Gradio 5 |
-| Runtime | Python 3.10 · uv |
-
----
-
-## Quick Start
-
-### 1. Install dependencies
+From a checkout, the recommended isolated installation is:
 
 ```bash
-uv sync
+uv tool install .
 ```
 
-### 2. Set environment variables
+Or with pipx:
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-export NETAGENT_PROBE_TARGETS="8.8.8.8,1.1.1.1"   # comma-separated hosts
+pipx install .
 ```
 
-### 3. Run
+For development:
 
 ```bash
-# Start the monitoring server (probes + agent + WebSocket)
-python main.py server
-
-# Launch the real-time dashboard (separate terminal)
-python main.py dashboard
-
-# Run an attack simulation
-python main.py simulate
+uv sync --dev
+uv run socketclaw
 ```
 
-Dashboard is available at `http://localhost:7860`
+## First run
 
----
+Launch SocketClaw:
 
-## Configuration
+```bash
+socketclaw
+```
 
-All settings are controlled via environment variables.
+The five-step onboarding flow:
 
-| Variable | Default | Description |
+1. explains the local file boundary;
+2. validates an OpenRouter key without making a paid model request;
+3. selects one of the three curated model contracts;
+4. configures initial targets and intervals;
+5. starts the local monitor.
+
+The API key field is masked. The key is stored as inert data in
+`~/.socketclaw/.env` with mode `0600`; the file is never sourced as shell code.
+
+## Curated OpenRouter models
+
+| UI preset | OpenRouter model ID | Fixed reasoning effort |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | Anthropic API key (required) |
-| `NETAGENT_HOST` | `0.0.0.0` | WebSocket server bind address |
-| `NETAGENT_PORT` | `8765` | WebSocket server port |
-| `NETAGENT_PROBE_TARGETS` | `8.8.8.8` | Comma-separated monitoring targets |
-| `NETAGENT_PING_INTERVAL` | `5` | Ping probe interval (seconds) |
-| `NETAGENT_SCAN_INTERVAL` | `60` | Port scan interval (seconds) |
-| `NETAGENT_LOG_PATH` | `/var/log/system.log` | Log file to watch |
-| `NETAGENT_DB_PATH` | `./netagent.db` | SQLite database path |
-| `NETAGENT_WINDOW_SIZE` | `50` | Sliding window event buffer size |
-| `NETAGENT_MODEL` | `claude-sonnet-4-20250514` | Claude model override |
-| `NETAGENT_DASHBOARD_PORT` | `7860` | Gradio dashboard port |
+| GPT-5.6 Terra | `openai/gpt-5.6-terra` | `high` |
+| Kimi K3 | `moonshotai/kimi-k3` | `max` |
+| Qwen3.7 Max | `qwen/qwen3.7-max` | `high` |
 
----
+SocketClaw does not silently fall back to another provider or model. A failed
+request becomes a durable, retryable investigation failure.
 
-## Project Structure
+## Keyboard reference
 
-```
-socketclaw/
-├── main.py                  # CLI entrypoint
-├── src/
-│   ├── protocol/            # Custom frame protocol (constants, CRC32 encoding)
-│   ├── network/             # WebSocket server, client, multiplexer
-│   ├── probes/              # BaseProbe, PingProbe, PortScanProbe, LogWatcherProbe
-│   ├── agent/               # LangGraph graph, nodes, tools, state
-│   ├── storage/             # SQLAlchemy models + async repository
-│   └── ui/                  # Gradio dashboard
-├── scripts/
-│   ├── run_server.py        # Server entrypoint
-│   ├── run_dashboard.py     # Dashboard launcher
-│   └── simulate_attack.py   # Attack scenario simulator
-└── tests/                   # pytest suite
-```
-
----
-
-## Attack Simulation
-
-The built-in simulator injects realistic attack scenarios into the pipeline:
-
-```bash
-# Run all scenarios
-python main.py simulate
-
-# Run a specific scenario
-python scripts/simulate_attack.py --scenario port_flood
-python scripts/simulate_attack.py --scenario brute_force
-python scripts/simulate_attack.py --scenario suspicious_ip
-python scripts/simulate_attack.py --scenario gradual_probe
-```
-
-| Scenario | Description |
+| Key | Action |
 |---|---|
-| `port_flood` | 12 ports opened simultaneously → critical |
-| `suspicious_ip` | Access from known malicious IP ranges |
-| `brute_force` | Escalating SSH login failures → critical |
-| `gradual_probe` | Slow reconnaissance, 1–2 ports at a time |
+| `1`–`5` | Open Overview, Events, Hosts, Investigations, or Settings |
+| `Space` | Pause or resume scheduled monitoring |
+| `C` / `A` | Show critical events / clear event filters |
+| `I` | Investigate the selected event |
+| `E` | Export the selected incident as Markdown |
+| `R` | Run the context action (host ping or investigation retry) |
+| `Ctrl+P` | Open the Textual command palette |
+| `?` | Show keyboard help |
+| `Q` | Stop monitoring and quit cleanly |
 
----
+## Response safety
 
-## Tests
+The default response mode is `approval`. Model output can create a response
+proposal, but it cannot directly change the machine:
 
-```bash
-uv run pytest tests/ -v
+- a proposal records the exact action, target, reason, and reversibility;
+- simulation and approval are explicit, durable state transitions;
+- approval requires a confirmation modal;
+- loopback, multicast, unspecified, broadcast-like, and configured watch
+  targets are rejected as block targets;
+- this release does **not** ship a firewall mutation adapter. “Approved” means
+  reviewed and recorded, not executed on the host.
+
+`simulation` is the safest mode. `automatic` is visible as an advanced opt-in
+configuration value, but it still cannot bypass the address safety policy or
+invent a platform mutation adapter.
+
+## Local files
+
+The default application home is `~/.socketclaw`. Override it with
+`SOCKETCLAW_HOME` for testing or an alternate profile.
+
+```text
+~/.socketclaw/
+├── .env                 # OpenRouter key, mode 0600
+├── config.toml          # validated non-secret settings, mode 0600
+├── socketclaw.db        # events, investigations, proposals, runs
+└── exports/             # redacted incident Markdown and JSON
 ```
 
----
+Configuration and export writes use a temporary file, `fsync`, and atomic
+replace. SocketClaw never prints the configured key in doctor output, UI
+notifications, exports, or live-test evidence.
 
-## Agent Response Flow
+## Commands
 
-| Classification | Trigger | Actions available |
-|---|---|---|
-| `normal` | Routine traffic | Log only |
-| `suspicious` | Anomalous patterns | Deep analysis → alert / block / investigate |
-| `critical` | Active threat | Immediate IP block + incident report |
+```bash
+socketclaw                       # launch the TUI
+socketclaw doctor                # launch-readiness diagnostics
+socketclaw config path           # effective application home
+socketclaw export --format markdown
+socketclaw export --format json --output incident.json
+socketclaw export --event EVENT_UUID
+socketclaw version
+```
+
+`doctor` treats malformed configuration and unusable SQLite storage as launch
+blockers. Missing optional system commands are warnings so the rest of the
+cockpit remains usable.
+
+## Troubleshooting
+
+**Onboarding says the key is invalid**
+
+Confirm that the key begins with the OpenRouter format and has access to the
+selected model. `socketclaw doctor` reports only whether a key is configured;
+it never prints its value.
+
+**Ping or traceroute is unavailable**
+
+Run `socketclaw doctor`. Install the operating system networking tools, or use
+the port and log views meanwhile. Probe failures become system events instead
+of stopping other jobs.
+
+**The config file will not load**
+
+Run `socketclaw config path`, inspect `config.toml`, and correct the first
+validation error shown by `socketclaw doctor`. SocketClaw will not overwrite a
+malformed file automatically.
+
+**OpenRouter returns 401, 402, 429, or a provider error**
+
+The investigation detail preserves a redacted, classified failure. Correct the
+key or credit/rate-limit condition and use Retry. Local monitoring and history
+remain available.
+
+**The terminal is small**
+
+SocketClaw supports an 80×24 compact layout. A wider terminal exposes more
+detail columns and the secondary incident pane.
+
+## Development and verification
+
+```bash
+uv sync --dev
+uv run pytest -q
+uv run ruff format --check .
+uv run ruff check .
+uv run pyright
+uv build
+```
+
+Paid live OpenRouter tests are opt-in and require an explicit env-file path.
+The file is parsed as data; it is not sourced:
+
+```bash
+SOCKETCLAW_LIVE_OPENROUTER=1 \
+SOCKETCLAW_LIVE_ENV_FILE=/absolute/path/to/.env \
+uv run pytest tests/live/test_openrouter_models.py -q
+```
+
+Live evidence is redacted and written below `artifacts/live-openrouter/`.

@@ -812,7 +812,7 @@ git commit -m "feat: complete SocketClaw operational TUI"
   - `socketclaw export --format markdown|json`
   - `socketclaw version`
 
-- [ ] **Step 1: Write CLI and doctor tests**
+- [x] **Step 1: Write CLI and doctor tests**
 
 ```python
 def test_version_command() -> None:
@@ -831,7 +831,7 @@ def test_doctor_redacts_key(tmp_path: Path, monkeypatch) -> None:
 Cover config path, missing key, malformed config, unavailable ping/traceroute,
 database writability, exports, TUI invocation, and `--help`.
 
-- [ ] **Step 2: Run tests and witness RED**
+- [x] **Step 2: Run tests and witness RED**
 
 Run:
 
@@ -841,7 +841,7 @@ uv run pytest tests/unit/test_cli.py tests/unit/test_doctor.py -q
 
 Expected: missing modules.
 
-- [ ] **Step 3: Implement commands and docs**
+- [x] **Step 3: Implement commands and docs**
 
 Use Typer with the no-argument callback launching `SocketClawApp`. `doctor`
 returns exit 1 only for conditions that prevent launch. README includes
@@ -849,7 +849,7 @@ installation with `uv tool install .` and `pipx install .`, first run, the three
 presets, home file layout, keyboard reference, safety modes, troubleshooting,
 development, live-test opt-in, and screenshots.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run:
 
@@ -861,7 +861,7 @@ uv run socketclaw version
 
 Expected: tests pass and commands exit 0.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/socketclaw/cli.py src/socketclaw/doctor.py tests README.md CHANGELOG.md

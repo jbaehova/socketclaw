@@ -49,7 +49,6 @@ class InvestigationsView(Vertical):
             yield Button("Retry", id="retry-investigation", variant="primary")
             yield Button("Simulate response", id="simulate-response")
             yield Button("Approve response", id="approve-response")
-            yield Button("Execute approved", id="execute-response", variant="warning")
 
     def on_mount(self) -> None:
         self.query_one("#investigations-table", DataTable).add_columns(
@@ -121,10 +120,6 @@ class InvestigationsView(Vertical):
     @on(Button.Pressed, "#approve-response")
     def approve_response(self) -> None:
         self._transition_response("approved", confirm=True)
-
-    @on(Button.Pressed, "#execute-response")
-    def execute_response(self) -> None:
-        self._transition_response("executed", confirm=True)
 
     def _transition_response(self, status: ResponseStatus, *, confirm: bool) -> None:
         proposal = self._selected_proposal()
