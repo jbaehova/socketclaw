@@ -23,19 +23,13 @@ socketclaw = "socketclaw.cli:app"
 
 [dependency-groups]
 dev = [
-    "gradio>=5.0",
-    "langchain-anthropic>=0.3",
-    "langchain-core>=0.3",
-    "langgraph>=0.2",
+    "packaging>=24",
     "pyright>=1.1.400",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
     "pytest-textual-snapshot>=1.0",
-    "python-whois>=0.9",
     "ruff>=0.12",
-    "scapy>=2.5",
-    "websockets>=12.0",
 ]
 
 [tool.pytest.ini_options]
@@ -45,6 +39,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["docs/**"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

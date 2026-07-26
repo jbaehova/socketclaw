@@ -892,7 +892,7 @@ git commit -m "feat: ship SocketClaw CLI and documentation"
 **Interfaces:**
 - Leaves only the supported `socketclaw` runtime and test surface
 
-- [ ] **Step 1: Write the legacy-provider guard**
+- [x] **Step 1: Write the legacy-provider guard**
 
 ```python
 def test_runtime_has_no_legacy_provider_references() -> None:
@@ -910,7 +910,7 @@ def test_runtime_has_no_legacy_provider_references() -> None:
 
 Also inspect installed dependency names from `importlib.metadata.requires`.
 
-- [ ] **Step 2: Run guard and witness RED**
+- [x] **Step 2: Run guard and witness RED**
 
 Run:
 
@@ -920,7 +920,7 @@ uv run pytest tests/unit/test_no_legacy_provider.py -q
 
 Expected: dependency assertion reports legacy packages.
 
-- [ ] **Step 3: Delete the prototype and regenerate the lock**
+- [x] **Step 3: Delete the prototype and regenerate the lock**
 
 Delete only the paths listed in this task, remove their dependencies, and run:
 
@@ -931,7 +931,7 @@ uv sync --dev
 
 Do not delete `.env`, `AGENTS.md`, docs, or the new package.
 
-- [ ] **Step 4: Run GREEN and search**
+- [x] **Step 4: Run GREEN and search**
 
 Run:
 
@@ -943,7 +943,7 @@ rg -ni "anthropic|claude|langchain|langgraph|gradio|ANTHROPIC_API_KEY" \
 
 Expected: test passes and search returns no matches.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A main.py scripts src tests pyproject.toml uv.lock
