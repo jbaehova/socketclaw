@@ -16,3 +16,7 @@ wheels/
 
 # Database files
 *.db
+
+AGENTS.md
+.env
+.worktrees/
