@@ -236,7 +236,7 @@ git commit -m "feat: add secure SocketClaw configuration"
     returning `DetectionResult(score: int, severity: Severity,
     signals: tuple[DetectionSignal, ...])`
 
-- [ ] **Step 1: Write domain and scoring tests**
+- [x] **Step 1: Write domain and scoring tests**
 
 ```python
 def test_total_ping_loss_is_high_with_explanation() -> None:
@@ -268,7 +268,7 @@ Cover new sensitive ports, multiple opened ports, recovery, suspicious log
 patterns, unrelated-window events, exact score clamping, UUID/timestamp
 defaults, confidence bounds, and invalid proposal addresses.
 
-- [ ] **Step 2: Run tests and witness RED**
+- [x] **Step 2: Run tests and witness RED**
 
 Run:
 
@@ -278,7 +278,7 @@ uv run pytest tests/unit/test_domain.py tests/unit/test_detection.py -q
 
 Expected: imports fail for missing modules.
 
-- [ ] **Step 3: Implement models and rule engine**
+- [x] **Step 3: Implement models and rule engine**
 
 Use UTC-aware datetimes and serializable Pydantic models. Each rule returns a
 named signal:
@@ -307,7 +307,7 @@ else:
     severity = Severity.INFO
 ```
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run:
 
@@ -317,7 +317,7 @@ uv run pytest tests/unit/test_domain.py tests/unit/test_detection.py -q
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/socketclaw/domain.py src/socketclaw/detection.py tests/unit
