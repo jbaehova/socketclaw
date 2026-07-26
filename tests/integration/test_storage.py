@@ -232,6 +232,42 @@ async def test_response_proposal_is_stored_as_pending_operator_work(
 
 
 @pytest.mark.asyncio
+async def test_response_status_requires_safe_transition(
+    repository: Repository,
+) -> None:
+    stored = await repository.save_event(event_fixture(), detection_fixture())
+    result = investigation_fixture().model_copy(
+        update={
+            "assessment": Assessment(
+                classification="critical",
+                confidence=0.98,
+                summary="The source is attacking SSH.",
+                rationale=["Repeated root authentication failures were observed."],
+                recommended_actions=["Block after operator review."],
+                response_proposal=ResponseProposal(
+                    action="block",
+                    target_ip="198.51.100.24",
+                    reason="Repeated SSH authentication failures",
+                ),
+            )
+        }
+    )
+    await repository.save_investigation(stored.id, result)
+    proposal = (await repository.list_response_proposals(event_id=stored.id))[0]
+
+    with pytest.raises(ValueError, match=r"pending.*executed"):
+        await repository.update_response_proposal_status(proposal.id, "executed")
+
+    simulated = await repository.update_response_proposal_status(
+        proposal.id,
+        "simulated",
+    )
+    assert simulated.status == "simulated"
+    with pytest.raises(ValueError, match=r"simulated.*approved"):
+        await repository.update_response_proposal_status(proposal.id, "approved")
+
+
+@pytest.mark.asyncio
 async def test_session_stats_aggregate_severity_usage_and_failures(
     repository: Repository,
 ) -> None:

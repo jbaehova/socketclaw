@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -158,6 +158,10 @@ class StoredEvent(SecurityEvent):
     signals: tuple[DetectionSignal, ...] = ()
 
 
+InvestigationStatus = Literal["complete", "failed"]
+ResponseStatus = Literal["pending", "simulated", "approved", "executed", "rejected"]
+
+
 class StoredInvestigation(BaseModel):
     """A completed or failed model investigation."""
 
@@ -165,7 +169,7 @@ class StoredInvestigation(BaseModel):
 
     id: UUID
     event_id: UUID
-    status: Literal["complete", "failed"]
+    status: InvestigationStatus
     assessment: Assessment | None = None
     usage: ModelUsage | None = None
     model_id: str
@@ -195,7 +199,7 @@ class StoredResponseProposal(BaseModel):
     event_id: UUID
     investigation_id: UUID
     proposal: ResponseProposal
-    status: Literal["pending", "simulated", "approved", "executed", "rejected"]
+    status: ResponseStatus
     created_at: datetime
 
 
@@ -424,17 +428,33 @@ class Repository:
         statement = statement.order_by(ResponseProposalRow.created_at.desc()).limit(limit)
         async with self._sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
-        return [
-            StoredResponseProposal(
-                id=UUID(row.id),
-                event_id=UUID(row.event_id),
-                investigation_id=UUID(row.investigation_id),
-                proposal=ResponseProposal.model_validate_json(row.proposal_json),
-                status=row.status,
-                created_at=_parse_timestamp(row.created_at),
-            )
-            for row in rows
-        ]
+        return [_stored_response_proposal(row) for row in rows]
+
+    async def update_response_proposal_status(
+        self,
+        proposal_id: UUID,
+        status: ResponseStatus,
+    ) -> StoredResponseProposal:
+        allowed: dict[ResponseStatus, frozenset[ResponseStatus]] = {
+            "pending": frozenset({"simulated", "approved", "rejected"}),
+            "approved": frozenset({"executed", "rejected"}),
+            "simulated": frozenset(),
+            "executed": frozenset(),
+            "rejected": frozenset(),
+        }
+        if status not in allowed:
+            raise ValueError(f"unknown response status: {status}")
+
+        async with self._sessions() as session:
+            row = await session.get(ResponseProposalRow, str(proposal_id))
+            if row is None:
+                raise KeyError(str(proposal_id))
+            current = cast(ResponseStatus, row.status)
+            if current not in allowed or status not in allowed[current]:
+                raise ValueError(f"response status cannot transition from {current} to {status}")
+            row.status = status
+            await session.commit()
+            return _stored_response_proposal(row)
 
     async def session_stats(self) -> SessionStats:
         async with self._sessions() as session:
@@ -473,8 +493,18 @@ class Repository:
         )
 
 
+class _DatabaseCursor(Protocol):
+    def execute(self, statement: str) -> object: ...
+
+    def close(self) -> None: ...
+
+
+class _DatabaseConnection(Protocol):
+    def cursor(self) -> _DatabaseCursor: ...
+
+
 def _configure_sqlite(dbapi_connection: object, _connection_record: object) -> None:
-    cursor = dbapi_connection.cursor()
+    cursor = cast(_DatabaseConnection, dbapi_connection).cursor()
     try:
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA journal_mode=WAL")
@@ -486,15 +516,15 @@ def _stored_event(row: EventRow) -> StoredEvent:
     return StoredEvent(
         id=UUID(row.id),
         observed_at=_parse_timestamp(row.observed_at),
-        source=row.source,
+        source=EventSource(row.source),
         event_type=row.event_type,
         title=row.title,
         summary=row.summary,
         target=row.target,
         evidence=json.loads(row.evidence_json),
         score=row.score,
-        severity=row.severity,
-        investigation_state=row.investigation_state,
+        severity=Severity(row.severity),
+        investigation_state=InvestigationState(row.investigation_state),
         created_at=_parse_timestamp(row.created_at),
         signals=tuple(
             DetectionSignal.model_validate(signal) for signal in json.loads(row.signals_json)
@@ -506,7 +536,7 @@ def _stored_investigation(row: InvestigationRow) -> StoredInvestigation:
     return StoredInvestigation(
         id=UUID(row.id),
         event_id=UUID(row.event_id),
-        status=row.status,
+        status=cast(InvestigationStatus, row.status),
         assessment=(
             Assessment.model_validate_json(row.assessment_json) if row.assessment_json else None
         ),
@@ -516,6 +546,17 @@ def _stored_investigation(row: InvestigationRow) -> StoredInvestigation:
         error=row.error,
         created_at=_parse_timestamp(row.created_at),
         completed_at=(_parse_timestamp(row.completed_at) if row.completed_at else None),
+    )
+
+
+def _stored_response_proposal(row: ResponseProposalRow) -> StoredResponseProposal:
+    return StoredResponseProposal(
+        id=UUID(row.id),
+        event_id=UUID(row.event_id),
+        investigation_id=UUID(row.investigation_id),
+        proposal=ResponseProposal.model_validate_json(row.proposal_json),
+        status=cast(ResponseStatus, row.status),
+        created_at=_parse_timestamp(row.created_at),
     )
 
 

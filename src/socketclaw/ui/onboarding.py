@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
 from textual import on
@@ -13,15 +13,16 @@ from textual.widgets import Button, ContentSwitcher, Input, Select, Static
 
 from ..config import MODEL_PRESETS, AppConfig, ModelKey
 from ..openrouter import OpenRouterError
+from .context import socketclaw_app
 
 if TYPE_CHECKING:
-    from .app import SocketClawApp
+    from .app import AppServices
 
 
 class OnboardingScreen(Screen[None]):
     """Collect, validate, and persist the minimum useful first-run settings."""
 
-    def __init__(self, services: object) -> None:
+    def __init__(self, services: AppServices) -> None:
         super().__init__()
         self.services = services
         self.current_step = 0
@@ -138,11 +139,15 @@ class OnboardingScreen(Screen[None]):
             await self._validate_key()
             return
         if self.current_step == 2:
-            selected = self.query_one("#onboarding-model", Select).value
+            model_select = cast(
+                Select[object],
+                self.query_one("#onboarding-model", Select),
+            )
+            selected = model_select.value
             if selected not in MODEL_PRESETS:
                 self._set_error("Choose one of the three curated models.")
                 return
-            self._selected_model = selected
+            self._selected_model = cast(ModelKey, selected)
             self._show_step(3)
             return
         if self.current_step == 3:
@@ -152,7 +157,7 @@ class OnboardingScreen(Screen[None]):
             self._render_summary()
             self.query_one("#onboarding-next", Button).label = "Start monitoring"
             return
-        app: SocketClawApp = self.app
+        app = socketclaw_app(self)
         await app.complete_onboarding(self._pending_config, self._pending_key)
 
     async def _validate_key(self) -> None:

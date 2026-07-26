@@ -722,7 +722,7 @@ git commit -m "feat: add SocketClaw Textual shell and onboarding"
 - Consumes all core service interfaces
 - Produces a complete keyboard-accessible operational UI
 
-- [ ] **Step 1: Write event and investigation flow tests**
+- [x] **Step 1: Write event and investigation flow tests**
 
 ```python
 @pytest.mark.asyncio
@@ -756,7 +756,7 @@ filters, details, host CRUD validation, manual diagnostics, failed
 investigation retry, exports, API key replacement, response confirmation,
 trusted-address rejection, and session cost update.
 
-- [ ] **Step 2: Run tests and witness RED**
+- [x] **Step 2: Run tests and witness RED**
 
 Run:
 
@@ -767,7 +767,7 @@ uv run pytest tests/tui/test_events.py tests/tui/test_hosts.py \
 
 Expected: imports or widget queries fail.
 
-- [ ] **Step 3: Implement operational screens**
+- [x] **Step 3: Implement operational screens**
 
 Use `DataTable` for events, hosts, and investigation queue; `Markdown` for
 details; `Sparkline` for recent activity; modals for destructive confirmations.
@@ -775,7 +775,7 @@ Every async action runs as an exclusive Textual worker and disables its trigger
 until completion. Bind `i`, `e`, `r`, and filter shortcuts only on screens where
 they apply.
 
-- [ ] **Step 4: Run GREEN and entire TUI suite**
+- [x] **Step 4: Run GREEN and entire TUI suite**
 
 Run:
 
@@ -785,7 +785,7 @@ uv run pytest tests/tui -q
 
 Expected: all Pilot flows pass without leaked tasks or warnings.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/socketclaw/ui tests/tui
