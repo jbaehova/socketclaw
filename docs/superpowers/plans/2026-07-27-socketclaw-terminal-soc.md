@@ -107,7 +107,7 @@ coverage exists.
   - `ConfigStore.load_api_key() -> str | None`
   - `ConfigStore.save_api_key(value: str) -> None`
 
-- [ ] **Step 1: Replace dependency declarations and declare the CLI**
+- [x] **Step 1: Replace dependency declarations and declare the CLI**
 
 Pin the development interpreter to `3.11` in `.python-version`, set the project
 floor to `>=3.11`, declare runtime dependencies `aiosqlite`, `httpx`,
@@ -123,7 +123,7 @@ socketclaw = "socketclaw.cli:app"
 Add `.env`, `.coverage`, `.pytest_cache/`, `.ruff_cache/`, `.mypy_cache/`,
 `.pyright/`, and generated screenshot reports to `.gitignore`.
 
-- [ ] **Step 2: Write configuration tests**
+- [x] **Step 2: Write configuration tests**
 
 ```python
 def test_model_presets_are_exact() -> None:
@@ -153,7 +153,7 @@ Also cover an env value containing `#`, quotes, and whitespace, invalid targets,
 invalid ports, corrupt TOML, `SOCKETCLAW_HOME`, and permissions corrected on an
 existing file.
 
-- [ ] **Step 3: Run tests and witness RED**
+- [x] **Step 3: Run tests and witness RED**
 
 Run:
 
@@ -164,7 +164,7 @@ uv run pytest tests/unit/test_config.py -q
 
 Expected: collection fails because `socketclaw.config` does not exist.
 
-- [ ] **Step 4: Implement secure configuration**
+- [x] **Step 4: Implement secure configuration**
 
 Use a frozen dataclass for presets and Pydantic for settings:
 
@@ -195,7 +195,7 @@ with `tomllib`. Save through a sibling temporary file, `fsync`, `os.replace`,
 and `chmod`. Encode the secret with shell-safe single quotes and decode using
 `shlex`; never call `source` or execute the file.
 
-- [ ] **Step 5: Run GREEN and full regression**
+- [x] **Step 5: Run GREEN and full regression**
 
 Run:
 
@@ -206,7 +206,7 @@ uv run pytest -q
 
 Expected: all configuration tests and the legacy suite pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add .gitignore pyproject.toml uv.lock src/socketclaw tests/unit/test_config.py

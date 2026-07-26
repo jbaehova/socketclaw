@@ -20,3 +20,13 @@ wheels/
 AGENTS.md
 .env
 .worktrees/
+
+# Test and quality artifacts
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+htmlcov/
+snapshot_report.html
+snapshot_report/
