@@ -342,7 +342,7 @@ git commit -m "feat: add explainable threat detection"
   - `OpenRouterError(kind: ErrorKind, status_code: int | None, message: str)`
   - `redact_secrets(text: str, secrets: Sequence[str]) -> str`
 
-- [ ] **Step 1: Write request-contract and error tests**
+- [x] **Step 1: Write request-contract and error tests**
 
 ```python
 @pytest.mark.asyncio
@@ -372,7 +372,7 @@ Cover `/api/v1/key`, 402, 429 with `Retry-After`, 502/503 backoff, timeouts,
 malformed JSON, fenced JSON, API error inside a 200 response, Qwen request
 shape, usage/cost parsing, missing usage, and request ID capture.
 
-- [ ] **Step 2: Run tests and witness RED**
+- [x] **Step 2: Run tests and witness RED**
 
 Run:
 
@@ -382,7 +382,7 @@ uv run pytest tests/unit/test_openrouter.py -q
 
 Expected: import fails for `socketclaw.openrouter`.
 
-- [ ] **Step 3: Implement the HTTP boundary**
+- [x] **Step 3: Implement the HTTP boundary**
 
 Send:
 
@@ -410,7 +410,7 @@ Use three total attempts for 429, 502, and 503; honor a bounded
 `Retry-After <= 30`, otherwise use 0.25 and 0.5 seconds. Never retry 400, 401,
 402, or 403. Categorize errors for TUI guidance.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run:
 
@@ -420,7 +420,7 @@ uv run pytest tests/unit/test_openrouter.py -q
 
 Expected: all pass with no warnings.
 
-- [ ] **Step 5: Add opt-in live test scaffold**
+- [x] **Step 5: Add opt-in live test scaffold**
 
 The live test must skip unless both `SOCKETCLAW_LIVE_OPENROUTER=1` and a key are
 present, parametrize the exact three presets, request a tiny synthetic event,
@@ -429,7 +429,7 @@ and write redacted JSON evidence to
 non-empty assessment, latency, and non-negative usage/cost without printing the
 key.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/socketclaw/openrouter.py tests/unit/test_openrouter.py tests/live
