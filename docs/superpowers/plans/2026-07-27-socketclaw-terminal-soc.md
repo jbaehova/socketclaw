@@ -89,6 +89,7 @@ coverage exists.
 ### Task 1: Package, Model Presets, and Secure Configuration
 
 **Files:**
+- Create: `.python-version`
 - Modify: `pyproject.toml`
 - Modify: `.gitignore`
 - Create: `src/socketclaw/__init__.py`
@@ -108,7 +109,8 @@ coverage exists.
 
 - [ ] **Step 1: Replace dependency declarations and declare the CLI**
 
-Set Python to `>=3.11`, declare runtime dependencies `aiosqlite`, `httpx`,
+Pin the development interpreter to `3.11` in `.python-version`, set the project
+floor to `>=3.11`, declare runtime dependencies `aiosqlite`, `httpx`,
 `pydantic`, `sqlalchemy`, `textual`, and `typer`, create a PEP 735 `dev`
 dependency group with pytest, pytest-asyncio, pytest-cov,
 pytest-textual-snapshot, Ruff, and Pyright, and add:
@@ -1009,13 +1011,13 @@ Expected: five SVG captures at wide size and at least onboarding/overview at
 
 - [ ] **Step 4: Run all three paid model tests**
 
-Load the repository root key into the process without printing it:
+Point the live fixture at the repository root key file. The fixture parses the
+single assignment as data with `shlex`; it does not execute or print the file:
 
 ```bash
-set -a
-source ./.env
-set +a
-SOCKETCLAW_LIVE_OPENROUTER=1 uv run pytest \
+SOCKETCLAW_LIVE_OPENROUTER=1 \
+SOCKETCLAW_LIVE_ENV_FILE=/Users/johnnybae/workspace/socketclaw/.env \
+uv run pytest \
   tests/live/test_openrouter_models.py -v
 ```
 
