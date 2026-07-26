@@ -459,7 +459,7 @@ git commit -m "feat: integrate curated OpenRouter investigations"
   - `export_json(...) -> str`
   - `export_markdown(...) -> str`
 
-- [ ] **Step 1: Write repository and export tests**
+- [x] **Step 1: Write repository and export tests**
 
 ```python
 @pytest.mark.asyncio
@@ -482,7 +482,7 @@ Cover schema version creation, idempotent initialize, severity/source/text/date
 filters, pagination, model usage totals, failed investigations, JSON round-trip,
 and deterministic Markdown.
 
-- [ ] **Step 2: Run tests and witness RED**
+- [x] **Step 2: Run tests and witness RED**
 
 Run:
 
@@ -492,7 +492,7 @@ uv run pytest tests/integration/test_storage.py tests/unit/test_export.py -q
 
 Expected: missing modules.
 
-- [ ] **Step 3: Implement SQLite and exports**
+- [x] **Step 3: Implement SQLite and exports**
 
 Create SQLAlchemy tables `schema_meta`, `events`, `investigations`,
 `response_proposals`, and `runs`. Store flexible evidence and signals as JSON,
@@ -500,7 +500,7 @@ while indexing timestamp, severity, source, target, and investigation status.
 Use `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`. Keep sessions
 method-scoped and return detached Pydantic records.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run:
 
@@ -510,7 +510,7 @@ uv run pytest tests/integration/test_storage.py tests/unit/test_export.py -q
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/socketclaw/storage.py src/socketclaw/export.py tests
