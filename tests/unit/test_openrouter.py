@@ -163,6 +163,12 @@ async def test_investigation_sends_exact_model_effort_and_schema(
     assert body["response_format"]["type"] == "json_schema"
     assert body["response_format"]["json_schema"]["strict"] is True
     assert body["response_format"]["json_schema"]["name"] == ("socketclaw_incident_assessment")
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
+    proposal_schema = schema["$defs"]["ResponseProposal"]
+    assert proposal_schema["additionalProperties"] is False
+    assert set(proposal_schema["required"]) == set(proposal_schema["properties"])
     assert body["stream"] is False
     assert body["max_tokens"] == 1200
 

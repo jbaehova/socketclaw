@@ -1,0 +1,14 @@
+{
+  "classification": "suspicious",
+  "completion_tokens": 1079,
+  "cost_usd": 0.018387,
+  "latency_ms": 44586,
+  "preset": "kimi",
+  "prompt_tokens": 734,
+  "provider_model_id": "moonshotai/kimi-k3",
+  "provider_request_id": "gen-1785086186-fjsx0Y2UnfkynygkcGRE",
+  "reasoning_tokens": 529,
+  "requested_effort": "max",
+  "requested_model_id": "moonshotai/kimi-k3",
+  "total_tokens": 1813
+}

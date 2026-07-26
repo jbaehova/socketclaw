@@ -965,7 +965,7 @@ git commit -m "refactor: remove the legacy Claude dashboard"
 **Interfaces:**
 - Produces authoritative completion artifacts without secrets
 
-- [ ] **Step 1: Add snapshot cases**
+- [x] **Step 1: Add snapshot cases**
 
 Parametrize onboarding, overview, events, investigation detail, and settings at
 `(80, 24)` and `(120, 36)`:
@@ -980,7 +980,7 @@ def test_visual_states(snap_compare, case: VisualCase) -> None:
     )
 ```
 
-- [ ] **Step 2: Witness initial snapshot RED and approve generated baselines**
+- [x] **Step 2: Witness initial snapshot RED and approve generated baselines**
 
 Run:
 
@@ -993,7 +993,7 @@ for clipping, overlap, unreadable contrast, secret leakage, and missing focus;
 fix production CSS through a new failing assertion when behavior is wrong, then
 approve the baselines.
 
-- [ ] **Step 3: Capture actual TUI states**
+- [x] **Step 3: Capture actual TUI states**
 
 `scripts/capture_tui.py` starts the real app with a deterministic seeded
 database and calls Textual's screenshot API after scripted Pilot navigation.
@@ -1009,7 +1009,7 @@ uv run python scripts/capture_tui.py
 Expected: five SVG captures at wide size and at least onboarding/overview at
 80×24, with no key in any file.
 
-- [ ] **Step 4: Run all three paid model tests**
+- [x] **Step 4: Run all three paid model tests**
 
 Point the live fixture at the repository root key file. The fixture parses the
 single assignment as data with `shlex`; it does not execute or print the file:
@@ -1027,7 +1027,7 @@ cost. If Qwen rejects `reasoning.effort=high`, preserve the user-visible preset
 label but record and implement the provider-compatible normalized request only
 after a failing contract test proves the necessary exception.
 
-- [ ] **Step 5: Run quality gates**
+- [x] **Step 5: Run quality gates**
 
 Run fresh:
 
@@ -1042,7 +1042,7 @@ uv build
 Expected: every command exits 0 with no warnings that indicate leaked tasks,
 unawaited coroutines, or deprecated runtime APIs.
 
-- [ ] **Step 6: Test the wheel in a fresh environment and PTY**
+- [x] **Step 6: Test the wheel in a fresh environment and PTY**
 
 Create a temporary directory with `mktemp -d`, create a Python 3.11+ virtual
 environment there, install `dist/socketclaw-*.whl`, then run:
@@ -1056,14 +1056,14 @@ SOCKETCLAW_HOME="$temporary_home" socketclaw --help
 Start `socketclaw` in a PTY with the deterministic test home, wait for the
 onboarding heading, send `q`, and assert exit 0 with terminal state restored.
 
-- [ ] **Step 7: Perform the requirement-by-requirement audit**
+- [x] **Step 7: Perform the requirement-by-requirement audit**
 
 Create `docs/verification/2026-07-27-completion-audit.md` with one row per
 requirement from the approved design and original request. Each row names the
 exact command, source file, live artifact, screenshot, or test that proves it.
 Any missing or indirect evidence returns to the responsible task.
 
-- [ ] **Step 8: Final commit**
+- [x] **Step 8: Final commit**
 
 ```bash
 git add tests scripts artifacts docs README.md

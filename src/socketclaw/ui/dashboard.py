@@ -36,6 +36,13 @@ _VIEWS = {
     "nav-investigations": "investigations-view",
     "nav-settings": "settings-view",
 }
+_FOCUS_TARGETS = {
+    "overview-view": "#overview-events",
+    "events-view": "#events-table",
+    "hosts-view": "#hosts-table",
+    "investigations-view": "#investigations-table",
+    "settings-view": "#model",
+}
 
 
 class OverviewView(Vertical):
@@ -191,6 +198,7 @@ class DashboardScreen(Screen[None]):
                 button.id is not None and _VIEWS.get(button.id) == view_id,
                 "active",
             )
+        self.query_one(_FOCUS_TARGETS[view_id]).focus()
         if view_id == "overview-view":
             self.query_one(OverviewView).refresh_data()
         elif view_id == "events-view":

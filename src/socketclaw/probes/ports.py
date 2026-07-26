@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 
-from ..domain import SecurityEvent
+from ..domain import EventSource, SecurityEvent
 
 Connector = Callable[[str, int, float], Awaitable[bool]]
 
@@ -61,7 +61,7 @@ class PortProbe:
             "newly_closed": newly_closed,
         }
         return SecurityEvent(
-            source="port_scan",
+            source=EventSource.PORT_SCAN,
             event_type="port_scan.result",
             title=title,
             summary=(f"{target}: {len(current)} open of {len(candidates)} scanned TCP ports"),

@@ -8,7 +8,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -123,7 +123,7 @@ class OpenRouterClient:
                 "json_schema": {
                     "name": "socketclaw_incident_assessment",
                     "strict": True,
-                    "schema": Assessment.model_json_schema(),
+                    "schema": _strict_response_schema(),
                 },
             },
             "max_tokens": 1200,
@@ -145,12 +145,12 @@ class OpenRouterClient:
         except (ValueError, json.JSONDecodeError, ValidationError) as exc:
             raise self._response_error(f"OpenRouter assessment is invalid: {exc}") from exc
 
-        usage_data = payload.get("usage")
-        if not isinstance(usage_data, dict):
-            usage_data = {}
-        completion_details = usage_data.get("completion_tokens_details")
-        if not isinstance(completion_details, dict):
-            completion_details = {}
+        usage_value = payload.get("usage")
+        usage_data = cast(dict[str, object], usage_value) if isinstance(usage_value, dict) else {}
+        completion_value = usage_data.get("completion_tokens_details")
+        completion_details = (
+            cast(dict[str, object], completion_value) if isinstance(completion_value, dict) else {}
+        )
 
         try:
             usage = ModelUsage(
@@ -184,7 +184,7 @@ class OpenRouterClient:
         path: str,
         *,
         json_body: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], httpx.Response]:
+    ) -> tuple[dict[str, object], httpx.Response]:
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
@@ -220,11 +220,12 @@ class OpenRouterClient:
                     raise self._http_error(response)
 
                 try:
-                    payload = response.json()
+                    payload_value: object = response.json()
                 except (json.JSONDecodeError, ValueError) as exc:
                     raise self._response_error("OpenRouter returned malformed JSON") from exc
-                if not isinstance(payload, dict):
+                if not isinstance(payload_value, dict):
                     raise self._response_error("OpenRouter returned a non-object response")
+                payload = cast(dict[str, object], payload_value)
                 if payload.get("error") is not None:
                     message = _error_message(payload)
                     raise self._response_error(f"OpenRouter provider error: {message}")
@@ -252,32 +253,37 @@ def redact_secrets(text: str, secrets: Sequence[str] = ()) -> str:
     return _OPENROUTER_KEY.sub("[REDACTED]", redacted)
 
 
-def _assistant_content(payload: dict[str, Any]) -> str:
+def _assistant_content(payload: dict[str, object]) -> str:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
         raise OpenRouterError(ErrorKind.RESPONSE, "OpenRouter response has no choices")
-    first = choices[0]
-    if not isinstance(first, dict):
+    first_value = cast(list[object], choices)[0]
+    if not isinstance(first_value, dict):
         raise OpenRouterError(ErrorKind.RESPONSE, "OpenRouter choice is invalid")
+    first = cast(dict[str, object], first_value)
     message = first.get("message")
     if not isinstance(message, dict):
         raise OpenRouterError(ErrorKind.RESPONSE, "OpenRouter choice has no message")
-    content = message.get("content")
+    typed_message = cast(dict[str, object], message)
+    content = typed_message.get("content")
     if isinstance(content, str) and content.strip():
         return content
     if isinstance(content, list):
-        texts = [
-            item.get("text")
-            for item in content
-            if isinstance(item, dict) and isinstance(item.get("text"), str)
-        ]
+        texts: list[str] = []
+        for item_value in cast(list[object], content):
+            if not isinstance(item_value, dict):
+                continue
+            item = cast(dict[str, object], item_value)
+            text = item.get("text")
+            if isinstance(text, str):
+                texts.append(text)
         joined = "\n".join(texts).strip()
         if joined:
             return joined
     raise OpenRouterError(ErrorKind.RESPONSE, "OpenRouter message has no text content")
 
 
-def _extract_json_object(content: str) -> dict[str, Any]:
+def _extract_json_object(content: str) -> dict[str, object]:
     stripped = content.strip()
     if stripped.startswith("```"):
         stripped = re.sub(r"^```(?:json)?\s*", "", stripped, count=1)
@@ -285,10 +291,34 @@ def _extract_json_object(content: str) -> dict[str, Any]:
     start = stripped.find("{")
     if start < 0:
         raise ValueError("assessment does not contain a JSON object")
-    decoded, _ = json.JSONDecoder().raw_decode(stripped[start:])
-    if not isinstance(decoded, dict):
+    decoded_value: object
+    decoded_value, _ = json.JSONDecoder().raw_decode(stripped[start:])
+    if not isinstance(decoded_value, dict):
         raise ValueError("assessment JSON is not an object")
-    return decoded
+    return cast(dict[str, object], decoded_value)
+
+
+def _strict_response_schema() -> dict[str, Any]:
+    """Build the provider-safe subset required by strict structured outputs."""
+    schema = Assessment.model_json_schema()
+    _require_all_object_properties(schema)
+    return schema
+
+
+def _require_all_object_properties(node: object) -> None:
+    if isinstance(node, dict):
+        mapping = cast(dict[str, object], node)
+        mapping.pop("default", None)
+        properties = mapping.get("properties")
+        if mapping.get("type") == "object" and isinstance(properties, dict):
+            typed_properties = cast(dict[str, object], properties)
+            mapping["additionalProperties"] = False
+            mapping["required"] = list(typed_properties)
+        for value in mapping.values():
+            _require_all_object_properties(value)
+    elif isinstance(node, list):
+        for value in cast(list[object], node):
+            _require_all_object_properties(value)
 
 
 def _error_kind(status_code: int) -> ErrorKind:
@@ -306,17 +336,18 @@ def _error_kind(status_code: int) -> ErrorKind:
 
 def _error_message_from_response(response: httpx.Response) -> str:
     try:
-        payload = response.json()
+        payload: object = response.json()
     except (json.JSONDecodeError, ValueError):
         return f"OpenRouter returned HTTP {response.status_code}"
     return _error_message(payload)
 
 
-def _error_message(payload: Any) -> str:
+def _error_message(payload: object) -> str:
     if isinstance(payload, dict):
-        error = payload.get("error")
+        typed_payload = cast(dict[str, object], payload)
+        error = typed_payload.get("error")
         if isinstance(error, dict):
-            message = error.get("message")
+            message = cast(dict[str, object], error).get("message")
             if isinstance(message, str):
                 return message
         if isinstance(error, str):
@@ -338,25 +369,31 @@ def _backoff(attempt: int) -> float:
     return 0.25 * (2**attempt)
 
 
-def _integer(value: Any) -> int:
+def _integer(value: object) -> int:
     if value is None:
         return 0
+    if not isinstance(value, int | float | str):
+        raise ValueError("expected an integer-compatible value")
     return int(value)
 
 
-def _optional_integer(value: Any) -> int | None:
+def _optional_integer(value: object) -> int | None:
     if value is None:
         return None
+    if not isinstance(value, int | float | str):
+        raise ValueError("expected an integer-compatible value")
     return int(value)
 
 
-def _number(value: Any) -> float:
+def _number(value: object) -> float:
     if value is None:
         return 0.0
+    if not isinstance(value, int | float | str):
+        raise ValueError("expected a numeric value")
     return float(value)
 
 
-def _request_id(payload: dict[str, Any], response: httpx.Response) -> str | None:
+def _request_id(payload: dict[str, object], response: httpx.Response) -> str | None:
     request_id = payload.get("id")
     if isinstance(request_id, str):
         return request_id

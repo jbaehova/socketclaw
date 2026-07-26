@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.20",
+    "click>=8.1",
     "greenlet>=3.0",
     "httpx>=0.28",
     "pydantic>=2.10",
@@ -35,6 +36,7 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = ["--snapshot-dirname=snapshots"]
 
 [tool.ruff]
 line-length = 100
@@ -45,6 +47,6 @@ extend-exclude = ["docs/**"]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.pyright]
-include = ["src/socketclaw", "tests"]
+include = ["src/socketclaw"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"

@@ -159,6 +159,14 @@ Screen {
     color: $sc-accent;
 }
 
+#activity-sparkline > .sparkline--max-color {
+    color: $sc-accent;
+}
+
+#activity-sparkline > .sparkline--min-color {
+    color: $sc-accent 35%;
+}
+
 #overview-events {
     height: 1fr;
 }
@@ -243,6 +251,29 @@ Screen {
     margin-left: 1;
 }
 
+Button.-primary {
+    background: $sc-accent;
+    color: $sc-ink;
+    border-top: tall $sc-accent;
+    border-bottom: tall $sc-accent;
+}
+
+Button.-primary:hover,
+Button.-primary:focus {
+    background: $sc-accent 85%;
+    color: $sc-ink;
+    border-top: tall $sc-accent;
+    border-bottom: tall $sc-accent;
+}
+
+Input:focus {
+    border: tall $sc-accent;
+}
+
+Select:focus > SelectCurrent {
+    border: tall $sc-accent;
+}
+
 DataTable {
     background: $sc-ink;
     color: $sc-text;
@@ -259,6 +290,12 @@ DataTable > .datatable--cursor {
     color: $sc-accent;
 }
 
+MarkdownH2,
+MarkdownH3,
+MarkdownBullet {
+    color: $sc-accent;
+}
+
 .settings-grid {
     height: 1fr;
     border-top: solid $sc-line;
@@ -268,10 +305,6 @@ DataTable > .datatable--cursor {
 .settings-grid > Vertical {
     width: 1fr;
     padding-right: 2;
-}
-
-.settings-grid .field-label {
-    margin-top: 1;
 }
 
 .compact-fields {
@@ -454,6 +487,10 @@ ConfirmResponseScreen {
 
 .narrow #active-model {
     display: none;
+}
+
+.narrow #run-state {
+    width: 1fr;
 }
 
 .narrow .workspace-view {

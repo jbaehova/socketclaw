@@ -1,0 +1,14 @@
+{
+  "classification": "suspicious",
+  "completion_tokens": 336,
+  "cost_usd": 0.00633,
+  "latency_ms": 4613,
+  "preset": "terra",
+  "prompt_tokens": 516,
+  "provider_model_id": "openai/gpt-5.6-terra",
+  "provider_request_id": "gen-1785086181-GtQhKHTC1NRouCnYLMCh",
+  "reasoning_tokens": 83,
+  "requested_effort": "high",
+  "requested_model_id": "openai/gpt-5.6-terra",
+  "total_tokens": 852
+}

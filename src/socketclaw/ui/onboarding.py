@@ -30,6 +30,9 @@ class OnboardingScreen(Screen[None]):
         self._selected_model: ModelKey = "terra"
         self._pending_config = AppConfig()
 
+    def on_mount(self) -> None:
+        self.query_one("#onboarding-next", Button).focus()
+
     def compose(self) -> ComposeResult:
         with Vertical(id="onboarding-shell"):
             yield Static("SOCKETCLAW", id="onboarding-brand")

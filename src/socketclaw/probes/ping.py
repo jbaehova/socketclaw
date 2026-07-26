@@ -6,10 +6,10 @@ import asyncio
 import math
 import platform
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 
-from ..domain import SecurityEvent
+from ..domain import EventSource, SecurityEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +44,7 @@ class PingProbe:
         try:
             result = await self._runner(command, deadline)
             evidence = _parse_ping(result.stdout, count)
-            if result.returncode != 0 and evidence["packet_loss"] < 100:
+            if result.returncode != 0 and _as_float(evidence["packet_loss"]) < 100:
                 evidence["packet_loss"] = 100.0
             if result.stderr.strip():
                 evidence["stderr"] = result.stderr.strip()[:1000]
@@ -56,7 +56,7 @@ class PingProbe:
                 "error": str(exc),
             }
 
-        loss = float(evidence["packet_loss"])
+        loss = _as_float(evidence["packet_loss"])
         if loss >= 100:
             title = f"{target} is unreachable"
         elif loss > 0:
@@ -64,7 +64,7 @@ class PingProbe:
         else:
             title = f"{target} is reachable"
         return SecurityEvent(
-            source="ping",
+            source=EventSource.PING,
             event_type="ping.result",
             title=title,
             summary=_ping_summary(target, evidence),
@@ -126,7 +126,7 @@ async def _run_command(command: list[str], timeout: float) -> CommandResult:
     )
 
 
-def _parse_ping(output: str, requested_count: int) -> dict[str, int | float]:
+def _parse_ping(output: str, requested_count: int) -> dict[str, object]:
     loss_match = re.search(r"([\d.]+)%\s*packet loss", output, re.IGNORECASE)
     if loss_match is None:
         loss_match = re.search(r"\(([\d.]+)%\s*loss\)", output, re.IGNORECASE)
@@ -143,7 +143,7 @@ def _parse_ping(output: str, requested_count: int) -> dict[str, int | float]:
     if received is None:
         received = re.search(r"Received\s*=\s*(\d+)", output, re.IGNORECASE)
 
-    evidence: dict[str, int | float] = {
+    evidence: dict[str, object] = {
         "sent": int(transmitted.group(1)) if transmitted else requested_count,
         "received": (
             int(received.group(1)) if received else round(requested_count * (1 - loss / 100))
@@ -180,9 +180,17 @@ def _parse_ping(output: str, requested_count: int) -> dict[str, int | float]:
     return evidence
 
 
-def _ping_summary(target: str, evidence: dict[str, object]) -> str:
-    loss = float(evidence["packet_loss"])
+def _ping_summary(target: str, evidence: Mapping[str, object]) -> str:
+    loss = _as_float(evidence["packet_loss"])
     average = evidence.get("rtt_avg_ms")
     if average is not None:
-        return f"{target}: {loss:g}% packet loss, {float(average):.2f} ms average RTT"
+        return f"{target}: {loss:g}% packet loss, {_as_float(average):.2f} ms average RTT"
     return f"{target}: {loss:g}% packet loss"
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, int | float | str):
+        return float(value)
+    raise TypeError(f"expected numeric ping evidence, got {type(value).__name__}")

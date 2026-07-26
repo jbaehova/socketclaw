@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..domain import SecurityEvent
+from ..domain import EventSource, SecurityEvent
 
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _PATTERNS = (
@@ -89,7 +89,7 @@ def _event_for_line(
         target_match = _IPV4.search(line)
         target = target_match.group(0) if target_match else None
         return SecurityEvent(
-            source="log",
+            source=EventSource.LOG,
             event_type=event_type,
             title=title,
             summary=line[:1000],

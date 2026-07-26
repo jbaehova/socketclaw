@@ -23,6 +23,15 @@ FORBIDDEN_TOP_LEVEL_PACKAGES = {
 }
 
 
+def test_direct_cli_runtime_dependencies_are_declared() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text())
+    names = {
+        Requirement(value).name.casefold() for value in project["project"].get("dependencies", [])
+    }
+
+    assert "click" in names
+
+
 def test_project_declares_no_legacy_runtime_or_development_dependency() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text())
     declarations = list(project["project"].get("dependencies", []))

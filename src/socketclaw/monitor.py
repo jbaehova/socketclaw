@@ -12,7 +12,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict
 
 from .detection import Detector
-from .domain import SecurityEvent, utc_now
+from .domain import EventSource, SecurityEvent, utc_now
 from .storage import Repository, StoredEvent
 
 Collector = Callable[[], Awaitable[Sequence[SecurityEvent]]]
@@ -173,7 +173,7 @@ class MonitorService:
                 self._last_error = str(exc)
                 await self.process_event(
                     SecurityEvent(
-                        source="system",
+                        source=EventSource.SYSTEM,
                         event_type="system.probe_error",
                         title=f"{job.name} probe failed",
                         summary=str(exc),

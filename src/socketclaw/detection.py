@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import timedelta
-from typing import Any
+from typing import cast
 
 from .domain import DetectionResult, DetectionSignal, SecurityEvent, Severity
 
@@ -268,7 +268,7 @@ def _severity_for_score(score: int) -> Severity:
     return Severity.INFO
 
 
-def _number(value: Any) -> float:
+def _number(value: object) -> float:
     if isinstance(value, bool):
         return 0.0
     if isinstance(value, int | float):
@@ -279,12 +279,14 @@ def _number(value: Any) -> float:
         return 0.0
 
 
-def _ports(value: Any) -> list[int]:
+def _ports(value: object) -> list[int]:
     if not isinstance(value, list | tuple | set):
         return []
     ports: list[int] = []
-    for item in value:
+    for item in cast(Iterable[object], value):
         if isinstance(item, bool):
+            continue
+        if not isinstance(item, int | float | str):
             continue
         try:
             port = int(item)

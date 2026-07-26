@@ -69,3 +69,35 @@ async def test_quit_stops_monitor_and_exits_cleanly(
 
     assert fixture.monitor.stopped == 1
     assert fixture.monitor.running is False
+
+
+@pytest.mark.asyncio
+async def test_quit_exits_cleanly_from_onboarding(
+    app_factory: Callable[..., Any],
+) -> None:
+    fixture = app_factory(configured=False)
+
+    async with fixture.app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        assert fixture.app.focused is not None
+        assert fixture.app.focused.id == "onboarding-next"
+        await pilot.press("q")
+
+    assert fixture.monitor.stopped == 1
+
+
+@pytest.mark.asyncio
+async def test_number_navigation_moves_focus_to_primary_control(
+    app_factory: Callable[..., Any],
+) -> None:
+    fixture = app_factory(configured=True)
+
+    async with fixture.app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause(0.2)
+        await pilot.press("2")
+        assert fixture.app.focused is not None
+        assert fixture.app.focused.id == "events-table"
+
+        await pilot.press("5")
+        assert fixture.app.focused is not None
+        assert fixture.app.focused.id == "model"
