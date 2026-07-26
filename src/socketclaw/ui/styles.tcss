@@ -1,0 +1,281 @@
+$sc-ink: #0a0f18;
+$sc-surface: #111827;
+$sc-panel: #182235;
+$sc-line: #2b3950;
+$sc-text: #e7eef7;
+$sc-muted: #8fa0b7;
+$sc-accent: #66d9c5;
+$sc-warning: #f2c14e;
+$sc-danger: #ff6b6b;
+
+Screen {
+    background: $sc-ink;
+    color: $sc-text;
+}
+
+#topbar {
+    height: 3;
+    padding: 0 2;
+    background: $sc-surface;
+    border-bottom: solid $sc-line;
+    align-vertical: middle;
+}
+
+#brand {
+    width: 22;
+    text-style: bold;
+    color: $sc-text;
+    content-align: left middle;
+}
+
+#active-model {
+    width: 1fr;
+    color: $sc-muted;
+    content-align: center middle;
+}
+
+#run-state {
+    width: 18;
+    color: $sc-accent;
+    text-style: bold;
+    content-align: right middle;
+}
+
+#run-state.paused {
+    color: $sc-warning;
+}
+
+#primary-nav {
+    height: 3;
+    padding: 0 1;
+    background: $sc-surface;
+    border-bottom: solid $sc-line;
+}
+
+.nav-button {
+    width: auto;
+    min-width: 14;
+    height: 3;
+    margin: 0;
+    padding: 0 2;
+    background: transparent;
+    color: $sc-muted;
+    border: none;
+}
+
+.nav-button:hover,
+.nav-button:focus {
+    background: $sc-panel;
+    color: $sc-text;
+    text-style: none;
+}
+
+.nav-button.active {
+    color: $sc-accent;
+    text-style: bold;
+    border-bottom: solid $sc-accent;
+}
+
+#workspace {
+    height: 1fr;
+    background: $sc-ink;
+}
+
+.workspace-view {
+    height: 1fr;
+    padding: 2 4;
+}
+
+.view-kicker {
+    height: 1;
+    color: $sc-accent;
+    text-style: bold;
+}
+
+.view-title {
+    height: 3;
+    margin-top: 1;
+    color: $sc-text;
+    text-style: bold;
+}
+
+.view-copy {
+    width: 70;
+    height: 3;
+    color: $sc-muted;
+}
+
+#overview-metrics {
+    height: 7;
+    margin-top: 1;
+    border-top: solid $sc-line;
+    border-bottom: solid $sc-line;
+}
+
+.metric {
+    width: 1fr;
+    padding: 1 2;
+    color: $sc-muted;
+    content-align: left middle;
+    border-right: solid $sc-line;
+}
+
+#activity-empty,
+.empty-state {
+    margin-top: 2;
+    padding: 1 0;
+    color: $sc-muted;
+}
+
+.target-list,
+.settings-summary {
+    margin-top: 2;
+    color: $sc-muted;
+}
+
+Footer {
+    height: 1;
+    background: $sc-surface;
+    color: $sc-muted;
+}
+
+OnboardingScreen {
+    align: center middle;
+    background: $sc-ink;
+}
+
+#onboarding-shell {
+    width: 74;
+    height: 26;
+    padding: 1 2;
+    background: $sc-surface;
+    border: solid $sc-line;
+}
+
+#onboarding-brand {
+    height: 2;
+    color: $sc-text;
+    text-style: bold;
+}
+
+#onboarding-kicker {
+    height: 1;
+    color: $sc-muted;
+}
+
+#onboarding-progress {
+    height: 2;
+    margin-top: 1;
+    color: $sc-accent;
+}
+
+#onboarding-steps {
+    height: 1fr;
+    border-top: solid $sc-line;
+    padding-top: 1;
+}
+
+.onboarding-step {
+    height: 1fr;
+}
+
+.step-title {
+    height: 3;
+    color: $sc-text;
+    text-style: bold;
+}
+
+.step-copy {
+    height: 4;
+    width: 64;
+    color: $sc-muted;
+}
+
+.step-note {
+    margin-top: 1;
+    color: $sc-accent;
+}
+
+#api-key,
+#onboarding-model,
+#onboarding-targets {
+    width: 1fr;
+    margin-top: 1;
+}
+
+.interval-row {
+    height: 5;
+    margin-top: 1;
+}
+
+.interval-row > Vertical {
+    width: 1fr;
+    margin-right: 2;
+}
+
+.field-label {
+    height: 1;
+    color: $sc-muted;
+}
+
+#onboarding-error {
+    height: 2;
+    color: $sc-danger;
+}
+
+#onboarding-actions {
+    height: 3;
+    align-horizontal: right;
+}
+
+#onboarding-actions Button {
+    min-width: 14;
+    margin-left: 1;
+}
+
+HelpScreen {
+    align: center middle;
+    background: #000000 60%;
+}
+
+#help-dialog {
+    width: 58;
+    height: 16;
+    padding: 1 2;
+    background: $sc-surface;
+    border: solid $sc-accent;
+}
+
+#help-title {
+    height: 2;
+    color: $sc-accent;
+    text-style: bold;
+}
+
+#help-copy {
+    height: 1fr;
+    color: $sc-muted;
+}
+
+#help-close {
+    align-horizontal: right;
+}
+
+.narrow #active-model {
+    display: none;
+}
+
+.narrow .workspace-view {
+    padding: 1 2;
+}
+
+.narrow .nav-button {
+    min-width: 10;
+    padding: 0 1;
+}
+
+.narrow #onboarding-shell {
+    width: 100%;
+    height: 100%;
+    border: none;
+}

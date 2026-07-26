@@ -627,7 +627,7 @@ git commit -m "feat: orchestrate resilient network monitoring"
   - `DashboardScreen(Screen[None])`
   - dependency injection through `AppServices`
 
-- [ ] **Step 1: Write Pilot tests before widgets**
+- [x] **Step 1: Write Pilot tests before widgets**
 
 ```python
 @pytest.mark.asyncio
@@ -654,7 +654,7 @@ async def test_direct_navigation_and_pause_binding(app_factory) -> None:
 Also cover key validation failure, successful onboarding save, model selection,
 80×24 render, tab focus, `?`, `Ctrl+P`, `q`, and shutdown cleanup.
 
-- [ ] **Step 2: Run tests and witness RED**
+- [x] **Step 2: Run tests and witness RED**
 
 Run:
 
@@ -664,7 +664,7 @@ uv run pytest tests/tui/test_onboarding.py tests/tui/test_navigation.py -q
 
 Expected: missing UI modules.
 
-- [ ] **Step 3: Implement shell and responsive CSS**
+- [x] **Step 3: Implement shell and responsive CSS**
 
 Use a top status bar, left navigation rail on wide terminals, `ContentSwitcher`,
 and footer key hints. At `max-width: 89`, hide the rail labels and secondary
@@ -683,7 +683,7 @@ Onboarding is a five-step `TabbedContent` wizard with validation preventing
 forward movement. The key field is password-masked and its value is never
 included in notifications.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run:
 
@@ -693,7 +693,7 @@ uv run pytest tests/tui/test_onboarding.py tests/tui/test_navigation.py -q
 
 Expected: all pass at both terminal sizes.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/socketclaw/ui tests/tui
