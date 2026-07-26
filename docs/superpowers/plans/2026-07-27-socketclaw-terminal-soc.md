@@ -540,7 +540,7 @@ git commit -m "feat: persist and export incident history"
   - `MonitorService.run_diagnostic(kind, target) -> SecurityEvent`
   - `MonitorStatus`
 
-- [ ] **Step 1: Write probe and lifecycle tests**
+- [x] **Step 1: Write probe and lifecycle tests**
 
 ```python
 @pytest.mark.asyncio
@@ -567,7 +567,7 @@ Cover platform ping parsing, timeout, bounded port concurrency, log append,
 rotation/truncation, log regexes, pause/resume, idempotent stop, schedule
 intervals, queue backpressure, persistence, and deterministic scoring.
 
-- [ ] **Step 2: Run tests and witness RED**
+- [x] **Step 2: Run tests and witness RED**
 
 Run:
 
@@ -577,7 +577,7 @@ uv run pytest tests/unit/test_probes.py tests/integration/test_monitor.py -q
 
 Expected: missing modules.
 
-- [ ] **Step 3: Implement probes and monitor**
+- [x] **Step 3: Implement probes and monitor**
 
 Use `asyncio.create_subprocess_exec` with argument arrays for ping and
 traceroute; never invoke a shell. TCP scans use `asyncio.open_connection` with
@@ -586,7 +586,7 @@ offset. `MonitorService` owns tasks in a `TaskGroup`, converts exceptions to
 system events, scores and persists every event, and fans out to bounded
 subscriber queues.
 
-- [ ] **Step 4: Run GREEN and real read-only probe smoke**
+- [x] **Step 4: Run GREEN and real read-only probe smoke**
 
 Run:
 
@@ -597,7 +597,7 @@ uv run python -c 'import asyncio; from socketclaw.probes.ping import PingProbe; 
 
 Expected: tests pass and smoke prints `ping.result`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/socketclaw/probes src/socketclaw/monitor.py tests
