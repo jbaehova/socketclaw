@@ -1070,7 +1070,7 @@ git add tests scripts artifacts docs README.md
 git commit -m "test: verify SocketClaw end to end"
 ```
 
-- [ ] **Step 9: Re-run the final gate after the commit**
+- [x] **Step 9: Re-run the final gate after the commit**
 
 Run:
 

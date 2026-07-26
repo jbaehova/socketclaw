@@ -80,4 +80,8 @@ uv run pytest -q
 uv build
 ```
 
+Observed result: clean feature worktree, 51 files formatted, Ruff clean,
+Pyright `0 errors`, `133 passed, 3 skipped`, all 10 snapshots passed, and both
+the source distribution and wheel built successfully.
+
 There are no waived, indirect, pending, or open audit rows.
