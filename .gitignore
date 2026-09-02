@@ -9,14 +9,13 @@ wheels/
 
 # Virtual environments
 .venv
-.claude
-
 # IDE
 .idea/
 
 # Database files
 *.db
 
+.agents/
 AGENTS.md
 .env
 .worktrees/
