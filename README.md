@@ -2,8 +2,8 @@
 
 SocketClaw is a local-first terminal security operations cockpit. It watches
 configured hosts and logs, explains why each observation is important, stores
-the evidence in SQLite, and uses one explicitly selected OpenRouter model only
-when deeper incident analysis is requested.
+the evidence in SQLite, and uses GPT-5.6 Luna directly through the OpenAI
+Platform when deeper incident analysis is requested.
 
 ![SocketClaw overview](docs/screenshots/overview.svg)
 
@@ -15,18 +15,18 @@ when deeper incident analysis is requested.
   working without an API key or network access.
 - Presents a keyboard-first Textual interface for posture, events, hosts,
   investigations, and settings.
-- Persists events, model usage, costs, failures, and response proposals in a
-  local SQLite database with WAL and foreign keys enabled.
+- Persists events and model operations in a local SQLite database. This includes
+  estimated costs, failures, and response proposals.
 - Exports redacted Markdown or JSON incident records.
-- Connects only to OpenRouter for AI investigation. There is no Anthropic,
-  LangChain, browser dashboard, or background WebSocket service.
+- Connects only to `https://api.openai.com/v1` for AI investigation. No
+  alternate model-provider route or fallback exists.
 
 ## Requirements
 
 - Python 3.11 or newer
 - A terminal with color support
 - The system `ping` command for reachability checks
-- An OpenRouter API key for AI investigations (monitoring itself works without
+- An OpenAI API key for AI investigations (monitoring itself works without
   one)
 
 ## Install
@@ -58,27 +58,25 @@ Launch SocketClaw:
 socketclaw
 ```
 
-The five-step onboarding flow:
+The four-step onboarding flow:
 
 1. explains the local file boundary;
-2. validates an OpenRouter key without making a paid model request;
-3. selects one of the three curated model contracts;
-4. configures initial targets and intervals;
-5. starts the local monitor.
+2. validates the OpenAI key and Luna access without generating tokens;
+3. configures initial targets and intervals;
+4. starts the local monitor.
 
 The API key field is masked. The key is stored as inert data in
 `~/.socketclaw/.env` with mode `0600`; the file is never sourced as shell code.
 
-## Curated OpenRouter models
+## OpenAI model policy
 
-| UI preset | OpenRouter model ID | Fixed reasoning effort |
+| Model | OpenAI model ID | Reasoning effort |
 |---|---|---|
-| GPT-5.6 Terra | `openai/gpt-5.6-terra` | `high` |
-| Kimi K3 | `moonshotai/kimi-k3` | `max` |
-| Qwen3.7 Max | `qwen/qwen3.7-max` | `high` |
+| GPT-5.6 Luna | `gpt-5.6-luna` | `medium` for medium events, `high` for high and critical events |
 
-SocketClaw does not silently fall back to another provider or model. A failed
-request becomes a durable, retryable investigation failure.
+The model cannot be changed in configuration or the UI. Requests use the
+OpenAI Responses API with structured outputs. A failed request becomes a
+durable, retryable investigation failure instead of falling back.
 
 ## Keyboard reference
 
@@ -118,7 +116,7 @@ The default application home is `~/.socketclaw`. Override it with
 
 ```text
 ~/.socketclaw/
-├── .env                 # OpenRouter key, mode 0600
+├── .env                 # OpenAI key, mode 0600
 ├── config.toml          # validated non-secret settings, mode 0600
 ├── socketclaw.db        # events, investigations, proposals, runs
 └── exports/             # redacted incident Markdown and JSON
@@ -148,8 +146,8 @@ cockpit remains usable.
 
 **Onboarding says the key is invalid**
 
-Confirm that the key begins with the OpenRouter format and has access to the
-selected model. `socketclaw doctor` reports only whether a key is configured;
+Confirm that the key is an OpenAI Platform key and has access to
+`gpt-5.6-luna`. `socketclaw doctor` reports only whether a key is configured;
 it never prints its value.
 
 **Ping or traceroute is unavailable**
@@ -164,7 +162,7 @@ Run `socketclaw config path`, inspect `config.toml`, and correct the first
 validation error shown by `socketclaw doctor`. SocketClaw will not overwrite a
 malformed file automatically.
 
-**OpenRouter returns 401, 402, 429, or a provider error**
+**OpenAI returns 401, 402, 429, or an API error**
 
 The investigation detail preserves a redacted, classified failure. Correct the
 key or credit/rate-limit condition and use Retry. Local monitoring and history
@@ -186,13 +184,13 @@ uv run pyright
 uv build
 ```
 
-Paid live OpenRouter tests are opt-in and require an explicit env-file path.
+Paid live OpenAI tests are opt-in and require an explicit env-file path.
 The file is parsed as data; it is not sourced:
 
 ```bash
-SOCKETCLAW_LIVE_OPENROUTER=1 \
+SOCKETCLAW_LIVE_OPENAI=1 \
 SOCKETCLAW_LIVE_ENV_FILE=/absolute/path/to/.env \
-uv run pytest tests/live/test_openrouter_models.py -q
+uv run pytest tests/live/test_openai_model.py -q
 ```
 
-Live evidence is redacted and written below `artifacts/live-openrouter/`.
+Live evidence is redacted and written below `artifacts/live-openai/`.
