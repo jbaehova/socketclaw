@@ -1,4 +1,4 @@
-"""Validated local configuration and private OpenRouter credentials."""
+"""Validated local configuration and private OpenAI credentials."""
 
 from __future__ import annotations
 
@@ -9,15 +9,14 @@ import re
 import shlex
 import tempfile
 import tomllib
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-ModelKey = Literal["terra", "kimi", "qwen"]
+ModelKey = Literal["luna"]
+ReasoningEffort = Literal["medium", "high"]
 InvestigationThreshold = Literal["medium", "high", "critical"]
 ResponseMode = Literal["simulation", "approval", "automatic"]
 
@@ -28,35 +27,30 @@ class ConfigError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ModelPreset:
-    """A curated OpenRouter model and its required reasoning effort."""
+    """The fixed OpenAI model and its severity-aware reasoning policy."""
 
     key: ModelKey
     label: str
     model_id: str
-    effort: str
+    default_effort: ReasoningEffort
+    elevated_effort: ReasoningEffort
+
+    def effort_for(self, severity: str) -> ReasoningEffort:
+        """Spend more reasoning on high-impact security events."""
+        return self.elevated_effort if severity in {"high", "critical"} else self.default_effort
+
+    @property
+    def reasoning_label(self) -> str:
+        """Return the compact policy label shown in the UI."""
+        return f"{self.default_effort.upper()}-{self.elevated_effort.upper()}"
 
 
-MODEL_PRESETS: Mapping[ModelKey, ModelPreset] = MappingProxyType(
-    {
-        "terra": ModelPreset(
-            key="terra",
-            label="GPT-5.6 Terra",
-            model_id="openai/gpt-5.6-terra",
-            effort="high",
-        ),
-        "kimi": ModelPreset(
-            key="kimi",
-            label="Kimi K3",
-            model_id="moonshotai/kimi-k3",
-            effort="max",
-        ),
-        "qwen": ModelPreset(
-            key="qwen",
-            label="Qwen3.7 Max",
-            model_id="qwen/qwen3.7-max",
-            effort="high",
-        ),
-    }
+OPENAI_MODEL = ModelPreset(
+    key="luna",
+    label="GPT-5.6 Luna",
+    model_id="gpt-5.6-luna",
+    default_effort="medium",
+    elevated_effort="high",
 )
 
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
@@ -67,7 +61,7 @@ class AppConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    model: ModelKey = "terra"
+    model: ModelKey = "luna"
     targets: list[str] = Field(default_factory=lambda: ["1.1.1.1"])
     ping_interval: float = Field(default=5.0, ge=1.0, le=3600.0)
     scan_interval: float = Field(default=60.0, ge=5.0, le=86400.0)
@@ -116,8 +110,8 @@ class AppConfig(BaseModel):
 
     @property
     def preset(self) -> ModelPreset:
-        """Return the complete OpenRouter contract for the selected model."""
-        return MODEL_PRESETS[self.model]
+        """Return the fixed OpenAI model contract."""
+        return OPENAI_MODEL
 
 
 class ConfigStore:
@@ -148,6 +142,8 @@ class ConfigStore:
             return AppConfig()
         try:
             data = tomllib.loads(self.config_path.read_text(encoding="utf-8"))
+            if isinstance(data.get("model"), str) and data["model"] != "luna":
+                data["model"] = "luna"
             return AppConfig.model_validate(data)
         except (OSError, tomllib.TOMLDecodeError, ValidationError, TypeError) as exc:
             raise ConfigError(f"Cannot read config.toml: {exc}") from exc
@@ -158,7 +154,7 @@ class ConfigStore:
         self._atomic_write(self.config_path, _config_as_toml(validated))
 
     def load_api_key(self) -> str | None:
-        """Read the OpenRouter key without executing the env file."""
+        """Read the OpenAI key without executing the env file."""
         if not self.env_path.exists():
             return None
         try:
@@ -170,17 +166,17 @@ class ConfigStore:
                 if len(fields) != 1 or "=" not in fields[0]:
                     raise ValueError("expected NAME=value")
                 name, value = fields[0].split("=", 1)
-                if name == "OPENROUTER_API_KEY":
+                if name == "OPENAI_API_KEY":
                     return value or None
             return None
         except (OSError, ValueError) as exc:
             raise ConfigError(f"Cannot read .env: {exc}") from exc
 
     def save_api_key(self, value: str) -> None:
-        """Store an OpenRouter key as inert env-file data."""
+        """Store an OpenAI key as inert env-file data."""
         if not value.strip() or "\n" in value or "\r" in value or "\x00" in value:
-            raise ConfigError("OpenRouter API key must be one non-empty line")
-        content = f"OPENROUTER_API_KEY={shlex.quote(value)}\n"
+            raise ConfigError("OpenAI API key must be one non-empty line")
+        content = f"OPENAI_API_KEY={shlex.quote(value)}\n"
         self._atomic_write(self.env_path, content)
 
     def _atomic_write(self, destination: Path, content: str) -> None:

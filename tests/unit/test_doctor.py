@@ -14,15 +14,15 @@ async def test_doctor_reports_missing_optional_commands_without_blocking(
     tmp_path: Path,
 ) -> None:
     store = ConfigStore(tmp_path)
-    store.save_api_key("sk-or-v1-secret")
+    store.save_api_key("sk-proj-secret")
 
     report = await inspect_environment(store, which=lambda _command: None)
 
     assert report.launch_ready is True
-    assert report.check("OpenRouter key").status == "pass"
+    assert report.check("OpenAI key").status == "pass"
     assert report.check("ping command").status == "warn"
     assert report.check("traceroute command").status == "warn"
-    assert "sk-or-v1-secret" not in report.render()
+    assert "sk-proj-secret" not in report.render()
 
 
 @pytest.mark.asyncio

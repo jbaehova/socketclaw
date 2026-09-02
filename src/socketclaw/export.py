@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 
-from .openrouter import redact_secrets
+from .openai import redact_secrets
 from .storage import StoredEvent, StoredInvestigation
 
 
@@ -40,7 +40,7 @@ def export_markdown(
     """Export one incident as an operator-readable Markdown report."""
     signal_lines = (
         "\n".join(
-            f"- `{signal.code}` (+{signal.points}) — {signal.detail}" for signal in event.signals
+            f"- `{signal.code}` (+{signal.points}) - {signal.detail}" for signal in event.signals
         )
         or "- No deterministic detection signals were recorded."
     )
@@ -57,7 +57,7 @@ def export_markdown(
         f"**Observed:** {event.observed_at.isoformat()}  ",
         f"**Severity:** {event.severity.value.upper()} ({event.score}/100)  ",
         f"**Source:** `{event.source.value}`  ",
-        f"**Target:** {event.target or '—'}",
+        f"**Target:** {event.target or '-'}",
         "",
         f"## {event.title}",
         "",
@@ -115,7 +115,7 @@ def export_markdown(
                 f"**Classification:** {assessment.classification.upper()}  ",
                 f"**Confidence:** {assessment.confidence:.0%}  ",
                 f"**Tokens:** {usage.total_tokens or 0}  ",
-                f"**Cost:** ${usage.cost_usd:.6f}  ",
+                f"**Estimated cost:** ${usage.cost_usd:.6f}  ",
                 f"**Latency:** {usage.latency_ms} ms",
                 "",
                 assessment.summary,

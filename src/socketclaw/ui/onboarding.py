@@ -1,18 +1,18 @@
-"""Five-step first-run setup for local files and OpenRouter."""
+"""Four-step first-run setup for local files and OpenAI."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
-from textual.widgets import Button, ContentSwitcher, Input, Select, Static
+from textual.widgets import Button, ContentSwitcher, Input, Static
 
-from ..config import MODEL_PRESETS, AppConfig, ModelKey
-from ..openrouter import OpenRouterError
+from ..config import AppConfig
+from ..openai import OpenAIError
 from .context import socketclaw_app
 
 if TYPE_CHECKING:
@@ -22,13 +22,12 @@ if TYPE_CHECKING:
 class OnboardingScreen(Screen[None]):
     """Collect, validate, and persist the minimum useful first-run settings."""
 
-    def __init__(self, services: AppServices) -> None:
+    def __init__(self, services: AppServices, initial_config: AppConfig) -> None:
         super().__init__()
         self.services = services
         self.current_step = 0
         self._pending_key = ""
-        self._selected_model: ModelKey = "terra"
-        self._pending_config = AppConfig()
+        self._pending_config = initial_config.model_copy(deep=True)
 
     def on_mount(self) -> None:
         self.query_one("#onboarding-next", Button).focus()
@@ -40,7 +39,7 @@ class OnboardingScreen(Screen[None]):
                 "LOCAL NETWORK OPERATIONS / FIRST RUN",
                 id="onboarding-kicker",
             )
-            yield Static("01  02  03  04  05", id="onboarding-progress")
+            yield Static("01  02  03  04", id="onboarding-progress")
             with ContentSwitcher(
                 initial="onboarding-welcome",
                 id="onboarding-steps",
@@ -49,7 +48,7 @@ class OnboardingScreen(Screen[None]):
                     yield Static("See what changed on your network.", classes="step-title")
                     yield Static(
                         "SocketClaw watches configured hosts and logs, keeps a local "
-                        "incident timeline, and asks OpenRouter only when an event needs "
+                        "incident timeline, and asks OpenAI only when an event needs "
                         "deeper analysis.",
                         classes="step-copy",
                     )
@@ -58,35 +57,16 @@ class OnboardingScreen(Screen[None]):
                         classes="step-note",
                     )
                 with Vertical(id="onboarding-key", classes="onboarding-step"):
-                    yield Static("Connect OpenRouter", classes="step-title")
+                    yield Static("Connect OpenAI", classes="step-title")
                     yield Static(
-                        "The key is validated without a model request, then stored in "
-                        "~/.socketclaw/.env with private permissions.",
+                        "The key and GPT-5.6 Luna access are validated without generating "
+                        "tokens, then stored in ~/.socketclaw/.env with private permissions.",
                         classes="step-copy",
                     )
                     yield Input(
-                        placeholder="sk-or-v1-…",
+                        placeholder="sk-proj-...",
                         password=True,
                         id="api-key",
-                    )
-                with Vertical(id="onboarding-model-step", classes="onboarding-step"):
-                    yield Static("Choose the analysis model", classes="step-title")
-                    yield Static(
-                        "Each preset has a fixed reasoning effort so investigations are "
-                        "consistent and auditable.",
-                        classes="step-copy",
-                    )
-                    yield Select(
-                        [
-                            (
-                                f"{preset.label}  /  {preset.effort.upper()}",
-                                preset.key,
-                            )
-                            for preset in MODEL_PRESETS.values()
-                        ],
-                        value="terra",
-                        allow_blank=False,
-                        id="onboarding-model",
                     )
                 with Vertical(id="onboarding-target-step", classes="onboarding-step"):
                     yield Static("Set the first watch targets", classes="step-title")
@@ -95,7 +75,7 @@ class OnboardingScreen(Screen[None]):
                         classes="step-copy",
                     )
                     yield Input(
-                        value="1.1.1.1",
+                        value=", ".join(self._pending_config.targets),
                         placeholder="1.1.1.1, gateway.local",
                         id="onboarding-targets",
                     )
@@ -103,14 +83,14 @@ class OnboardingScreen(Screen[None]):
                         with Vertical():
                             yield Static("PING / SECONDS", classes="field-label")
                             yield Input(
-                                value="5",
+                                value=f"{self._pending_config.ping_interval:g}",
                                 type="number",
                                 id="onboarding-ping-interval",
                             )
                         with Vertical():
                             yield Static("PORT SCAN / SECONDS", classes="field-label")
                             yield Input(
-                                value="60",
+                                value=f"{self._pending_config.scan_interval:g}",
                                 type="number",
                                 id="onboarding-scan-interval",
                             )
@@ -142,21 +122,9 @@ class OnboardingScreen(Screen[None]):
             await self._validate_key()
             return
         if self.current_step == 2:
-            model_select = cast(
-                Select[object],
-                self.query_one("#onboarding-model", Select),
-            )
-            selected = model_select.value
-            if selected not in MODEL_PRESETS:
-                self._set_error("Choose one of the three curated models.")
-                return
-            self._selected_model = cast(ModelKey, selected)
-            self._show_step(3)
-            return
-        if self.current_step == 3:
             if not self._validate_targets():
                 return
-            self._show_step(4)
+            self._show_step(3)
             self._render_summary()
             self.query_one("#onboarding-next", Button).label = "Start monitoring"
             return
@@ -166,18 +134,18 @@ class OnboardingScreen(Screen[None]):
     async def _validate_key(self) -> None:
         key = self.query_one("#api-key", Input).value
         if not key.strip():
-            self._set_error("Enter an OpenRouter API key.")
+            self._set_error("Enter an OpenAI API key.")
             return
         button = self.query_one("#onboarding-next", Button)
         button.disabled = True
         button.label = "Validating…"
         try:
             await self.services.validate_key(key)
-        except OpenRouterError as exc:
+        except OpenAIError as exc:
             self._set_error(str(exc))
             return
         except Exception:
-            self._set_error("OpenRouter validation failed. Check your connection.")
+            self._set_error("OpenAI validation failed. Check your connection.")
             return
         finally:
             button.disabled = False
@@ -189,11 +157,17 @@ class OnboardingScreen(Screen[None]):
         raw_targets = self.query_one("#onboarding-targets", Input).value
         targets = [value.strip() for value in raw_targets.split(",") if value.strip()]
         try:
-            self._pending_config = AppConfig(
-                model=self._selected_model,
-                targets=targets,
-                ping_interval=float(self.query_one("#onboarding-ping-interval", Input).value),
-                scan_interval=float(self.query_one("#onboarding-scan-interval", Input).value),
+            self._pending_config = AppConfig.model_validate(
+                {
+                    **self._pending_config.model_dump(),
+                    "targets": targets,
+                    "ping_interval": float(
+                        self.query_one("#onboarding-ping-interval", Input).value
+                    ),
+                    "scan_interval": float(
+                        self.query_one("#onboarding-scan-interval", Input).value
+                    ),
+                }
             )
         except (ValidationError, ValueError) as exc:
             self._set_error(_validation_message(exc))
@@ -204,7 +178,6 @@ class OnboardingScreen(Screen[None]):
         ids = (
             "onboarding-welcome",
             "onboarding-key",
-            "onboarding-model-step",
             "onboarding-target-step",
             "onboarding-ready",
         )
@@ -212,19 +185,19 @@ class OnboardingScreen(Screen[None]):
         self.query_one("#onboarding-steps", ContentSwitcher).current = ids[step]
         progress = "  ".join(
             f"[b reverse]{index:02d}[/]" if index == step + 1 else f"{index:02d}"
-            for index in range(1, 6)
+            for index in range(1, 5)
         )
         self.query_one("#onboarding-progress", Static).update(progress)
         self.query_one("#onboarding-back", Button).disabled = step == 0
-        if step < 4:
+        if step < 3:
             self.query_one("#onboarding-next", Button).label = "Continue"
 
     def _render_summary(self) -> None:
         preset = self._pending_config.preset
         self.query_one("#onboarding-summary", Static).update(
-            f"{len(self._pending_config.targets)} target(s)  •  "
-            f"{preset.label} / {preset.effort.upper()}  •  "
-            f"Ping {self._pending_config.ping_interval:g}s  •  "
+            f"{len(self._pending_config.targets)} target(s) / "
+            f"{preset.label} / {preset.reasoning_label} / "
+            f"Ping {self._pending_config.ping_interval:g}s / "
             f"Scan {self._pending_config.scan_interval:g}s"
         )
 

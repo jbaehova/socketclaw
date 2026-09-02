@@ -7,12 +7,17 @@ from pathlib import Path
 from packaging.requirements import Requirement
 
 FORBIDDEN_DEPENDENCIES = {
+    "anthropic",
+    "claude-agent-sdk",
     "gradio",
     "langchain-anthropic",
     "langchain-core",
+    "langchain-openrouter",
     "langgraph",
+    "openrouter",
     "websockets",
 }
+FORBIDDEN_PROVIDER_MARKERS = ("openrouter", "anthropic", "claude")
 FORBIDDEN_TOP_LEVEL_PACKAGES = {
     "agent",
     "network",
@@ -57,3 +62,12 @@ def test_source_tree_exposes_only_the_socketclaw_product_package() -> None:
     }
 
     assert packages.isdisjoint(FORBIDDEN_TOP_LEVEL_PACKAGES)
+
+
+def test_runtime_source_has_no_alternate_model_provider_path() -> None:
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(Path("src/socketclaw").rglob("*.py"))
+    ).casefold()
+
+    for marker in FORBIDDEN_PROVIDER_MARKERS:
+        assert marker not in source

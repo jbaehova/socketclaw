@@ -8,7 +8,7 @@ from textual.widgets import Input, Select, Static
 
 
 @pytest.mark.asyncio
-async def test_settings_select_qwen_and_atomically_save(
+async def test_settings_preserves_luna_and_atomically_saves(
     app_factory: Callable[..., Any],
 ) -> None:
     fixture = app_factory(configured=True)
@@ -16,7 +16,6 @@ async def test_settings_select_qwen_and_atomically_save(
     async with fixture.app.run_test(size=(120, 36)) as pilot:
         await pilot.pause(0.2)
         await pilot.press("5")
-        fixture.app.screen.query_one("#model", Select).value = "qwen"
         fixture.app.screen.query_one("#settings-targets", Input).value = "1.1.1.1, 8.8.8.8"
         fixture.app.screen.query_one("#settings-ping", Input).value = "10"
         fixture.app.screen.query_one("#settings-scan", Input).value = "120"
@@ -25,9 +24,9 @@ async def test_settings_select_qwen_and_atomically_save(
         await pilot.click("#save-settings")
         await pilot.pause(0.2)
 
-        assert fixture.app.config.model == "qwen"
+        assert fixture.app.config.model == "luna"
         saved = fixture.store.load()
-        assert saved.model == "qwen"
+        assert saved.model == "luna"
         assert saved.targets == ["1.1.1.1", "8.8.8.8"]
         assert saved.investigation_threshold == "critical"
         assert saved.response_mode == "simulation"
@@ -53,12 +52,12 @@ async def test_api_key_replacement_is_masked_validated_and_never_rendered(
         await pilot.press("5")
         key = fixture.app.screen.query_one("#settings-api-key", Input)
         assert key.password is True
-        key.value = "sk-or-v1-replacement"
+        key.value = "sk-proj-replacement"
         await pilot.click("#save-settings")
         await pilot.pause(0.3)
 
-        assert seen == ["sk-or-v1-replacement"]
-        assert fixture.store.load_api_key() == "sk-or-v1-replacement"
-        assert "sk-or-v1-replacement" not in str(
+        assert seen == ["sk-proj-replacement"]
+        assert fixture.store.load_api_key() == "sk-proj-replacement"
+        assert "sk-proj-replacement" not in str(
             fixture.app.screen.query_one("#settings-state", Static).render()
         )

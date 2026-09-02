@@ -73,7 +73,7 @@ def investigation_fixture(*, cost: float = 0.0042) -> InvestigationResult:
             latency_ms=800,
             provider_request_id="gen-test",
         ),
-        model_id="openai/gpt-5.6-terra",
+        model_id="gpt-5.6-luna",
         requested_effort="high",
     )
 
@@ -187,14 +187,14 @@ async def test_failed_investigation_is_durable_and_retryable(
 
     failure = await repository.save_investigation_failure(
         stored.id,
-        model_id="qwen/qwen3.7-max",
+        model_id="gpt-5.6-luna",
         requested_effort="high",
-        error="OpenRouter rate limited the request",
+        error="OpenAI rate limited the request",
     )
 
     loaded = await repository.get_event(stored.id)
     assert failure.status == "failed"
-    assert failure.error == "OpenRouter rate limited the request"
+    assert failure.error == "OpenAI rate limited the request"
     assert loaded is not None
     assert loaded.investigation_state == "failed"
 
@@ -283,8 +283,8 @@ async def test_session_stats_aggregate_severity_usage_and_failures(
     await repository.save_investigation(first.id, investigation_fixture(cost=0.004))
     await repository.save_investigation_failure(
         second.id,
-        model_id="moonshotai/kimi-k3",
-        requested_effort="max",
+        model_id="gpt-5.6-luna",
+        requested_effort="high",
         error="Provider unavailable",
     )
 
@@ -294,7 +294,7 @@ async def test_session_stats_aggregate_severity_usage_and_failures(
     assert stats.by_severity == {"critical": 1, "high": 1}
     assert stats.completed_investigations == 1
     assert stats.failed_investigations == 1
-    assert stats.total_tokens == 150
+    assert stats.total_tokens == 130
     assert stats.cost_usd == pytest.approx(0.004)
 
 

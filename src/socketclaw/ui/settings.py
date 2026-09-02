@@ -10,7 +10,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Input, Select, Static
 
-from ..config import MODEL_PRESETS, AppConfig
+from ..config import AppConfig
 from .context import socketclaw_app
 
 
@@ -30,14 +30,9 @@ class SettingsView(Vertical):
         with Horizontal(classes="settings-grid"):
             with Vertical():
                 yield Static("ANALYSIS MODEL", classes="field-label")
-                yield Select(
-                    [
-                        (f"{preset.label} / {preset.effort.upper()}", preset.key)
-                        for preset in MODEL_PRESETS.values()
-                    ],
-                    value=config.model,
-                    allow_blank=False,
-                    id="model",
+                yield Static(
+                    f"{config.preset.label} / {config.preset.reasoning_label}",
+                    id="model-policy",
                 )
                 yield Static("INVESTIGATE AT", classes="field-label")
                 yield Select(
@@ -78,7 +73,7 @@ class SettingsView(Vertical):
                             type="number",
                             id="settings-scan",
                         )
-                yield Static("REPLACE OPENROUTER KEY / OPTIONAL", classes="field-label")
+                yield Static("REPLACE OPENAI KEY / OPTIONAL", classes="field-label")
                 yield Input(
                     placeholder="Leave blank to keep the configured key",
                     password=True,
@@ -112,7 +107,7 @@ class SettingsView(Vertical):
         try:
             config = AppConfig.model_validate(
                 {
-                    "model": _select_value(cast(Select[object], self.query_one("#model", Select))),
+                    "model": app.config.model,
                     "targets": [
                         target.strip()
                         for target in self.query_one("#settings-targets", Input).value.split(",")
@@ -149,7 +144,7 @@ class SettingsView(Vertical):
             self._show_state(f"Settings were not saved: {exc}", error=True)
         else:
             key_input.value = ""
-            self._show_state(f"Saved · {config.preset.label} / {config.preset.effort.upper()}")
+            self._show_state(f"Saved / {config.preset.label} / {config.preset.reasoning_label}")
         finally:
             button.disabled = False
 

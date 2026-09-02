@@ -45,7 +45,7 @@ async def test_filter_select_investigate_export_and_live_insert(
         await pilot.pause(0.2)
         exports = list((fixture.store.home / "exports").glob("*.md"))
         assert len(exports) == 1
-        assert "sk-or-v1-configured" not in exports[0].read_text()
+        assert "sk-proj-configured" not in exports[0].read_text()
 
         live = event_fixture(title="Live DNS anomaly", severity="high")
         await fixture.monitor.publish(live)

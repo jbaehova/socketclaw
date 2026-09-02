@@ -100,4 +100,4 @@ async def test_number_navigation_moves_focus_to_primary_control(
 
         await pilot.press("5")
         assert fixture.app.focused is not None
-        assert fixture.app.focused.id == "model"
+        assert fixture.app.focused.id == "threshold"

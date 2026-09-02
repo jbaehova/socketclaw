@@ -105,7 +105,7 @@ async def inspect_environment(
                 status="pass",
                 detail=(
                     f"{len(config.targets)} target(s), "
-                    f"{config.preset.label} / {config.preset.effort.upper()}"
+                    f"{config.preset.label} / {config.preset.reasoning_label}"
                 ),
             )
         )
@@ -115,7 +115,7 @@ async def inspect_environment(
     except ConfigError as exc:
         checks.append(
             DiagnosticCheck(
-                name="OpenRouter key",
+                name="OpenAI key",
                 status="fail",
                 detail=str(exc),
                 blocking=True,
@@ -124,7 +124,7 @@ async def inspect_environment(
     else:
         checks.append(
             DiagnosticCheck(
-                name="OpenRouter key",
+                name="OpenAI key",
                 status="pass" if key else "warn",
                 detail="configured" if key else "not configured; onboarding will open",
             )

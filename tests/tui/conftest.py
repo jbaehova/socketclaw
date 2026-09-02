@@ -12,7 +12,7 @@ import pytest
 from socketclaw.config import AppConfig, ConfigStore
 from socketclaw.domain import Assessment, DetectionSignal, ModelUsage
 from socketclaw.monitor import MonitorStatus
-from socketclaw.openrouter import KeyStatus
+from socketclaw.openai import ModelAccess
 from socketclaw.storage import (
     EventQuery,
     SessionStats,
@@ -181,16 +181,15 @@ class FakeRepository:
         )
 
 
-KeyValidator = Callable[[str], Awaitable[KeyStatus]]
+KeyValidator = Callable[[str], Awaitable[ModelAccess]]
 
 
-async def valid_key(_key: str) -> KeyStatus:
-    return KeyStatus(
-        label="socketclaw-test",
-        is_free_tier=False,
-        limit=10,
-        limit_remaining=9,
-        usage=1,
+async def valid_key(_key: str) -> ModelAccess:
+    return ModelAccess(
+        id="gpt-5.6-luna",
+        object="model",
+        created=1,
+        owned_by="openai",
     )
 
 
@@ -267,7 +266,7 @@ def investigation_fixture(
             if status == "complete"
             else None
         ),
-        model_id="openai/gpt-5.6-terra",
+        model_id="gpt-5.6-luna",
         requested_effort="high",
         error="Provider unavailable" if status == "failed" else None,
         created_at=now,
@@ -296,7 +295,7 @@ def app_factory(
         store = ConfigStore(tmp_path / f"home-{counter}")
         if configured:
             store.save(config or AppConfig())
-            store.save_api_key("sk-or-v1-configured")
+            store.save_api_key("sk-proj-configured")
         repository = FakeRepository(events, investigations, proposals)
         monitor = TestMonitor(repository)
 

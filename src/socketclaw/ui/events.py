@@ -119,7 +119,7 @@ class EventsView(Vertical):
     async def _investigate(self, event_id: UUID) -> None:
         button = self.query_one("#investigate-event", Button)
         button.disabled = True
-        self._show_state("Investigating with the selected OpenRouter model…")
+        self._show_state("Investigating with GPT-5.6 Luna on OpenAI…")
         try:
             app = socketclaw_app(self)
             await app.investigate_event(event_id)
@@ -181,7 +181,7 @@ class EventsView(Vertical):
                 event.observed_at.astimezone().strftime("%H:%M:%S"),
                 event.severity.value.upper(),
                 event.source.value,
-                event.target or "—",
+                event.target or "-",
                 event.title,
                 key=str(event.id),
             )
@@ -203,15 +203,15 @@ class EventsView(Vertical):
             return
         signals = (
             "\n".join(
-                f"- **{signal.label}** `+{signal.points}` — {signal.detail}"
+                f"- **{signal.label}** `+{signal.points}` - {signal.detail}"
                 for signal in event.signals
             )
             or "- No deterministic signals were recorded."
         )
         self.query_one("#event-detail", Markdown).update(
             f"## {event.title}\n\n"
-            f"**{event.severity.value.upper()} · {event.score}/100**  \n"
-            f"`{event.event_type}` · `{event.target or 'no target'}`  \n"
+            f"**{event.severity.value.upper()} / {event.score}/100**  \n"
+            f"`{event.event_type}` / `{event.target or 'no target'}`  \n"
             f"{event.observed_at.astimezone().isoformat(timespec='seconds')}\n\n"
             f"{event.summary}\n\n### Detection signals\n\n{signals}\n\n"
             f"### Evidence\n\n```json\n{event.model_dump_json(indent=2)}\n```"

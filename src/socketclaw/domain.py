@@ -1,4 +1,4 @@
-"""Typed domain records shared by monitoring, storage, OpenRouter, and UI."""
+"""Typed domain records shared by monitoring, storage, OpenAI, and UI."""
 
 from __future__ import annotations
 
@@ -136,7 +136,7 @@ class Assessment(BaseModel):
 
 
 class ModelUsage(BaseModel):
-    """Provider usage and billing metadata for a single investigation."""
+    """OpenAI token usage and estimated billing for one investigation."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -154,13 +154,13 @@ class ModelUsage(BaseModel):
             object.__setattr__(
                 self,
                 "total_tokens",
-                self.prompt_tokens + self.completion_tokens + self.reasoning_tokens,
+                self.prompt_tokens + self.completion_tokens,
             )
         return self
 
 
 class InvestigationResult(BaseModel):
-    """Assessment plus the OpenRouter contract and accounting used."""
+    """Assessment plus the OpenAI contract and accounting used."""
 
     model_config = ConfigDict(frozen=True)
 

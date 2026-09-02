@@ -153,7 +153,7 @@ async def _seed(repository: Repository) -> None:
                 latency_ms=810,
                 provider_request_id="capture-request",
             ),
-            model_id="openai/gpt-5.6-terra",
+            model_id="gpt-5.6-luna",
             requested_effort="high",
         ),
     )

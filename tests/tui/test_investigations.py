@@ -41,8 +41,8 @@ async def test_investigation_detail_shows_model_usage_cost_and_failed_retry(
         await pilot.click("#retry-investigation")
         await pilot.pause(0.3)
         assert len(fixture.repository.investigations_data) == 3
-        assert "GPT-5.6 Terra" in detail.source
-        assert "180 tokens" in detail.source
+        assert "GPT-5.6 Luna" in detail.source
+        assert "160 tokens" in detail.source
         assert "$0.004200" in detail.source
 
 

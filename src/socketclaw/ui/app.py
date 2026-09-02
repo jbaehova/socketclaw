@@ -17,7 +17,7 @@ from ..config import AppConfig, ConfigStore
 from ..domain import InvestigationResult, SecurityEvent
 from ..export import export_markdown
 from ..monitor import MonitorStatus
-from ..openrouter import KeyStatus, OpenRouterClient
+from ..openai import ModelAccess, OpenAIClient
 from ..storage import (
     EventQuery,
     ResponseStatus,
@@ -91,12 +91,12 @@ class DataRepository(Protocol):
     async def session_stats(self) -> SessionStats: ...
 
 
-KeyValidator = Callable[[str], Awaitable[KeyStatus]]
+KeyValidator = Callable[[str], Awaitable[ModelAccess]]
 InvestigationRunner = Callable[[UUID], Awaitable[StoredInvestigation]]
 
 
-async def _validate_key(key: str) -> KeyStatus:
-    return await OpenRouterClient(key).validate_key()
+async def _validate_key(key: str) -> ModelAccess:
+    return await OpenAIClient(key).validate_key()
 
 
 @dataclass(slots=True)
@@ -143,11 +143,11 @@ class SocketClawApp(App[None]):
         return self.services.config_store
 
     async def on_mount(self) -> None:
+        self.config = self.services.config_store.load()
         key = self.services.config_store.load_api_key()
         if key is None:
-            self._show_product_screen(OnboardingScreen(self.services))
+            self._show_product_screen(OnboardingScreen(self.services, self.config))
             return
-        self.config = self.services.config_store.load()
         await self._open_dashboard()
 
     async def complete_onboarding(self, config: AppConfig, api_key: str) -> None:
@@ -180,15 +180,16 @@ class SocketClawApp(App[None]):
             raise KeyError(str(event_id))
         key = self.services.config_store.load_api_key()
         if key is None:
-            raise RuntimeError("OpenRouter API key is not configured")
+            raise RuntimeError("OpenAI API key is not configured")
         preset = self.config.preset
+        effort = preset.effort_for(event.severity)
         try:
-            result = await OpenRouterClient(key).investigate(event, preset)
+            result = await OpenAIClient(key).investigate(event)
         except Exception as exc:
             await repository.save_investigation_failure(
                 event_id,
                 model_id=preset.model_id,
-                requested_effort=preset.effort,
+                requested_effort=effort,
                 error=str(exc),
             )
             self._refresh_investigations()

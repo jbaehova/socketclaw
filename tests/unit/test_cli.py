@@ -57,14 +57,14 @@ def test_doctor_command_redacts_configured_key(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("SOCKETCLAW_HOME", str(tmp_path))
-    ConfigStore(tmp_path).save_api_key("sk-or-v1-secret")
+    ConfigStore(tmp_path).save_api_key("sk-proj-secret")
 
     result = runner.invoke(app, ["doctor"])
 
     assert result.exit_code == 0
-    assert "OpenRouter key" in result.stdout
+    assert "OpenAI key" in result.stdout
     assert "configured" in result.stdout
-    assert "sk-or-v1-secret" not in result.stdout
+    assert "sk-proj-secret" not in result.stdout
 
 
 def test_export_latest_event_as_redacted_json(
@@ -73,7 +73,7 @@ def test_export_latest_event_as_redacted_json(
 ) -> None:
     monkeypatch.setenv("SOCKETCLAW_HOME", str(tmp_path))
     store = ConfigStore(tmp_path)
-    store.save_api_key("sk-or-v1-secret")
+    store.save_api_key("sk-proj-secret")
 
     async def seed() -> str:
         repository = Repository(store.database_path)
@@ -82,9 +82,9 @@ def test_export_latest_event_as_redacted_json(
             source="manual",
             event_type="manual.test",
             title="Synthetic incident",
-            summary="Evidence contains sk-or-v1-secret",
+            summary="Evidence contains sk-proj-secret",
             target="1.1.1.1",
-            evidence={"secret": "sk-or-v1-secret"},
+            evidence={"secret": "sk-proj-secret"},
         )
         stored = await repository.save_event(
             event,
@@ -105,7 +105,7 @@ def test_export_latest_event_as_redacted_json(
     assert str(destination) in result.stdout
     payload = json.loads(destination.read_text())
     assert payload["event"]["id"] == event_id
-    assert "sk-or-v1-secret" not in destination.read_text()
+    assert "sk-proj-secret" not in destination.read_text()
     assert "[REDACTED]" in destination.read_text()
 
 

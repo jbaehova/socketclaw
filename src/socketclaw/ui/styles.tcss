@@ -380,7 +380,6 @@ OnboardingScreen {
 }
 
 #api-key,
-#onboarding-model,
 #onboarding-targets {
     width: 1fr;
     margin-top: 1;

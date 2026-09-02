@@ -21,7 +21,7 @@ def incident_fixture() -> tuple[StoredEvent, StoredInvestigation]:
         title="Target stopped responding",
         summary="Complete packet loss on 1.1.1.1",
         target="1.1.1.1",
-        evidence={"packet_loss": 100.0, "debug": "sk-or-v1-secret"},
+        evidence={"packet_loss": 100.0, "debug": "sk-proj-secret"},
         score=70,
         severity="high",
         investigation_state="complete",
@@ -54,7 +54,7 @@ def incident_fixture() -> tuple[StoredEvent, StoredInvestigation]:
             latency_ms=800,
             provider_request_id="gen-test",
         ),
-        model_id="openai/gpt-5.6-terra",
+        model_id="gpt-5.6-luna",
         requested_effort="high",
         created_at=datetime(2026, 7, 27, 12, 0, 2, tzinfo=UTC),
         completed_at=datetime(2026, 7, 27, 12, 0, 3, tzinfo=UTC),
@@ -68,16 +68,16 @@ def test_markdown_export_is_complete_and_redacts_secret() -> None:
     rendered = export_markdown(
         event,
         investigation,
-        secrets=["sk-or-v1-secret"],
+        secrets=["sk-proj-secret"],
     )
 
     assert rendered.startswith("# SocketClaw Incident\n")
     assert "**Severity:** HIGH (70/100)" in rendered
     assert "`ping.total_loss`" in rendered
     assert "GPT-5.6" not in rendered
-    assert "openai/gpt-5.6-terra" in rendered
+    assert "gpt-5.6-luna" in rendered
     assert "$0.004200" in rendered
-    assert "sk-or-v1-secret" not in rendered
+    assert "sk-proj-secret" not in rendered
     assert "[REDACTED]" in rendered
 
 
@@ -87,15 +87,15 @@ def test_json_export_round_trips_typed_incident_without_secret() -> None:
     rendered = export_json(
         event,
         investigation,
-        secrets=["sk-or-v1-secret"],
+        secrets=["sk-proj-secret"],
     )
     parsed = json.loads(rendered)
 
     assert parsed["event"]["id"] == str(event.id)
     assert parsed["event"]["signals"][0]["code"] == "ping.total_loss"
     assert parsed["investigation"]["assessment"]["confidence"] == 0.91
-    assert parsed["investigation"]["usage"]["total_tokens"] == 150
-    assert "sk-or-v1-secret" not in rendered
+    assert parsed["investigation"]["usage"]["total_tokens"] == 130
+    assert "sk-proj-secret" not in rendered
 
 
 def test_export_without_investigation_has_explicit_pending_state() -> None:

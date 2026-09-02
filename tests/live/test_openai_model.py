@@ -6,37 +6,33 @@ from pathlib import Path
 
 import pytest
 
-from socketclaw.config import MODEL_PRESETS, ConfigStore
+from socketclaw.config import OPENAI_MODEL, ConfigStore
 from socketclaw.domain import SecurityEvent
-from socketclaw.openrouter import OpenRouterClient
+from socketclaw.openai import OpenAIClient
 
 
 def _live_key() -> str:
-    if os.getenv("SOCKETCLAW_LIVE_OPENROUTER") != "1":
-        pytest.skip("set SOCKETCLAW_LIVE_OPENROUTER=1 to spend OpenRouter credits")
-    direct = os.getenv("OPENROUTER_API_KEY")
+    if os.getenv("SOCKETCLAW_LIVE_OPENAI") != "1":
+        pytest.skip("set SOCKETCLAW_LIVE_OPENAI=1 to spend OpenAI credits")
+    direct = os.getenv("OPENAI_API_KEY")
     if direct:
         return direct
     env_file = os.getenv("SOCKETCLAW_LIVE_ENV_FILE")
     if not env_file:
-        pytest.skip("no OpenRouter key or SOCKETCLAW_LIVE_ENV_FILE configured")
+        pytest.skip("no OpenAI key or SOCKETCLAW_LIVE_ENV_FILE configured")
     path = Path(env_file)
     if path.name != ".env":
         pytest.fail("SOCKETCLAW_LIVE_ENV_FILE must point to an .env file")
     key = ConfigStore(path.parent).load_api_key()
     if not key:
-        pytest.skip("the selected .env file has no OPENROUTER_API_KEY")
+        pytest.skip("the selected .env file has no OPENAI_API_KEY")
     return key
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preset_key", ["terra", "kimi", "qwen"])
-async def test_curated_model_can_assess_a_minimal_paid_event(
-    preset_key: str,
-) -> None:
+async def test_luna_can_assess_a_minimal_paid_event() -> None:
     key = _live_key()
-    preset = MODEL_PRESETS[preset_key]
-    client = OpenRouterClient(key, timeout=90.0)
+    client = OpenAIClient(key, timeout=90.0)
     event = SecurityEvent(
         source="port_scan",
         event_type="port_scan.result",
@@ -48,22 +44,21 @@ async def test_curated_model_can_assess_a_minimal_paid_event(
         severity="medium",
     )
 
-    result = await client.investigate(event, preset)
+    result = await client.investigate(event)
 
     assert result.assessment.summary.strip()
     assert result.assessment.rationale
-    assert result.model_id
-    assert result.requested_effort == preset.effort
+    assert result.model_id == OPENAI_MODEL.model_id
+    assert result.requested_effort == "medium"
     assert result.usage.latency_ms > 0
     assert result.usage.total_tokens is not None
     assert result.usage.total_tokens > 0
     assert result.usage.cost_usd >= 0
 
-    evidence_directory = Path("artifacts/live-openrouter")
+    evidence_directory = Path("artifacts/live-openai")
     evidence_directory.mkdir(parents=True, exist_ok=True)
     evidence = {
-        "preset": preset.key,
-        "requested_model_id": preset.model_id,
+        "requested_model_id": OPENAI_MODEL.model_id,
         "provider_model_id": result.model_id,
         "requested_effort": result.requested_effort,
         "classification": result.assessment.classification,
@@ -72,10 +67,10 @@ async def test_curated_model_can_assess_a_minimal_paid_event(
         "completion_tokens": result.usage.completion_tokens,
         "reasoning_tokens": result.usage.reasoning_tokens,
         "total_tokens": result.usage.total_tokens,
-        "cost_usd": result.usage.cost_usd,
+        "estimated_cost_usd": result.usage.cost_usd,
         "provider_request_id": result.usage.provider_request_id,
     }
-    (evidence_directory / f"{preset.key}.json").write_text(
+    (evidence_directory / "luna.json").write_text(
         json.dumps(evidence, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )

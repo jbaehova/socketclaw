@@ -1,4 +1,4 @@
-"""OpenRouter investigation queue, usage accounting, and response review."""
+"""OpenAI investigation queue, usage accounting, and response review."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, DataTable, Markdown, Static
 
-from ..config import MODEL_PRESETS
+from ..config import OPENAI_MODEL
 from ..storage import ResponseStatus, StoredInvestigation, StoredResponseProposal
 from .context import socketclaw_app
 from .dialogs import ConfirmResponseScreen
@@ -26,7 +26,7 @@ class InvestigationsView(Vertical):
         self._selected_id: UUID | None = None
 
     def compose(self) -> ComposeResult:
-        yield Static("INVESTIGATIONS / OPENROUTER", classes="view-kicker")
+        yield Static("INVESTIGATIONS / OPENAI", classes="view-kicker")
         with Horizontal(classes="view-heading"):
             yield Static("Analysis queue", classes="view-title")
             yield Static("", id="investigation-totals", classes="view-hint")
@@ -191,8 +191,8 @@ class InvestigationsView(Vertical):
                 item.status.upper(),
                 _model_label(item.model_id),
                 item.requested_effort.upper(),
-                str(usage.total_tokens or 0) if usage else "—",
-                f"${usage.cost_usd:.6f}" if usage else "—",
+                str(usage.total_tokens or 0) if usage else "-",
+                f"${usage.cost_usd:.6f}" if usage else "-",
                 key=str(item.id),
             )
         total_tokens = sum(
@@ -202,7 +202,7 @@ class InvestigationsView(Vertical):
             item.usage.cost_usd for item in self.investigations if item.usage is not None
         )
         self.query_one("#investigation-totals", Static).update(
-            f"{total_tokens:,} tokens  ·  ${total_cost:.6f} session cost"
+            f"{total_tokens:,} tokens / ${total_cost:.6f} estimated cost"
         )
         if not self.investigations:
             self._selected_id = None
@@ -223,7 +223,7 @@ class InvestigationsView(Vertical):
         label = _model_label(item.model_id)
         if item.status == "failed":
             content = (
-                f"## Investigation failed\n\n**{label}** · "
+                f"## Investigation failed\n\n**{label}** / "
                 f"`{item.requested_effort.upper()}`\n\n"
                 f"{item.error or 'No provider error was recorded.'}"
             )
@@ -239,20 +239,20 @@ class InvestigationsView(Vertical):
                     or "- No response was recommended."
                 )
                 content = (
-                    f"## {assessment.classification.upper()} · "
+                    f"## {assessment.classification.upper()} / "
                     f"{assessment.confidence:.0%}\n\n"
-                    f"**{label}** · `{item.requested_effort.upper()}`  \n"
-                    f"**{usage.total_tokens or 0} tokens** · "
-                    f"**${usage.cost_usd:.6f}** · {usage.latency_ms} ms\n\n"
+                    f"**{label}** / `{item.requested_effort.upper()}`  \n"
+                    f"**{usage.total_tokens or 0} tokens** / "
+                    f"**${usage.cost_usd:.6f}** / {usage.latency_ms} ms\n\n"
                     f"{assessment.summary}\n\n### Rationale\n\n{rationale}\n\n"
                     f"### Recommended actions\n\n{actions}"
                 )
         proposal = self._selected_proposal()
         if proposal is not None:
             content += (
-                f"\n\n### Response proposal · {proposal.status.upper()}\n\n"
+                f"\n\n### Response proposal / {proposal.status.upper()}\n\n"
                 f"`{proposal.proposal.action}` "
-                f"`{proposal.proposal.target_ip or 'no target'}` — "
+                f"`{proposal.proposal.target_ip or 'no target'}` - "
                 f"{proposal.proposal.reason}"
             )
         self.query_one("#investigation-detail", Markdown).update(content)
@@ -273,7 +273,4 @@ class InvestigationsView(Vertical):
 
 
 def _model_label(model_id: str) -> str:
-    return next(
-        (preset.label for preset in MODEL_PRESETS.values() if preset.model_id == model_id),
-        model_id,
-    )
+    return OPENAI_MODEL.label if model_id == OPENAI_MODEL.model_id else model_id

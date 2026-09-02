@@ -84,7 +84,7 @@ def test_model_usage_calculates_total_when_provider_omits_it() -> None:
         latency_ms=840,
     )
 
-    assert usage.total_tokens == 160
+    assert usage.total_tokens == 150
 
 
 def test_model_usage_rejects_negative_billing_values() -> None:

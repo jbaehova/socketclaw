@@ -41,7 +41,7 @@ _FOCUS_TARGETS = {
     "events-view": "#events-table",
     "hosts-view": "#hosts-table",
     "investigations-view": "#investigations-table",
-    "settings-view": "#model",
+    "settings-view": "#threshold",
 }
 
 
@@ -56,12 +56,12 @@ class OverviewView(Vertical):
         yield Static("OVERVIEW / LIVE POSTURE", classes="view-kicker")
         with Horizontal(classes="view-heading"):
             yield Static("Network changes, prioritized.", classes="view-title")
-            yield Static("Local evidence · explicit model spend", classes="view-hint")
+            yield Static("Local evidence / explicit model spend", classes="view-hint")
         with Horizontal(id="overview-metrics"):
             yield Static("00\nEVENTS", id="metric-events", classes="metric")
             yield Static("00\nHIGH + CRITICAL", id="metric-incidents", classes="metric")
             yield Static("00\nINVESTIGATIONS", id="metric-investigations", classes="metric")
-            yield Static("$0.000000\nSESSION COST", id="metric-cost", classes="metric")
+            yield Static("$0.000000\nEST. COST", id="metric-cost", classes="metric")
         with Horizontal(id="overview-body"):
             with Vertical(id="activity-panel"):
                 yield Static("RECENT SEVERITY PULSE", classes="section-label")
@@ -102,7 +102,7 @@ class OverviewView(Vertical):
         self.query_one("#metric-investigations", Static).update(
             f"{stats.completed_investigations:02d}\nINVESTIGATIONS"
         )
-        self.query_one("#metric-cost", Static).update(f"${stats.cost_usd:.6f}\nSESSION COST")
+        self.query_one("#metric-cost", Static).update(f"${stats.cost_usd:.6f}\nEST. COST")
         weights = {
             "info": 1,
             "low": 2,
@@ -122,7 +122,7 @@ class OverviewView(Vertical):
             table.add_row(
                 event.observed_at.astimezone().strftime("%H:%M:%S"),
                 event.severity.value.upper(),
-                event.target or "—",
+                event.target or "-",
                 event.title,
                 key=str(event.id),
             )
@@ -155,7 +155,7 @@ class DashboardScreen(Screen[None]):
         with Horizontal(id="topbar"):
             yield Static("SOCKETCLAW", id="brand")
             yield Static(
-                f"{preset.label} / {preset.effort.upper()}",
+                f"{preset.label} / {preset.reasoning_label}",
                 id="active-model",
             )
             yield Static("", id="run-state")
@@ -209,7 +209,7 @@ class DashboardScreen(Screen[None]):
     def apply_config(self, config: AppConfig) -> None:
         self.config = config
         preset = config.preset
-        self.query_one("#active-model", Static).update(f"{preset.label} / {preset.effort.upper()}")
+        self.query_one("#active-model", Static).update(f"{preset.label} / {preset.reasoning_label}")
         overview = self.query_one(OverviewView)
         overview.config = config
         self.query_one(HostsView).refresh_targets()
