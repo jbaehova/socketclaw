@@ -5,10 +5,13 @@ from __future__ import annotations
 import ipaddress
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
+
+_RationaleItem = Annotated[str, Field(min_length=1, max_length=1000)]
+_ActionItem = Annotated[str, Field(min_length=1, max_length=1000)]
 
 
 def utc_now() -> datetime:
@@ -43,7 +46,7 @@ class InvestigationState(StrEnum):
 class DetectionSignal(BaseModel):
     """One explainable rule that contributed to an event score."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid", str_strip_whitespace=True)
 
     code: str = Field(min_length=1, max_length=80)
     label: str = Field(min_length=1, max_length=120)
@@ -54,17 +57,35 @@ class DetectionSignal(BaseModel):
 class DetectionResult(BaseModel):
     """Deterministic severity and the exact signals behind it."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     score: int = Field(ge=0, le=100)
     severity: Severity
     signals: tuple[DetectionSignal, ...] = ()
 
+    @model_validator(mode="after")
+    def validate_explanation(self) -> DetectionResult:
+        expected_score = min(100, sum(signal.points for signal in self.signals))
+        if self.score != expected_score:
+            raise ValueError("score must equal the capped sum of signal points")
+        expected_severity = severity_for_score(self.score)
+        if self.severity is not expected_severity:
+            raise ValueError("severity must match the score")
+        codes = [signal.code for signal in self.signals]
+        if len(codes) != len(set(codes)):
+            raise ValueError("detection signal codes must be unique")
+        return self
+
 
 class SecurityEvent(BaseModel):
     """A normalized observation emitted by any SocketClaw source."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        allow_inf_nan=False,
+    )
 
     id: UUID = Field(default_factory=uuid4)
     observed_at: datetime = Field(default_factory=utc_now)
@@ -72,8 +93,8 @@ class SecurityEvent(BaseModel):
     event_type: str = Field(min_length=1, max_length=100)
     title: str = Field(min_length=1, max_length=200)
     summary: str = Field(min_length=1, max_length=2000)
-    target: str | None = Field(default=None, max_length=253)
-    evidence: dict[str, Any] = Field(default_factory=dict)
+    target: str | None = Field(default=None, min_length=1, max_length=253)
+    evidence: dict[str, JsonValue] = Field(default_factory=dict)
     score: int = Field(default=0, ge=0, le=100)
     severity: Severity = Severity.INFO
     investigation_state: InvestigationState = InvestigationState.NOT_REQUESTED
@@ -90,55 +111,77 @@ class SecurityEvent(BaseModel):
 class ResponseProposal(BaseModel):
     """A reviewable response; execution is a separate, explicit operation."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid", str_strip_whitespace=True)
 
     action: Literal["block", "monitor", "notify"]
-    target_ip: str | None = None
+    target_ip: str | None = Field(default=None, min_length=1, max_length=64)
     reason: str = Field(min_length=1, max_length=1000)
-    command: str | None = Field(default=None, max_length=2000)
-    platform: str | None = Field(default=None, max_length=80)
+    command: str | None = Field(default=None, min_length=1, max_length=2000)
+    platform: str | None = Field(default=None, min_length=1, max_length=80)
     reversible: bool = True
-    requires_approval: bool = True
+    requires_approval: Literal[True] = True
 
     @model_validator(mode="after")
     def validate_block_target(self) -> ResponseProposal:
-        if self.action != "block":
-            return self
         if self.target_ip is None:
-            raise ValueError("a block proposal requires an IP address")
+            if self.action == "block":
+                raise ValueError("a block proposal requires an IP address")
+            return self
         try:
             address = ipaddress.ip_address(self.target_ip)
         except ValueError as exc:
-            raise ValueError("a block proposal requires a valid IP address") from exc
-        if (
+            raise ValueError("target_ip must be a valid IP address") from exc
+        if self.action == "block" and (
             address.is_loopback
             or address.is_multicast
             or address.is_unspecified
             or address.is_link_local
             or address.is_reserved
+            or getattr(address, "scope_id", None) is not None
             or (address.version == 4 and address.packed[-1] == 255)
         ):
             raise ValueError("the proposed IP address is unsafe to block")
+        object.__setattr__(self, "target_ip", str(address))
         return self
 
 
 class Assessment(BaseModel):
     """A validated incident assessment returned by a curated model."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        allow_inf_nan=False,
+    )
 
     classification: Literal["benign", "suspicious", "critical"]
     confidence: float = Field(ge=0.0, le=1.0)
     summary: str = Field(min_length=1, max_length=2000)
-    rationale: list[str] = Field(min_length=1, max_length=12)
-    recommended_actions: list[str] = Field(default_factory=list, max_length=12)
+    rationale: tuple[_RationaleItem, ...] = Field(min_length=1, max_length=12)
+    recommended_actions: tuple[_ActionItem, ...] = Field(default_factory=tuple, max_length=12)
     response_proposal: ResponseProposal | None = None
+
+    @model_validator(mode="after")
+    def reject_benign_block(self) -> Assessment:
+        if (
+            self.classification == "benign"
+            and self.response_proposal is not None
+            and self.response_proposal.action == "block"
+        ):
+            raise ValueError("a benign assessment cannot propose blocking an address")
+        return self
 
 
 class ModelUsage(BaseModel):
     """OpenAI token usage and estimated billing for one investigation."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        allow_inf_nan=False,
+    )
 
     prompt_tokens: int = Field(default=0, ge=0)
     completion_tokens: int = Field(default=0, ge=0)
@@ -146,25 +189,39 @@ class ModelUsage(BaseModel):
     total_tokens: int | None = Field(default=None, ge=0)
     cost_usd: float = Field(default=0.0, ge=0.0)
     latency_ms: int = Field(default=0, ge=0)
-    provider_request_id: str | None = None
+    provider_request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
     @model_validator(mode="after")
     def calculate_total(self) -> ModelUsage:
+        expected_total = self.prompt_tokens + self.completion_tokens
         if self.total_tokens is None:
-            object.__setattr__(
-                self,
-                "total_tokens",
-                self.prompt_tokens + self.completion_tokens,
-            )
+            object.__setattr__(self, "total_tokens", expected_total)
+        elif self.total_tokens != expected_total:
+            raise ValueError("total_tokens must equal prompt_tokens plus completion_tokens")
+        if self.reasoning_tokens > self.completion_tokens:
+            raise ValueError("reasoning_tokens cannot exceed completion_tokens")
         return self
 
 
 class InvestigationResult(BaseModel):
     """Assessment plus the OpenAI contract and accounting used."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid", str_strip_whitespace=True)
 
     assessment: Assessment
     usage: ModelUsage
-    model_id: str
-    requested_effort: str
+    model_id: str = Field(min_length=1, max_length=200)
+    requested_effort: str = Field(min_length=1, max_length=20)
+
+
+def severity_for_score(score: int) -> Severity:
+    """Map a normalized detection score to its canonical severity."""
+    if score >= 90:
+        return Severity.CRITICAL
+    if score >= 70:
+        return Severity.HIGH
+    if score >= 40:
+        return Severity.MEDIUM
+    if score >= 15:
+        return Severity.LOW
+    return Severity.INFO

@@ -13,7 +13,7 @@ def event(
     source: str,
     event_type: str,
     evidence: dict[str, object],
-    target: str = "1.1.1.1",
+    target: str | None = "1.1.1.1",
     observed_at: datetime = NOW,
 ) -> SecurityEvent:
     return SecurityEvent(
@@ -230,9 +230,136 @@ def test_firewall_denial_burst_is_medium() -> None:
 
     result = Detector().score(current, [])
 
-    assert result.score == 40
+    assert result.score == 55
     assert result.severity is Severity.MEDIUM
-    assert [signal.code for signal in result.signals] == ["log.firewall_denial_burst"]
+    assert [signal.code for signal in result.signals] == [
+        "log.firewall_denial",
+        "log.firewall_denial_burst",
+    ]
+
+
+def test_single_firewall_denial_is_low() -> None:
+    current = event(
+        source="log",
+        event_type="log.firewall_denial",
+        evidence={"message": "DROP connection"},
+    )
+
+    result = Detector().score(current, [])
+
+    assert result.score == 15
+    assert result.severity is Severity.LOW
+    assert [signal.code for signal in result.signals] == ["log.firewall_denial"]
+
+
+def test_individual_firewall_denials_form_a_path_scoped_burst() -> None:
+    recent = [
+        event(
+            source="log",
+            event_type="log.firewall_denial",
+            target=None,
+            evidence={"message": "DROP connection", "path": "/var/log/firewall.log"},
+            observed_at=NOW - timedelta(seconds=offset),
+        )
+        for offset in range(10, 100, 10)
+    ]
+    current = event(
+        source="log",
+        event_type="log.firewall_denial",
+        target=None,
+        evidence={"message": "DROP connection", "path": "/var/log/firewall.log"},
+    )
+
+    result = Detector().score(current, recent)
+
+    assert result.score == 55
+    assert [signal.code for signal in result.signals] == [
+        "log.firewall_denial",
+        "log.firewall_denial_burst",
+    ]
+
+
+def test_no_ip_auth_failures_are_correlated_only_within_one_log_path() -> None:
+    recent = [
+        event(
+            source="log",
+            event_type="log.auth_failure",
+            target=None,
+            evidence={"message": "Failed password", "path": f"/var/log/auth-{index}.log"},
+            observed_at=NOW - timedelta(seconds=index),
+        )
+        for index in range(1, 6)
+    ]
+    current = event(
+        source="log",
+        event_type="log.auth_failure",
+        target=None,
+        evidence={"message": "Failed password", "path": "/var/log/auth-current.log"},
+    )
+
+    result = Detector().score(current, recent)
+
+    assert result.score == 25
+    assert [signal.code for signal in result.signals] == ["log.auth_failure"]
+
+
+def test_log_line_can_emit_multiple_independent_signals() -> None:
+    current = event(
+        source="log",
+        event_type="log.auth_failure",
+        evidence={"message": "Failed password followed by sudo: cryptominer detected"},
+    )
+
+    result = Detector().score(current, [])
+
+    assert result.score == 100
+    assert {signal.code for signal in result.signals} == {
+        "log.malware_indicator",
+        "log.auth_failure",
+        "log.privilege_escalation",
+    }
+
+
+def test_correlation_excludes_other_sources_and_the_current_event() -> None:
+    current = event(
+        source="ping",
+        event_type="ping.result",
+        evidence={"packet_loss": 100},
+    )
+    recent = [
+        current,
+        event(source="log", event_type="log.match", evidence={"packet_loss": 100}),
+        event(source="manual", event_type="manual.ping", evidence={"packet_loss": 100}),
+    ]
+
+    result = Detector().score(current, recent)
+
+    assert result.score == 70
+    assert [signal.code for signal in result.signals] == ["ping.total_loss"]
+
+
+def test_malformed_numeric_evidence_is_safely_ignored() -> None:
+    ping = event(
+        source="ping",
+        event_type="ping.result",
+        evidence={"packet_loss": "NaN"},
+    )
+    ports = event(
+        source="port_scan",
+        event_type="port_scan.result",
+        evidence={"newly_opened": ["Infinity", 22.5, "6379", True]},
+    )
+    log = event(
+        source="log",
+        event_type="log.match",
+        evidence={"message": "ordinary", "denial_count": "Infinity"},
+    )
+
+    assert Detector().score(ping, []).score == 0
+    assert Detector().score(log, []).score == 0
+    port_result = Detector().score(ports, [])
+    assert port_result.score == 55
+    assert "6379" in port_result.signals[0].detail
 
 
 def test_private_address_is_not_malicious_by_itself() -> None:

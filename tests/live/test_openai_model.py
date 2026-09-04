@@ -70,7 +70,9 @@ async def test_luna_can_assess_a_minimal_paid_event() -> None:
         "estimated_cost_usd": result.usage.cost_usd,
         "provider_request_id": result.usage.provider_request_id,
     }
-    (evidence_directory / "luna.json").write_text(
+    evidence_path = evidence_directory / "luna.json"
+    evidence_path.write_text(
         json.dumps(evidence, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    evidence_path.chmod(0o600)

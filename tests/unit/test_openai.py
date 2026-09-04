@@ -2,22 +2,35 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from pathlib import Path
+from uuid import UUID
 
 import httpx
 import pytest
 
 from socketclaw.domain import SecurityEvent
-from socketclaw.openai import ErrorKind, OpenAIClient, OpenAIError, redact_secrets
+from socketclaw.openai import (
+    OPENAI_BASE_URL,
+    ErrorKind,
+    OpenAIClient,
+    OpenAIError,
+    redact_secrets,
+)
 
 
-def event_fixture(*, severity: str = "critical") -> SecurityEvent:
+def event_fixture(
+    *,
+    severity: str = "critical",
+    target: str = "198.51.100.24",
+    evidence: dict[str, object] | None = None,
+) -> SecurityEvent:
     return SecurityEvent(
         source="log",
         event_type="log.auth_failure",
         title="Repeated SSH authentication failures",
         summary="Twelve failed root logins were observed in sixty seconds.",
-        target="198.51.100.24",
-        evidence={"attempts": 12},
+        target=target,
+        evidence=evidence or {"attempts": 12},
         score=95,
         severity=severity,
     )
@@ -74,6 +87,18 @@ def success_response(*, content: str | None = None) -> httpx.Response:
                 "output_tokens_details": {"reasoning_tokens": 20},
                 "total_tokens": 250,
             },
+        },
+    )
+
+
+def model_response() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "id": "gpt-5.6-luna",
+            "object": "model",
+            "created": 1,
+            "owned_by": "openai",
         },
     )
 
@@ -150,6 +175,7 @@ async def test_investigation_uses_luna_and_severity_aware_effort(
     assert body["store"] is False
     assert body["max_output_tokens"] == 4000
     assert body["text"]["verbosity"] == "low"
+    assert "untrusted evidence" in body["instructions"]
     response_format = body["text"]["format"]
     assert response_format["type"] == "json_schema"
     assert response_format["strict"] is True
@@ -160,6 +186,59 @@ async def test_investigation_uses_luna_and_severity_aware_effort(
     proposal_schema = schema["$defs"]["ResponseProposal"]
     assert proposal_schema["additionalProperties"] is False
     assert set(proposal_schema["required"]) == set(proposal_schema["properties"])
+
+
+@pytest.mark.asyncio
+async def test_event_credentials_are_redacted_before_provider_serialization() -> None:
+    api_key = "sk-proj-secret-value"
+    bearer = "Bearer another-sensitive-token"
+    sequence = SequenceTransport([success_response()])
+    client = OpenAIClient(api_key, transport=mock_transport(sequence))
+    event = event_fixture(
+        evidence={
+            "nested": [
+                api_key,
+                {
+                    api_key: f"prefix {bearer} suffix",
+                    "[REDACTED]": "literal collision value",
+                },
+            ],
+            "count": 12,
+            "enabled": True,
+        }
+    )
+
+    await client.investigate(event)
+
+    request_content = sequence.requests[0].content
+    assert api_key.encode() not in request_content
+    assert bearer.encode() not in request_content
+    body = json.loads(request_content)
+    assert "[REDACTED]" in body["input"]
+    assert '"count":12' in body["input"]
+    assert '"enabled":true' in body["input"]
+    event_payload = json.loads(body["input"].split("\n", 1)[1])
+    nested_mapping = event_payload["evidence"]["nested"][1]
+    assert set(nested_mapping.values()) == {
+        "prefix Bearer [REDACTED] suffix",
+        "literal collision value",
+    }
+
+
+@pytest.mark.asyncio
+async def test_event_size_limit_applies_after_credential_redaction() -> None:
+    api_key = "sk-proj-secret-value"
+    raw_secret_payload = api_key * 4000
+    assert len(raw_secret_payload.encode()) > 64 * 1024
+    sequence = SequenceTransport([success_response()])
+    client = OpenAIClient(api_key, transport=mock_transport(sequence))
+
+    result = await client.investigate(
+        event_fixture(evidence={"accidental_secret_dump": raw_secret_payload})
+    )
+
+    assert result.assessment.classification == "critical"
+    assert api_key.encode() not in sequence.requests[0].content
 
 
 @pytest.mark.asyncio
@@ -195,6 +274,42 @@ async def test_fenced_json_response_is_parsed_without_relaxing_schema() -> None:
     result = await client.investigate(event_fixture())
 
     assert result.assessment.summary.startswith("A concentrated SSH")
+
+
+@pytest.mark.asyncio
+async def test_incomplete_json_fence_is_rejected() -> None:
+    content = f"```json\n{json.dumps(assessment_content())}"
+    client = OpenAIClient(
+        "sk-proj-secret-value",
+        transport=mock_transport(SequenceTransport([success_response(content=content)])),
+    )
+
+    with pytest.raises(OpenAIError, match="invalid JSON code fence"):
+        await client.investigate(event_fixture())
+
+
+@pytest.mark.asyncio
+async def test_assessment_rejects_trailing_content_and_mismatched_block_target() -> None:
+    trailing = json.dumps(assessment_content()) + " trailing"
+    client = OpenAIClient(
+        "sk-proj-secret-value",
+        transport=mock_transport(SequenceTransport([success_response(content=trailing)])),
+    )
+    with pytest.raises(OpenAIError, match="trailing content"):
+        await client.investigate(event_fixture())
+
+    mismatched = assessment_content()
+    proposal = mismatched["response_proposal"]
+    assert isinstance(proposal, dict)
+    proposal["target_ip"] = "203.0.113.10"
+    client = OpenAIClient(
+        "sk-proj-secret-value",
+        transport=mock_transport(
+            SequenceTransport([success_response(content=json.dumps(mismatched))])
+        ),
+    )
+    with pytest.raises(OpenAIError, match="does not match"):
+        await client.investigate(event_fixture())
 
 
 @pytest.mark.asyncio
@@ -241,7 +356,7 @@ async def test_non_retryable_http_errors_are_classified(
 
 
 @pytest.mark.asyncio
-async def test_429_honors_bounded_retry_after_then_succeeds() -> None:
+async def test_generation_429_is_not_automatically_retried() -> None:
     delays: list[float] = []
 
     async def record_sleep(delay: float) -> None:
@@ -263,15 +378,70 @@ async def test_429_honors_bounded_retry_after_then_succeeds() -> None:
         sleep=record_sleep,
     )
 
-    result = await client.investigate(event_fixture())
+    with pytest.raises(OpenAIError) as caught:
+        await client.investigate(event_fixture())
 
-    assert result.assessment.classification == "critical"
-    assert delays == [30.0]
-    assert len(sequence.requests) == 2
+    assert caught.value.kind is ErrorKind.RATE_LIMIT
+    assert delays == []
+    assert len(sequence.requests) == 1
 
 
 @pytest.mark.asyncio
-async def test_503_retries_three_total_attempts_then_reports_unavailable() -> None:
+async def test_429_quota_error_is_not_retried_and_is_classified_as_credits() -> None:
+    sequence = SequenceTransport(
+        [
+            httpx.Response(
+                429,
+                json={
+                    "error": {
+                        "message": "Organization spend limit reached",
+                        "code": "billing_hard_limit_reached",
+                    }
+                },
+            )
+        ]
+    )
+    client = OpenAIClient("sk-proj-secret-value", transport=mock_transport(sequence))
+
+    with pytest.raises(OpenAIError) as caught:
+        await client.investigate(event_fixture())
+
+    assert caught.value.kind is ErrorKind.CREDITS
+    assert len(sequence.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_safe_get_retry_honors_retry_after_and_reuses_trace_id() -> None:
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    sequence = SequenceTransport(
+        [
+            httpx.Response(503, headers={"retry-after-ms": "1500"}),
+            model_response(),
+        ]
+    )
+    client = OpenAIClient(
+        "sk-proj-secret-value",
+        transport=mock_transport(sequence),
+        sleep=record_sleep,
+    )
+
+    access = await client.validate_key()
+
+    assert access.id == "gpt-5.6-luna"
+    assert delays == [1.5]
+    assert len(sequence.requests) == 2
+    trace_ids = [request.headers["X-Client-Request-Id"] for request in sequence.requests]
+    assert trace_ids[0] == trace_ids[1]
+    assert str(UUID(trace_ids[0])) == trace_ids[0]
+    assert trace_ids[0].isascii()
+
+
+@pytest.mark.asyncio
+async def test_generation_503_is_not_automatically_retried() -> None:
     delays: list[float] = []
 
     async def record_sleep(delay: float) -> None:
@@ -280,7 +450,7 @@ async def test_503_retries_three_total_attempts_then_reports_unavailable() -> No
     def unavailable(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, json={"error": {"message": "Service unavailable"}})
 
-    sequence = SequenceTransport([unavailable, unavailable, unavailable])
+    sequence = SequenceTransport([unavailable])
     client = OpenAIClient(
         "sk-proj-secret-value",
         transport=mock_transport(sequence),
@@ -291,12 +461,12 @@ async def test_503_retries_three_total_attempts_then_reports_unavailable() -> No
         await client.investigate(event_fixture())
 
     assert caught.value.kind is ErrorKind.UNAVAILABLE
-    assert len(sequence.requests) == 3
-    assert delays == [0.25, 0.5]
+    assert len(sequence.requests) == 1
+    assert delays == []
 
 
 @pytest.mark.asyncio
-async def test_timeout_is_retried_then_can_recover() -> None:
+async def test_ambiguous_generation_timeout_is_not_retried() -> None:
     delays: list[float] = []
 
     async def record_sleep(delay: float) -> None:
@@ -309,14 +479,20 @@ async def test_timeout_is_retried_then_can_recover() -> None:
         sleep=record_sleep,
     )
 
-    result = await client.investigate(event_fixture())
+    with pytest.raises(OpenAIError) as caught:
+        await client.investigate(event_fixture())
 
-    assert result.assessment.classification == "critical"
-    assert delays == [0.25]
+    assert caught.value.kind is ErrorKind.TIMEOUT
+    assert caught.value.client_request_id == sequence.requests[0].headers["X-Client-Request-Id"]
+    assert "may have accepted" in str(caught.value)
+    assert "retry manually" in str(caught.value)
+    assert caught.value.client_request_id in str(caught.value)
+    assert len(sequence.requests) == 1
+    assert delays == []
 
 
 @pytest.mark.asyncio
-async def test_missing_usage_is_normalized_to_zero() -> None:
+async def test_missing_usage_is_rejected_instead_of_undercounting_cost() -> None:
     response = success_response()
     payload = json.loads(response.content)
     payload.pop("usage")
@@ -325,12 +501,10 @@ async def test_missing_usage_is_normalized_to_zero() -> None:
         transport=mock_transport(SequenceTransport([httpx.Response(200, json=payload)])),
     )
 
-    result = await client.investigate(event_fixture())
+    with pytest.raises(OpenAIError, match="no usage metadata") as caught:
+        await client.investigate(event_fixture())
 
-    assert result.usage.prompt_tokens == 0
-    assert result.usage.completion_tokens == 0
-    assert result.usage.total_tokens == 0
-    assert result.usage.cost_usd == 0
+    assert caught.value.kind is ErrorKind.RESPONSE
 
 
 @pytest.mark.asyncio
@@ -347,6 +521,87 @@ async def test_malformed_usage_is_reported_as_response_error() -> None:
         await client.investigate(event_fixture())
 
     assert caught.value.kind is ErrorKind.RESPONSE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_value", [True, 1.5, "12"])
+async def test_usage_requires_json_integers(invalid_value: object) -> None:
+    response = success_response()
+    payload = json.loads(response.content)
+    payload["usage"]["input_tokens"] = invalid_value
+    client = OpenAIClient(
+        "sk-proj-secret-value",
+        transport=mock_transport(SequenceTransport([httpx.Response(200, json=payload)])),
+    )
+
+    with pytest.raises(OpenAIError, match="expected an integer"):
+        await client.investigate(event_fixture())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["input_tokens", "output_tokens"])
+async def test_required_usage_tokens_reject_null(field: str) -> None:
+    response = success_response()
+    payload = json.loads(response.content)
+    payload["usage"][field] = None
+    client = OpenAIClient(
+        "sk-proj-secret-value",
+        transport=mock_transport(SequenceTransport([httpx.Response(200, json=payload)])),
+    )
+
+    with pytest.raises(OpenAIError, match=f"{field} must be an integer"):
+        await client.investigate(event_fixture())
+
+
+@pytest.mark.asyncio
+async def test_response_from_unexpected_model_is_rejected() -> None:
+    response = success_response()
+    payload = json.loads(response.content)
+    payload["model"] = "gpt-other"
+    client = OpenAIClient(
+        "sk-proj-secret-value",
+        transport=mock_transport(SequenceTransport([httpx.Response(200, json=payload)])),
+    )
+
+    with pytest.raises(OpenAIError, match="unexpected model"):
+        await client.investigate(event_fixture())
+
+
+@pytest.mark.asyncio
+async def test_mixed_output_text_and_refusal_is_rejected() -> None:
+    response = success_response()
+    payload = json.loads(response.content)
+    payload["output"][0]["content"].append(
+        {"type": "refusal", "refusal": "I cannot assess this event."}
+    )
+    client = OpenAIClient(
+        "sk-proj-secret-value",
+        transport=mock_transport(SequenceTransport([httpx.Response(200, json=payload)])),
+    )
+
+    with pytest.raises(OpenAIError, match="refused"):
+        await client.investigate(event_fixture())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("role", "tool"), ("status", "in_progress"), ("type", "reasoning")],
+)
+async def test_output_text_requires_a_completed_assistant_message(
+    field: str,
+    value: str,
+) -> None:
+    response = success_response()
+    payload = json.loads(response.content)
+    payload["output"][0][field] = value
+    client = OpenAIClient(
+        "sk-proj-secret-value",
+        transport=mock_transport(SequenceTransport([httpx.Response(200, json=payload)])),
+    )
+
+    with pytest.raises(OpenAIError, match="no output text"):
+        await client.investigate(event_fixture())
 
 
 @pytest.mark.asyncio
@@ -379,3 +634,37 @@ def test_redaction_removes_explicit_and_openai_shaped_secrets() -> None:
     )
 
     assert rendered == "explicit=[REDACTED] automatic=[REDACTED]"
+
+
+def test_redaction_removes_bearer_tokens() -> None:
+    rendered = redact_secrets("Authorization: Bearer opaque-secret-token")
+
+    assert rendered == "Authorization: Bearer [REDACTED]"
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan"), True])
+def test_client_rejects_invalid_timeout(timeout: float) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        OpenAIClient("sk-proj-secret-value", timeout=timeout)
+
+
+def test_runtime_has_one_fixed_openai_provider_boundary() -> None:
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(Path("src/socketclaw").rglob("*.py"))
+    ).casefold()
+    forbidden_markers = (
+        "openrouter_api_key",
+        "anthropic_api_key",
+        "google_api_key",
+        "gemini_api_key",
+        "mistral_api_key",
+        "groq_api_key",
+        "openrouter.ai",
+        "api.anthropic.com",
+        "generativelanguage.googleapis.com",
+        "api.mistral.ai",
+        "api.groq.com",
+    )
+
+    assert OPENAI_BASE_URL == "https://api.openai.com/v1"
+    assert all(marker not in source for marker in forbidden_markers)

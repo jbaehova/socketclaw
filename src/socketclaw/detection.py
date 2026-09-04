@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Iterable, Sequence
 from datetime import timedelta
 from typing import cast
 
-from .domain import DetectionResult, DetectionSignal, SecurityEvent, Severity
+from .domain import DetectionResult, DetectionSignal, SecurityEvent, severity_for_score
 
 _SENSITIVE_PORTS = {
     21,
@@ -36,6 +38,7 @@ _AUTH_FAILURE_TERMS = (
     "invalid user",
     "login failed",
 )
+_FIREWALL_DENIAL = re.compile(r"(?:firewall.*den(?:y|ied)|\bDROP\b|\bREJECT\b)", re.I)
 
 
 class Detector:
@@ -60,7 +63,7 @@ class Detector:
         score = min(100, sum(signal.points for signal in signals))
         return DetectionResult(
             score=score,
-            severity=_severity_for_score(score),
+            severity=severity_for_score(score),
             signals=tuple(signals),
         )
 
@@ -160,8 +163,10 @@ class Detector:
         recent: Sequence[SecurityEvent],
         signals: list[DetectionSignal],
     ) -> None:
-        message = str(event.evidence.get("message", "")).lower()
-        if any(term in message for term in _MALWARE_TERMS):
+        message = str(event.evidence.get("message", "")).casefold()
+        if event.event_type == "log.malware_indicator" or any(
+            term in message for term in _MALWARE_TERMS
+        ):
             signals.append(
                 _signal(
                     "log.malware_indicator",
@@ -170,8 +175,6 @@ class Detector:
                     "The log entry contains a known malware indicator.",
                 )
             )
-            return
-
         is_auth_failure = event.event_type == "log.auth_failure" or any(
             term in message for term in _AUTH_FAILURE_TERMS
         )
@@ -189,7 +192,7 @@ class Detector:
                 for candidate in self._related(event, recent)
                 if candidate.event_type == "log.auth_failure"
                 or any(
-                    term in str(candidate.evidence.get("message", "")).lower()
+                    term in str(candidate.evidence.get("message", "")).casefold()
                     for term in _AUTH_FAILURE_TERMS
                 )
             ]
@@ -199,12 +202,13 @@ class Detector:
                         "log.auth_burst",
                         "Authentication failure burst",
                         75,
-                        "At least six failures from the same target occurred within five minutes.",
+                        "At least six failures from the same target or log source occurred "
+                        "within five minutes.",
                     )
                 )
-            return
-
-        if "privilege escalation" in message or "sudo:" in message:
+        if event.event_type == "log.privilege_escalation" or (
+            "privilege escalation" in message or "sudo:" in message
+        ):
             signals.append(
                 _signal(
                     "log.privilege_escalation",
@@ -213,7 +217,21 @@ class Detector:
                     "The log records a privileged execution event.",
                 )
             )
-        denial_count = int(_number(event.evidence.get("denial_count")))
+        denial_count = _firewall_denial_count(event)
+        is_firewall_denial = denial_count > 0
+        if is_firewall_denial:
+            signals.append(
+                _signal(
+                    "log.firewall_denial",
+                    "Firewall denial",
+                    15,
+                    "The log records a denied network connection.",
+                )
+            )
+        if denial_count:
+            denial_count += sum(
+                _firewall_denial_count(candidate) for candidate in self._related(event, recent)
+            )
         if denial_count >= 10:
             signals.append(
                 _signal(
@@ -232,10 +250,15 @@ class Detector:
         minimum_loss: float | None = None,
     ) -> list[SecurityEvent]:
         earliest = event.observed_at - self.window
+        correlation_key = _correlation_key(event)
+        if correlation_key is None:
+            return []
         related = [
             candidate
             for candidate in recent
-            if candidate.target == event.target
+            if candidate.id != event.id
+            and candidate.source == event.source
+            and _correlation_key(candidate) == correlation_key
             and earliest <= candidate.observed_at <= event.observed_at
         ]
         if minimum_loss is not None:
@@ -256,26 +279,16 @@ def _signal(
     return DetectionSignal(code=code, label=label, points=points, detail=detail)
 
 
-def _severity_for_score(score: int) -> Severity:
-    if score >= 90:
-        return Severity.CRITICAL
-    if score >= 70:
-        return Severity.HIGH
-    if score >= 40:
-        return Severity.MEDIUM
-    if score >= 15:
-        return Severity.LOW
-    return Severity.INFO
-
-
 def _number(value: object) -> float:
     if isinstance(value, bool):
         return 0.0
     if isinstance(value, int | float):
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else 0.0
     try:
-        return float(str(value))
-    except ValueError:
+        number = float(str(value))
+        return number if math.isfinite(number) else 0.0
+    except (TypeError, ValueError, OverflowError):
         return 0.0
 
 
@@ -289,8 +302,11 @@ def _ports(value: object) -> list[int]:
         if not isinstance(item, int | float | str):
             continue
         try:
-            port = int(item)
-        except (TypeError, ValueError):
+            numeric = float(item)
+            if not math.isfinite(numeric) or not numeric.is_integer():
+                continue
+            port = int(numeric)
+        except (TypeError, ValueError, OverflowError):
             continue
         if 1 <= port <= 65535 and port not in ports:
             ports.append(port)
@@ -299,3 +315,24 @@ def _ports(value: object) -> list[int]:
 
 def _port_list(ports: list[int]) -> str:
     return ", ".join(str(port) for port in ports)
+
+
+def _correlation_key(event: SecurityEvent) -> tuple[str, str] | None:
+    if event.target is not None:
+        return ("target", event.target.casefold())
+    path = event.evidence.get("path")
+    if event.source == "log" and isinstance(path, str) and path:
+        return ("path", path)
+    return None
+
+
+def _firewall_denial_count(event: SecurityEvent) -> int:
+    reported = max(0, int(_number(event.evidence.get("denial_count"))))
+    message = str(event.evidence.get("message", ""))
+    if (
+        event.event_type == "log.firewall_denial"
+        or reported > 0
+        or _FIREWALL_DENIAL.search(message) is not None
+    ):
+        return max(1, reported)
+    return 0

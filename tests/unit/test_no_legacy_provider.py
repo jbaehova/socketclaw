@@ -6,6 +6,8 @@ from pathlib import Path
 
 from packaging.requirements import Requirement
 
+import socketclaw
+
 FORBIDDEN_DEPENDENCIES = {
     "anthropic",
     "claude-agent-sdk",
@@ -26,15 +28,33 @@ FORBIDDEN_TOP_LEVEL_PACKAGES = {
     "storage",
     "ui",
 }
+DIRECT_RUNTIME_DEPENDENCIES = {
+    "aiosqlite",
+    "click",
+    "httpx",
+    "pydantic",
+    "sqlalchemy",
+    "textual",
+    "typer",
+}
 
 
-def test_direct_cli_runtime_dependencies_are_declared() -> None:
+def test_direct_runtime_dependencies_are_declared() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text())
     names = {
         Requirement(value).name.casefold() for value in project["project"].get("dependencies", [])
     }
 
-    assert "click" in names
+    assert names == DIRECT_RUNTIME_DEPENDENCIES
+
+
+def test_package_version_has_one_authoritative_source() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text())
+
+    assert project["project"].get("dynamic") == ["version"]
+    assert "version" not in project["project"]
+    assert project["tool"]["hatch"]["version"]["path"] == "src/socketclaw/__init__.py"
+    assert importlib.metadata.version("socketclaw") == socketclaw.__version__
 
 
 def test_project_declares_no_legacy_runtime_or_development_dependency() -> None:
@@ -61,7 +81,23 @@ def test_source_tree_exposes_only_the_socketclaw_product_package() -> None:
         if path.is_dir() and (path / "__init__.py").exists()
     }
 
+    assert packages == {"socketclaw"}
     assert packages.isdisjoint(FORBIDDEN_TOP_LEVEL_PACKAGES)
+    assert not Path("src/__init__.py").exists()
+    assert Path(socketclaw.__file__).with_name("py.typed").is_file()
+
+
+def test_build_targets_exclude_development_and_generated_files() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text())
+    hatch = project["tool"]["hatch"]
+
+    assert hatch["build"]["targets"]["wheel"]["packages"] == ["src/socketclaw"]
+    assert set(hatch["build"]["targets"]["sdist"]["include"]) == {
+        "/CHANGELOG.md",
+        "/README.md",
+        "/pyproject.toml",
+        "/src/socketclaw",
+    }
 
 
 def test_runtime_source_has_no_alternate_model_provider_path() -> None:
