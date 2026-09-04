@@ -6,6 +6,7 @@ dist/
 wheels/
 *.egg-info
 .agent
+.DS_Store
 
 # Virtual environments
 .venv
@@ -14,6 +15,8 @@ wheels/
 
 # Database files
 *.db
+*.db-shm
+*.db-wal
 
 .agents/
 AGENTS.md
@@ -29,3 +32,5 @@ AGENTS.md
 htmlcov/
 snapshot_report.html
 snapshot_report/
+.audit-requirements.txt
+artifacts/live-openai/
