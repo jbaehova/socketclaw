@@ -31,8 +31,9 @@ more reasoning budget. The exact effort is stored with every investigation.
 ## Guardrails
 
 Automated tests enforce the fixed endpoint, model ID, request schema, effort
-policy, secret redaction, retry behavior, and absence of alternate provider
-paths in runtime source and dependency declarations.
+policy, secret redaction, retry behavior, direct runtime dependencies, and
+absence of alternate provider paths in runtime source and dependency
+declarations.
 
 The model and API choices follow the official
 [GPT-5.6 Luna model documentation](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
