@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,15 +10,17 @@ from uuid import UUID, uuid4
 import pytest
 
 from socketclaw.config import AppConfig, ConfigStore
-from socketclaw.domain import Assessment, DetectionSignal, ModelUsage
+from socketclaw.domain import Assessment, DetectionSignal, InvestigationResult, ModelUsage
 from socketclaw.monitor import MonitorStatus
 from socketclaw.openai import ModelAccess
 from socketclaw.storage import (
     EventQuery,
+    ResponseStatus,
     SessionStats,
     StoredEvent,
     StoredInvestigation,
     StoredResponseProposal,
+    StoredResponseStatus,
 )
 from socketclaw.ui.app import AppServices, SocketClawApp
 
@@ -32,7 +34,10 @@ class TestMonitor:
         self.paused = False
         self.started = 0
         self.stopped = 0
+        self.start_error: Exception | None = None
+        self.stop_error: Exception | None = None
         self.diagnostics: list[tuple[str, str]] = []
+        self.available_diagnostics: frozenset[str] = frozenset({"ping", "ports"})
         self._subscribers: set[asyncio.Queue[StoredEvent]] = set()
 
     @property
@@ -43,9 +48,12 @@ class TestMonitor:
             started_at=datetime.now().astimezone() if self.running else None,
             active_jobs=2 if self.running else 0,
             last_error=None,
+            diagnostics=self.available_diagnostics,
         )
 
     async def start(self) -> None:
+        if self.start_error is not None:
+            raise self.start_error
         self.running = True
         self.started += 1
 
@@ -58,6 +66,8 @@ class TestMonitor:
     async def stop(self) -> None:
         self.running = False
         self.stopped += 1
+        if self.stop_error is not None:
+            raise self.stop_error
 
     async def events(self) -> AsyncIterator[StoredEvent]:
         queue: asyncio.Queue[StoredEvent] = asyncio.Queue()
@@ -95,6 +105,14 @@ class FakeRepository:
         self.events_data = list(events or [])
         self.investigations_data = list(investigations or [])
         self.proposals_data = list(proposals or [])
+        self.start_investigation_error: Exception | None = None
+        self.complete_investigation_error: Exception | None = None
+        self.complete_after_commit_error: Exception | None = None
+        self.complete_started: asyncio.Event | None = None
+        self.complete_release: asyncio.Event | None = None
+        self.queue_started: asyncio.Event | None = None
+        self.queue_release: asyncio.Event | None = None
+        self.recovery_error: Exception | None = None
 
     async def list_events(self, query: EventQuery | None = None) -> list[StoredEvent]:
         query = query or EventQuery()
@@ -137,10 +155,112 @@ class FakeRepository:
             rows = [row for row in rows if row.event_id == event_id]
         return rows[:limit]
 
+    async def queue_investigation(
+        self,
+        event_id: UUID,
+        *,
+        model_id: str,
+        requested_effort: str,
+    ) -> StoredInvestigation:
+        if self.queue_started is not None:
+            self.queue_started.set()
+        if self.queue_release is not None:
+            await self.queue_release.wait()
+        if any(
+            item.event_id == event_id and item.status in {"queued", "running"}
+            for item in self.investigations_data
+        ):
+            raise ValueError("event already has an active investigation")
+        queued = StoredInvestigation(
+            id=uuid4(),
+            event_id=event_id,
+            status="queued",
+            model_id=model_id,
+            requested_effort=requested_effort,
+            created_at=datetime.now(UTC),
+        )
+        self.investigations_data.insert(0, queued)
+        return queued
+
+    async def start_investigation(self, investigation_id: UUID) -> StoredInvestigation:
+        if self.start_investigation_error is not None:
+            raise self.start_investigation_error
+        index = self._investigation_index(investigation_id)
+        current = self.investigations_data[index]
+        if current.status != "queued":
+            raise ValueError(f"investigation cannot start from {current.status}")
+        running = current.model_copy(update={"status": "running"})
+        self.investigations_data[index] = running
+        return running
+
+    async def complete_investigation(
+        self,
+        investigation_id: UUID,
+        result: InvestigationResult,
+    ) -> StoredInvestigation:
+        if self.complete_started is not None:
+            self.complete_started.set()
+        if self.complete_release is not None:
+            await self.complete_release.wait()
+        if self.complete_investigation_error is not None:
+            raise self.complete_investigation_error
+        index = self._investigation_index(investigation_id)
+        current = self.investigations_data[index]
+        completed = current.model_copy(
+            update={
+                "status": "complete",
+                "assessment": result.assessment,
+                "usage": result.usage,
+                "completed_at": datetime.now(UTC),
+            }
+        )
+        self.investigations_data[index] = completed
+        if self.complete_after_commit_error is not None:
+            raise self.complete_after_commit_error
+        return completed
+
+    async def fail_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        error: str,
+    ) -> StoredInvestigation:
+        index = self._investigation_index(investigation_id)
+        current = self.investigations_data[index]
+        failed = current.model_copy(
+            update={
+                "status": "failed",
+                "error": error,
+                "completed_at": datetime.now(UTC),
+            }
+        )
+        self.investigations_data[index] = failed
+        return failed
+
+    async def recover_incomplete_investigations(self) -> int:
+        if self.recovery_error is not None:
+            raise self.recovery_error
+        recovered = 0
+        for index, item in enumerate(self.investigations_data):
+            if item.status not in {"queued", "running"}:
+                continue
+            self.investigations_data[index] = item.model_copy(
+                update={
+                    "status": "failed",
+                    "error": "SocketClaw stopped before the investigation completed",
+                    "completed_at": datetime.now(UTC),
+                }
+            )
+            recovered += 1
+        return recovered
+
     async def update_response_proposal_status(
         self,
         proposal_id: UUID,
-        status: str,
+        status: ResponseStatus,
+        *,
+        expected_status: StoredResponseStatus,
+        protected_targets: Collection[str],
     ) -> StoredResponseProposal:
         index = next(
             (
@@ -153,18 +273,33 @@ class FakeRepository:
         if index is None:
             raise KeyError(str(proposal_id))
         current = self.proposals_data[index]
-        allowed = {
-            "pending": {"simulated", "approved", "rejected"},
-            "approved": {"executed", "rejected"},
-            "simulated": set(),
-            "executed": set(),
-            "rejected": set(),
+        predecessors = {
+            "pending": set(),
+            "approved": {"pending"},
+            "rejected": {"pending", "approved"},
         }
-        if status not in allowed[current.status]:
+        if current.status != expected_status:
+            raise ValueError("response status changed concurrently")
+        if current.status not in predecessors[status]:
             raise ValueError(f"cannot transition {current.status} to {status}")
+        if status == "approved" and current.proposal.target_ip in protected_targets:
+            raise ValueError("response target is protected")
         updated = current.model_copy(update={"status": status})
         self.proposals_data[index] = updated
         return updated
+
+    def _investigation_index(self, investigation_id: UUID) -> int:
+        index = next(
+            (
+                position
+                for position, item in enumerate(self.investigations_data)
+                if item.id == investigation_id
+            ),
+            None,
+        )
+        if index is None:
+            raise KeyError(str(investigation_id))
+        return index
 
     async def session_stats(self) -> SessionStats:
         complete = [item for item in self.investigations_data if item.status == "complete"]
@@ -270,7 +405,7 @@ def investigation_fixture(
         requested_effort="high",
         error="Provider unavailable" if status == "failed" else None,
         created_at=now,
-        completed_at=now,
+        completed_at=now if status in {"complete", "failed"} else None,
     )
 
 
@@ -289,6 +424,7 @@ def app_factory(
         proposals: list[StoredResponseProposal] | None = None,
         config: AppConfig | None = None,
         investigation_result: StoredInvestigation | None = None,
+        reconfigure: Callable[[AppConfig], Awaitable[None]] | None = None,
     ) -> AppFixture:
         nonlocal counter
         counter += 1
@@ -311,6 +447,7 @@ def app_factory(
             validate_key=validator,
             repository=repository,
             investigate=investigate,
+            reconfigure=reconfigure,
         )
         return AppFixture(
             app=SocketClawApp(services),

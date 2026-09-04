@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 from textual.command import CommandPalette
-from textual.widgets import ContentSwitcher
+from textual.widgets import ContentSwitcher, DataTable, Static
 
 from socketclaw.ui.dashboard import DashboardScreen
 from socketclaw.ui.dialogs import HelpScreen
@@ -27,7 +27,7 @@ async def test_direct_navigation_and_pause_binding(
         assert switcher.current == "events-view"
         await pilot.press("5")
         assert switcher.current == "settings-view"
-        await pilot.press("1")
+        await pilot.click("#nav-overview")
         assert switcher.current == "overview-view"
 
         await pilot.press("space")
@@ -72,6 +72,21 @@ async def test_quit_stops_monitor_and_exits_cleanly(
 
 
 @pytest.mark.asyncio
+async def test_quit_still_exits_when_monitor_cleanup_fails(
+    app_factory: Callable[..., Any],
+) -> None:
+    fixture = app_factory(configured=True)
+    fixture.monitor.stop_error = RuntimeError("worker cleanup failed")
+
+    async with fixture.app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await pilot.press("q")
+
+    assert fixture.monitor.stopped == 1
+    assert fixture.monitor.running is False
+
+
+@pytest.mark.asyncio
 async def test_quit_exits_cleanly_from_onboarding(
     app_factory: Callable[..., Any],
 ) -> None:
@@ -100,4 +115,106 @@ async def test_number_navigation_moves_focus_to_primary_control(
 
         await pilot.press("5")
         assert fixture.app.focused is not None
-        assert fixture.app.focused.id == "threshold"
+        assert fixture.app.focused.id == "settings-targets"
+
+
+@pytest.mark.asyncio
+async def test_text_entry_never_triggers_global_quit_or_number_navigation(
+    app_factory: Callable[..., Any],
+) -> None:
+    fixture = app_factory(configured=True)
+
+    async with fixture.app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause(0.2)
+        await pilot.press("5")
+        targets = fixture.app.screen.query_one("#settings-targets")
+        targets.value = "example.com"
+        targets.focus()
+
+        await pilot.press("1", "q")
+
+        assert isinstance(fixture.app.screen, DashboardScreen)
+        assert (
+            fixture.app.screen.query_one("#workspace", ContentSwitcher).current == "settings-view"
+        )
+        assert "1" in targets.value
+        assert "q" in targets.value
+
+
+@pytest.mark.asyncio
+async def test_monitor_start_failure_opens_an_offline_but_usable_dashboard(
+    app_factory: Callable[..., Any],
+) -> None:
+    fixture = app_factory(configured=True)
+    fixture.monitor.start_error = RuntimeError("probe bootstrap failed")
+
+    async with fixture.app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause(0.2)
+
+        assert isinstance(fixture.app.screen, DashboardScreen)
+        run_state = fixture.app.screen.query_one("#run-state", Static)
+        assert "OFFLINE" in str(run_state.render())
+
+        await pilot.press("2")
+        assert fixture.app.screen.query_one("#workspace", ContentSwitcher).current == "events-view"
+
+
+@pytest.mark.asyncio
+async def test_recovery_warning_survives_navigation_and_overview_refresh(
+    app_factory: Callable[..., Any],
+) -> None:
+    fixture = app_factory(configured=True)
+    fixture.repository.recovery_error = RuntimeError("database locked")
+
+    async with fixture.app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause(0.2)
+        state = fixture.app.screen.query_one("#overview-state", Static)
+        assert "Investigation recovery failed: database locked" in str(state.render())
+        assert "WARN" in str(fixture.app.screen.query_one("#run-state", Static).render())
+
+        await pilot.press("2")
+        await pilot.press("1")
+        await pilot.pause(0.2)
+
+        assert "Investigation recovery failed: database locked" in str(state.render())
+
+
+@pytest.mark.asyncio
+async def test_periodic_status_refresh_reports_an_unexpected_monitor_stop(
+    app_factory: Callable[..., Any],
+) -> None:
+    fixture = app_factory(configured=True)
+
+    async with fixture.app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause(0.2)
+        fixture.monitor.running = False
+        await pilot.pause(1.1)
+
+        run_state = fixture.app.screen.query_one("#run-state", Static)
+        assert "STOPPED" in str(run_state.render())
+
+
+@pytest.mark.asyncio
+async def test_compact_workspaces_keep_operational_table_rows_visible(
+    app_factory: Callable[..., Any],
+) -> None:
+    from .conftest import event_fixture, investigation_fixture
+
+    event = event_fixture()
+    fixture = app_factory(
+        configured=True,
+        events=[event],
+        investigations=[investigation_fixture(event.id)],
+    )
+
+    async with fixture.app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause(0.2)
+        for key, selector in (
+            ("2", "#events-table"),
+            ("3", "#hosts-table"),
+            ("4", "#investigations-table"),
+        ):
+            await pilot.press(key)
+            await pilot.pause(0.1)
+            table = fixture.app.screen.query_one(selector, DataTable)
+            assert table.region.height >= 6

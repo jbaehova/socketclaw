@@ -22,13 +22,18 @@ VISUAL_CASES = tuple(
         name=f"{state}-{width}x{height}",
         size=(width, height),
         configured=state != "onboarding",
-        keys=(() if state in {"onboarding", "overview"} else (key, "_")),
+        keys=(
+            ()
+            if state in {"onboarding", "overview"}
+            else ((key,) if state == "settings" else (key, "_"))
+        ),
     )
     for width, height in ((80, 24), (120, 36))
     for state, key in (
         ("onboarding", ""),
         ("overview", ""),
         ("events", "2"),
+        ("hosts", "3"),
         ("investigations", "4"),
         ("settings", "5"),
     )

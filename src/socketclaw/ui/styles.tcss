@@ -1,12 +1,12 @@
-$sc-ink: #0a0f18;
-$sc-surface: #111827;
-$sc-panel: #182235;
-$sc-line: #2b3950;
-$sc-text: #e7eef7;
-$sc-muted: #8fa0b7;
-$sc-accent: #66d9c5;
-$sc-warning: #f2c14e;
-$sc-danger: #ff6b6b;
+$sc-ink: $background;
+$sc-surface: $surface;
+$sc-panel: $panel;
+$sc-line: $border;
+$sc-text: $text;
+$sc-muted: $text-muted;
+$sc-accent: $primary;
+$sc-warning: $warning;
+$sc-danger: $error;
 
 Screen {
     background: $sc-ink;
@@ -45,6 +45,11 @@ Screen {
     color: $sc-warning;
 }
 
+#run-state.degraded,
+#run-state.offline {
+    color: $sc-warning;
+}
+
 #primary-nav {
     height: 3;
     padding: 0 1;
@@ -61,6 +66,7 @@ Screen {
     background: transparent;
     color: $sc-muted;
     border: none;
+    content-align: center middle;
 }
 
 .nav-button:hover,
@@ -73,7 +79,7 @@ Screen {
 .nav-button.active {
     color: $sc-accent;
     text-style: bold;
-    border-bottom: solid $sc-accent;
+    background: $sc-panel;
 }
 
 #workspace {
@@ -297,7 +303,9 @@ MarkdownBullet {
 }
 
 .settings-grid {
-    height: 1fr;
+    height: auto;
+    min-height: 17;
+    margin-bottom: 1;
     border-top: solid $sc-line;
     padding-top: 1;
 }
@@ -305,6 +313,21 @@ MarkdownBullet {
 .settings-grid > Vertical {
     width: 1fr;
     padding-right: 2;
+}
+
+.settings-guidance {
+    height: auto;
+    margin-top: 1;
+    color: $sc-muted;
+}
+
+#settings-footer {
+    height: 5;
+    background: $sc-ink;
+}
+
+#settings-scroll {
+    height: 1fr;
 }
 
 .compact-fields {
@@ -448,6 +471,41 @@ ConfirmResponseScreen {
     background: #000000 70%;
 }
 
+ConfirmTargetRemovalScreen {
+    align: center middle;
+    background: #000000 70%;
+}
+
+#target-removal-dialog {
+    width: 58;
+    height: 14;
+    padding: 1 2;
+    background: $sc-surface;
+    border: solid $sc-danger;
+}
+
+#target-removal-title {
+    height: 2;
+    color: $sc-text;
+    text-style: bold;
+}
+
+#target-removal-copy {
+    height: 1fr;
+    color: $sc-muted;
+}
+
+#target-removal-actions {
+    height: 3;
+    align-horizontal: right;
+}
+
+#target-removal-actions Button {
+    width: auto;
+    min-width: 16;
+    margin-left: 1;
+}
+
 #response-dialog {
     width: 62;
     height: 20;
@@ -468,20 +526,44 @@ ConfirmResponseScreen {
     text-style: bold;
 }
 
-#response-copy {
+#response-review {
     height: 1fr;
+}
+
+#response-copy {
+    height: auto;
+    color: $sc-muted;
+}
+
+.response-section-label {
+    height: 2;
+    margin-top: 1;
+    color: $sc-warning;
+    text-style: bold;
+}
+
+.response-model-content {
+    height: auto;
+    padding-left: 1;
+    color: $sc-text;
+    border-left: solid $sc-line;
+}
+
+#response-disclaimer {
+    height: auto;
+    margin-top: 1;
     color: $sc-muted;
 }
 
 #response-dialog-actions {
-    height: 6;
+    height: 3;
     align-horizontal: right;
 }
 
 #response-dialog-actions Button {
     width: auto;
     min-width: 18;
-    margin-top: 1;
+    margin-left: 1;
 }
 
 .narrow #active-model {
@@ -493,7 +575,7 @@ ConfirmResponseScreen {
 }
 
 .narrow .workspace-view {
-    padding: 1 2;
+    padding: 0 2;
 }
 
 .narrow .view-hint,
@@ -502,24 +584,49 @@ ConfirmResponseScreen {
     display: none;
 }
 
+.narrow .view-kicker {
+    display: none;
+}
+
+.narrow .view-heading {
+    height: 2;
+    margin-top: 0;
+}
+
+.narrow .filter-row {
+    margin-bottom: 0;
+}
+
+.narrow .inline-state {
+    height: 1;
+}
+
 .narrow #activity-panel {
     width: 1fr;
     border-right: none;
 }
 
+.narrow .metric {
+    padding: 1 1;
+}
+
 .narrow #events-table,
 .narrow #investigations-table {
-    width: 3fr;
+    width: 1fr;
 }
 
 .narrow #event-detail,
 .narrow #investigation-detail {
-    width: 2fr;
-    padding: 0 1;
+    display: none;
 }
 
 .narrow .settings-grid > Vertical {
     padding-right: 1;
+}
+
+.narrow .settings-grid {
+    height: auto;
+    min-height: 17;
 }
 
 .narrow .nav-button {
@@ -530,5 +637,12 @@ ConfirmResponseScreen {
 .narrow #onboarding-shell {
     width: 100%;
     height: 100%;
+    border: none;
+}
+
+OnboardingScreen.compact #onboarding-shell {
+    width: 100%;
+    height: 100%;
+    padding: 0 2;
     border: none;
 }

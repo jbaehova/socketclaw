@@ -20,7 +20,8 @@ from textual.widgets import (
 )
 
 from ..config import AppConfig
-from .context import socketclaw_app
+from ..monitor import MonitorStatus
+from .context import safe_text, socketclaw_app
 from .events import EventsView
 from .hosts import HostsView
 from .investigations import InvestigationsView
@@ -41,16 +42,17 @@ _FOCUS_TARGETS = {
     "events-view": "#events-table",
     "hosts-view": "#hosts-table",
     "investigations-view": "#investigations-table",
-    "settings-view": "#threshold",
+    "settings-view": "#settings-targets",
 }
 
 
 class OverviewView(Vertical):
     """At-a-glance posture backed by current persisted session data."""
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, *, startup_warning: str | None = None) -> None:
         super().__init__(id="overview-view", classes="workspace-view")
         self.config = config
+        self.startup_warning = startup_warning
 
     def compose(self) -> ComposeResult:
         yield Static("OVERVIEW / LIVE POSTURE", classes="view-kicker")
@@ -66,7 +68,7 @@ class OverviewView(Vertical):
             with Vertical(id="activity-panel"):
                 yield Static("RECENT SEVERITY PULSE", classes="section-label")
                 yield Sparkline([0], id="activity-sparkline")
-                yield Static("", id="overview-state", classes="inline-state")
+                yield Static("", id="overview-state", classes="inline-state", markup=False)
             with Vertical(id="recent-panel"):
                 yield Static("RECENT HIGH-SIGNAL EVENTS", classes="section-label")
                 yield DataTable(
@@ -97,7 +99,8 @@ class OverviewView(Vertical):
         high_signal = [event for event in events if event.severity.value in {"high", "critical"}]
         self.query_one("#metric-events", Static).update(f"{stats.total_events:02d}\nEVENTS")
         self.query_one("#metric-incidents", Static).update(
-            f"{len(high_signal):02d}\nHIGH + CRITICAL"
+            f"{stats.by_severity.get('high', 0) + stats.by_severity.get('critical', 0):02d}"
+            "\nHIGH + CRITICAL"
         )
         self.query_one("#metric-investigations", Static).update(
             f"{stats.completed_investigations:02d}\nINVESTIGATIONS"
@@ -122,15 +125,17 @@ class OverviewView(Vertical):
             table.add_row(
                 event.observed_at.astimezone().strftime("%H:%M:%S"),
                 event.severity.value.upper(),
-                event.target or "-",
-                event.title,
+                safe_text(event.target or "-"),
+                safe_text(event.title),
                 key=str(event.id),
             )
-        self.query_one("#overview-state", Static).update(
-            "Monitoring is active. New evidence appears without refreshing."
-            if events
-            else "Waiting for the first probe cycle."
-        )
+        state = self.query_one("#overview-state", Static)
+        if self.startup_warning is not None:
+            state.update(safe_text(self.startup_warning))
+            state.set_class(True, "error")
+        else:
+            state.update(_overview_status(app.services.monitor.status, has_events=bool(events)))
+            state.remove_class("error")
 
 
 class DashboardScreen(Screen[None]):
@@ -144,11 +149,20 @@ class DashboardScreen(Screen[None]):
         Binding("r", "context_retry", "Run / retry", show=False),
     ]
 
-    def __init__(self, config: AppConfig, services: AppServices) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        services: AppServices,
+        *,
+        startup_error: str | None = None,
+        startup_warning: str | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.services = services
         self.monitor = services.monitor
+        self._monitor_error = startup_error
+        self._startup_warning = startup_warning
 
     def compose(self) -> ComposeResult:
         preset = self.config.preset
@@ -158,7 +172,7 @@ class DashboardScreen(Screen[None]):
                 f"{preset.label} / {preset.reasoning_label}",
                 id="active-model",
             )
-            yield Static("", id="run-state")
+            yield Static("", id="run-state", markup=False)
         with Horizontal(id="primary-nav"):
             yield Button("1  Overview", id="nav-overview", classes="nav-button active")
             yield Button("2  Events", id="nav-events", classes="nav-button")
@@ -170,7 +184,7 @@ class DashboardScreen(Screen[None]):
             )
             yield Button("5  Settings", id="nav-settings", classes="nav-button")
         with ContentSwitcher(initial="overview-view", id="workspace"):
-            yield OverviewView(self.config)
+            yield OverviewView(self.config, startup_warning=self._startup_warning)
             yield EventsView()
             yield HostsView()
             yield InvestigationsView()
@@ -178,7 +192,11 @@ class DashboardScreen(Screen[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.set_class(self.size.width < 90, "narrow")
         self.refresh_run_state()
+        if self._monitor_error is not None:
+            self.show_monitor_error(self._monitor_error)
+        self.set_interval(1.0, self.refresh_run_state)
         self._consume_events()
 
     def on_resize(self, event: Resize) -> None:
@@ -213,12 +231,40 @@ class DashboardScreen(Screen[None]):
         overview = self.query_one(OverviewView)
         overview.config = config
         self.query_one(HostsView).refresh_targets()
+        self.query_one(InvestigationsView).refresh_actions()
+        self.query_one(SettingsView).apply_config(config)
 
     def refresh_run_state(self) -> None:
-        paused = bool(self.monitor.status.paused)
-        marker = "PAUSED" if paused else "● LIVE"
-        self.query_one("#run-state", Static).update(marker)
-        self.query_one("#run-state", Static).set_class(paused, "paused")
+        status = self.monitor.status
+        if self._monitor_error is not None:
+            marker = "! OFFLINE"
+            state_class = "offline"
+        elif not status.running:
+            marker = "○ STOPPED"
+            state_class = "offline"
+        elif status.paused:
+            marker = "Ⅱ PAUSED"
+            state_class = "paused"
+        elif status.last_error or self._startup_warning:
+            marker = "● LIVE / WARN"
+            state_class = "degraded"
+        else:
+            marker = "● LIVE"
+            state_class = ""
+        widget = self.query_one("#run-state", Static)
+        widget.update(marker)
+        widget.set_classes(state_class)
+
+    def show_monitor_error(self, error: str) -> None:
+        self._monitor_error = error
+        self.refresh_run_state()
+        overview_state = self.query_one("#overview-state", Static)
+        overview_state.update(f"Monitor is offline: {safe_text(error)}. Press Space to retry.")
+        overview_state.set_class(True, "error")
+
+    def clear_monitor_error(self) -> None:
+        self._monitor_error = None
+        self.refresh_run_state()
 
     def refresh_investigations(self) -> None:
         self.query_one(InvestigationsView).refresh_data()
@@ -253,6 +299,23 @@ class DashboardScreen(Screen[None]):
 
     @work(exclusive=True, group="live-events")
     async def _consume_events(self) -> None:
-        async for event in self.monitor.events():
-            self.query_one(EventsView).add_live_event(event)
-            self.query_one(OverviewView).refresh_data()
+        try:
+            async for event in self.monitor.events():
+                self._monitor_error = None
+                self.refresh_run_state()
+                self.query_one(EventsView).add_live_event(event)
+                self.query_one(OverviewView).refresh_data()
+        except Exception as exc:
+            self.show_monitor_error(str(exc) or type(exc).__name__)
+
+
+def _overview_status(status: MonitorStatus, *, has_events: bool) -> str:
+    if not status.running:
+        return "Monitoring is stopped. Press Space to retry."
+    if status.paused:
+        return "Monitoring is paused. Press Space to resume."
+    if status.last_error:
+        return f"Monitoring continues; the last probe failed: {safe_text(status.last_error)}"
+    if has_events:
+        return "Monitoring is active. New evidence appears automatically."
+    return "Monitoring is active. Waiting for the first probe cycle."

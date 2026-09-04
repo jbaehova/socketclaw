@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import cast
 from uuid import UUID
 
@@ -11,8 +12,13 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, DataTable, Markdown, Static
 
 from ..config import OPENAI_MODEL
-from ..storage import ResponseStatus, StoredInvestigation, StoredResponseProposal
-from .context import socketclaw_app
+from ..storage import (
+    ResponseStatus,
+    StoredInvestigation,
+    StoredResponseProposal,
+    StoredResponseStatus,
+)
+from .context import escape_markdown, safe_text, socketclaw_app
 from .dialogs import ConfirmResponseScreen
 
 
@@ -24,6 +30,7 @@ class InvestigationsView(Vertical):
         self.investigations: list[StoredInvestigation] = []
         self.proposals: list[StoredResponseProposal] = []
         self._selected_id: UUID | None = None
+        self._transitioning = False
 
     def compose(self) -> ComposeResult:
         yield Static("INVESTIGATIONS / OPENAI", classes="view-kicker")
@@ -34,6 +41,7 @@ class InvestigationsView(Vertical):
             "Loading investigation history…",
             id="investigations-state",
             classes="inline-state",
+            markup=False,
         )
         with Horizontal(classes="split-workspace"):
             yield DataTable(
@@ -44,11 +52,17 @@ class InvestigationsView(Vertical):
             yield Markdown(
                 "Select an investigation to inspect the model assessment.",
                 id="investigation-detail",
+                open_links=False,
             )
         with Horizontal(classes="action-row"):
-            yield Button("Retry", id="retry-investigation", variant="primary")
-            yield Button("Simulate response", id="simulate-response")
-            yield Button("Approve response", id="approve-response")
+            yield Button(
+                "Retry",
+                id="retry-investigation",
+                variant="primary",
+                disabled=True,
+            )
+            yield Button("Approve response", id="approve-response", disabled=True)
+            yield Button("Reject response", id="reject-response", disabled=True)
 
     def on_mount(self) -> None:
         self.query_one("#investigations-table", DataTable).add_columns(
@@ -64,11 +78,17 @@ class InvestigationsView(Vertical):
             self._show_state("Investigation storage is unavailable.", error=True)
             return
         try:
-            self.investigations = await repository.list_investigations(limit=500)
-            self.proposals = await repository.list_response_proposals(limit=500)
+            self.investigations, self.proposals, stats = await asyncio.gather(
+                repository.list_investigations(limit=500),
+                repository.list_response_proposals(limit=500),
+                repository.session_stats(),
+            )
         except Exception as exc:
             self._show_state(f"Could not load investigations: {exc}", error=True)
             return
+        self.query_one("#investigation-totals", Static).update(
+            f"{stats.total_tokens:,} tokens / ${stats.cost_usd:.6f} lifetime cost"
+        )
         self._render_rows()
 
     def selected_investigation(self) -> StoredInvestigation | None:
@@ -88,13 +108,15 @@ class InvestigationsView(Vertical):
         except (TypeError, ValueError):
             self._selected_id = None
         self._render_detail()
+        self.refresh_actions()
 
     @on(Button.Pressed, "#retry-investigation")
     def retry(self) -> None:
         selected = self.selected_investigation()
-        if selected is None:
+        if selected is None or selected.status != "failed":
             self._show_state("Select a failed investigation to retry.")
             return
+        self._selected_id = None
         self._retry(selected.event_id)
 
     @work(exclusive=True, group="investigation-retry")
@@ -113,13 +135,13 @@ class InvestigationsView(Vertical):
         finally:
             button.disabled = False
 
-    @on(Button.Pressed, "#simulate-response")
-    def simulate_response(self) -> None:
-        self._transition_response("simulated", confirm=False)
-
     @on(Button.Pressed, "#approve-response")
     def approve_response(self) -> None:
         self._transition_response("approved", confirm=True)
+
+    @on(Button.Pressed, "#reject-response")
+    def reject_response(self) -> None:
+        self._transition_response("rejected", confirm=True)
 
     def _transition_response(self, status: ResponseStatus, *, confirm: bool) -> None:
         proposal = self._selected_proposal()
@@ -127,9 +149,19 @@ class InvestigationsView(Vertical):
             self._show_state("This investigation has no response proposal.")
             return
         app = socketclaw_app(self)
+        permitted = (
+            proposal.status in {"pending", "approved"}
+            if status == "rejected"
+            else proposal.status == "pending"
+        )
+        if not permitted:
+            self._show_state(
+                f"This response is already {proposal.status}; it cannot be marked {status}."
+            )
+            return
         target_ip = proposal.proposal.target_ip
         if (
-            status in {"approved", "executed"}
+            status == "approved"
             and proposal.proposal.action == "block"
             and target_ip in app.config.targets
         ):
@@ -145,6 +177,7 @@ class InvestigationsView(Vertical):
                     accepted,
                     proposal.id,
                     status,
+                    proposal.status,
                 ),
             )
             return
@@ -155,63 +188,77 @@ class InvestigationsView(Vertical):
         accepted: bool | None,
         proposal_id: UUID,
         status: ResponseStatus,
+        expected_status: StoredResponseStatus,
     ) -> None:
         if accepted:
-            self._update_response(proposal_id, status)
+            self._update_response(proposal_id, status, expected_status)
 
     @work(exclusive=True, group="response-transition")
     async def _update_response(
         self,
         proposal_id: UUID,
         status: ResponseStatus,
+        expected_status: StoredResponseStatus,
     ) -> None:
         app = socketclaw_app(self)
         repository = app.services.repository
         if repository is None:
             self._show_state("Response storage is unavailable.", error=True)
             return
+        self._transitioning = True
+        self.refresh_actions()
         try:
-            await repository.update_response_proposal_status(proposal_id, status)
+            await repository.update_response_proposal_status(
+                proposal_id,
+                status,
+                expected_status=expected_status,
+                protected_targets=app.config.targets,
+            )
         except Exception as exc:
             self._show_state(f"Response was not changed: {exc}", error=True)
         else:
             self._show_state(f"Response marked {status}.")
             self.refresh_data()
+        finally:
+            self._transitioning = False
+            self.refresh_actions()
 
     def _render_rows(self) -> None:
         table = cast(
             DataTable[str],
             self.query_one("#investigations-table", DataTable),
         )
+        previous_selection = self._selected_id
         table.clear()
         for item in self.investigations:
             usage = item.usage
             table.add_row(
                 item.created_at.astimezone().strftime("%H:%M:%S"),
                 item.status.upper(),
-                _model_label(item.model_id),
+                safe_text(_model_label(item.model_id)),
                 item.requested_effort.upper(),
                 str(usage.total_tokens or 0) if usage else "-",
                 f"${usage.cost_usd:.6f}" if usage else "-",
                 key=str(item.id),
             )
-        total_tokens = sum(
-            item.usage.total_tokens or 0 for item in self.investigations if item.usage is not None
-        )
-        total_cost = sum(
-            item.usage.cost_usd for item in self.investigations if item.usage is not None
-        )
-        self.query_one("#investigation-totals", Static).update(
-            f"{total_tokens:,} tokens / ${total_cost:.6f} estimated cost"
-        )
         if not self.investigations:
             self._selected_id = None
             self._show_state("No investigations yet. Select an event and press I.")
+            self.query_one("#investigation-detail", Markdown).update(
+                "No investigation is selected."
+            )
+            self.refresh_actions()
             return
-        self._selected_id = self.investigations[0].id
-        table.move_cursor(row=0)
+        investigation_ids = {item.id for item in self.investigations}
+        self._selected_id = (
+            previous_selection
+            if previous_selection in investigation_ids
+            else self.investigations[0].id
+        )
+        table.move_cursor(row=table.get_row_index(str(self._selected_id)))
         self._show_state(f"{len(self.investigations)} durable investigation record(s).")
         self._render_detail()
+        self.refresh_actions()
 
     def _render_detail(self) -> None:
         item = self.selected_investigation()
@@ -221,11 +268,23 @@ class InvestigationsView(Vertical):
             )
             return
         label = _model_label(item.model_id)
+        rendered_label = label if item.model_id == OPENAI_MODEL.model_id else escape_markdown(label)
         if item.status == "failed":
             content = (
-                f"## Investigation failed\n\n**{label}** / "
-                f"`{item.requested_effort.upper()}`\n\n"
-                f"{item.error or 'No provider error was recorded.'}"
+                f"## Investigation failed\n\n**{rendered_label}** / "
+                f"`{escape_markdown(item.requested_effort.upper())}`\n\n"
+                f"{escape_markdown(item.error or 'No provider error was recorded.')}"
+            )
+        elif item.status in {"queued", "running"}:
+            state = (
+                "Queued for provider execution."
+                if item.status == "queued"
+                else ("OpenAI analysis is in progress. Monitoring continues in the background.")
+            )
+            content = (
+                f"## Investigation {item.status}\n\n"
+                f"**{rendered_label}** / "
+                f"`{escape_markdown(item.requested_effort.upper())}`\n\n{state}"
             )
         else:
             assessment = item.assessment
@@ -233,18 +292,22 @@ class InvestigationsView(Vertical):
             if assessment is None or usage is None:
                 content = "## Invalid record\n\nThe completed result is missing data."
             else:
-                rationale = "\n".join(f"- {line}" for line in assessment.rationale)
+                rationale = "\n".join(f"- {escape_markdown(line)}" for line in assessment.rationale)
                 actions = (
-                    "\n".join(f"- {line}" for line in assessment.recommended_actions)
+                    "\n".join(
+                        f"- {escape_markdown(line)}" for line in assessment.recommended_actions
+                    )
                     or "- No response was recommended."
                 )
                 content = (
                     f"## {assessment.classification.upper()} / "
                     f"{assessment.confidence:.0%}\n\n"
-                    f"**{label}** / `{item.requested_effort.upper()}`  \n"
+                    f"**{rendered_label}** / "
+                    f"`{escape_markdown(item.requested_effort.upper())}`  \n"
                     f"**{usage.total_tokens or 0} tokens** / "
                     f"**${usage.cost_usd:.6f}** / {usage.latency_ms} ms\n\n"
-                    f"{assessment.summary}\n\n### Rationale\n\n{rationale}\n\n"
+                    f"{escape_markdown(assessment.summary)}\n\n"
+                    f"### Rationale\n\n{rationale}\n\n"
                     f"### Recommended actions\n\n{actions}"
                 )
         proposal = self._selected_proposal()
@@ -252,10 +315,21 @@ class InvestigationsView(Vertical):
             content += (
                 f"\n\n### Response proposal / {proposal.status.upper()}\n\n"
                 f"`{proposal.proposal.action}` "
-                f"`{proposal.proposal.target_ip or 'no target'}` - "
-                f"{proposal.proposal.reason}"
+                f"`{escape_markdown(proposal.proposal.target_ip or 'no target')}` - "
+                f"{escape_markdown(proposal.proposal.reason)}"
             )
         self.query_one("#investigation-detail", Markdown).update(content)
+
+    def refresh_actions(self) -> None:
+        selected = self.selected_investigation()
+        proposal = self._selected_proposal()
+        pending = proposal is not None and proposal.status == "pending"
+        rejectable = proposal is not None and proposal.status in {"pending", "approved"}
+        self.query_one("#retry-investigation", Button).disabled = (
+            selected is None or selected.status != "failed"
+        )
+        self.query_one("#approve-response", Button).disabled = not pending or self._transitioning
+        self.query_one("#reject-response", Button).disabled = not rejectable or self._transitioning
 
     def _selected_proposal(self) -> StoredResponseProposal | None:
         selected = self.selected_investigation()
@@ -268,7 +342,7 @@ class InvestigationsView(Vertical):
 
     def _show_state(self, message: str, *, error: bool = False) -> None:
         state = self.query_one("#investigations-state", Static)
-        state.update(message)
+        state.update(safe_text(message))
         state.set_class(error, "error")
 
 

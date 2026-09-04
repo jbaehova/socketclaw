@@ -11,7 +11,8 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, DataTable, Input, Static
 
 from ..config import AppConfig
-from .context import socketclaw_app
+from .context import safe_text, socketclaw_app
+from .dialogs import ConfirmTargetRemovalScreen
 
 
 class HostsView(Vertical):
@@ -28,7 +29,7 @@ class HostsView(Vertical):
         with Horizontal(classes="filter-row"):
             yield Input(placeholder="IP address or hostname", id="host-target")
             yield Button("Add target", id="add-host", variant="primary")
-        yield Static("", id="hosts-state", classes="inline-state")
+        yield Static("", id="hosts-state", classes="inline-state", markup=False)
         yield DataTable(id="hosts-table", cursor_type="row", zebra_stripes=True)
         with Horizontal(classes="action-row"):
             yield Button("Ping now", id="ping-host", variant="primary")
@@ -44,6 +45,7 @@ class HostsView(Vertical):
     def refresh_targets(self) -> None:
         app = socketclaw_app(self)
         table = cast(DataTable[str], self.query_one("#hosts-table", DataTable))
+        selected = self.selected_target()
         table.clear()
         for target in app.config.targets:
             table.add_row(
@@ -53,21 +55,58 @@ class HostsView(Vertical):
                 ", ".join(str(port) for port in app.config.ports),
                 key=target,
             )
-        self._show_state(f"{len(app.config.targets)} target(s) monitored.")
+        if app.config.targets:
+            target = selected if selected in app.config.targets else app.config.targets[0]
+            table.move_cursor(row=table.get_row_index(target))
+        self._refresh_diagnostic_buttons()
+        if "ping" not in app.services.monitor.status.diagnostics:
+            self._show_state(
+                f"{len(app.config.targets)} target(s) monitored. System ping is unavailable."
+            )
+        else:
+            self._show_state(f"{len(app.config.targets)} target(s) monitored.")
 
     @on(Button.Pressed, "#add-host")
     def add_target(self) -> None:
+        self._add_target()
+
+    @on(Input.Submitted, "#host-target")
+    def submit_target(self) -> None:
+        self._add_target()
+
+    @work(exclusive=True, group="host-update")
+    async def _add_target(self) -> None:
         app = socketclaw_app(self)
         target = self.query_one("#host-target", Input).value.strip()
+        if target in app.config.targets:
+            self._show_state(f"{target} is already monitored.")
+            return
+        button = self.query_one("#add-host", Button)
+        button.disabled = True
         try:
-            updated = app.config.model_copy(update={"targets": [*app.config.targets, target]})
-            updated = AppConfig.model_validate(updated.model_dump())
+            added = False
+
+            def add_to_latest(current: AppConfig) -> AppConfig:
+                nonlocal added
+                if target in current.targets:
+                    return current
+                added = True
+                updated = current.model_copy(update={"targets": [*current.targets, target]})
+                return AppConfig.model_validate(updated.model_dump())
+
+            await app.update_config(add_to_latest)
+            if not added:
+                self._show_state(f"{target} is already monitored.")
+                return
         except ValidationError as exc:
             self._show_state(_validation_message(exc), error=True)
-            return
-        app.save_config(updated)
-        self.query_one("#host-target", Input).value = ""
-        self.refresh_targets()
+        except Exception as exc:
+            self._show_state(f"Target was not added: {exc}", error=True)
+        else:
+            self.query_one("#host-target", Input).value = ""
+            self._show_state(f"Added {target} to active monitoring.")
+        finally:
+            button.disabled = False
 
     @on(Button.Pressed, "#remove-host")
     def remove_target(self) -> None:
@@ -79,11 +118,44 @@ class HostsView(Vertical):
         if len(app.config.targets) == 1:
             self._show_state("At least one monitoring target is required.", error=True)
             return
-        updated = app.config.model_copy(
-            update={"targets": [target for target in app.config.targets if target != selected]}
+        app.push_screen(
+            ConfirmTargetRemovalScreen(selected),
+            lambda accepted: self._confirmed_removal(accepted, selected),
         )
-        app.save_config(updated)
-        self.refresh_targets()
+
+    def _confirmed_removal(self, accepted: bool | None, target: str) -> None:
+        if accepted:
+            self._remove_target(target)
+
+    @work(exclusive=True, group="host-update")
+    async def _remove_target(self, selected: str) -> None:
+        app = socketclaw_app(self)
+        button = self.query_one("#remove-host", Button)
+        button.disabled = True
+        try:
+            removed = False
+
+            def remove_from_latest(current: AppConfig) -> AppConfig:
+                nonlocal removed
+                if selected not in current.targets:
+                    return current
+                if len(current.targets) == 1:
+                    raise ValueError("At least one monitoring target is required.")
+                removed = True
+                return current.model_copy(
+                    update={"targets": [target for target in current.targets if target != selected]}
+                )
+
+            await app.update_config(remove_from_latest)
+            if not removed:
+                self._show_state(f"{selected} is no longer monitored.")
+                return
+        except Exception as exc:
+            self._show_state(f"Target was not removed: {exc}", error=True)
+        else:
+            self._show_state(f"Removed {selected} from active monitoring.")
+        finally:
+            button.disabled = False
 
     @on(Button.Pressed, "#ping-host")
     def ping_target(self) -> None:
@@ -95,6 +167,14 @@ class HostsView(Vertical):
 
     @work(exclusive=True, group="host-diagnostic")
     async def run_diagnostic(self, kind: str) -> None:
+        app = socketclaw_app(self)
+        if kind not in app.services.monitor.status.diagnostics:
+            self._show_state(
+                f"{kind.title()} diagnostic is unavailable on this system.",
+                error=True,
+            )
+            self._refresh_diagnostic_buttons()
+            return
         selected = self.selected_target()
         if selected is None:
             self._show_state("Select a target before running a diagnostic.")
@@ -107,26 +187,32 @@ class HostsView(Vertical):
             button.disabled = True
         self._show_state(f"Running {kind} diagnostic for {selected}…")
         try:
-            app = socketclaw_app(self)
             await app.services.monitor.run_diagnostic(kind, selected)
         except Exception as exc:
             self._show_state(f"Diagnostic failed: {exc}", error=True)
         else:
             self._show_state(f"{kind.title()} diagnostic completed for {selected}.")
         finally:
-            for button in buttons:
-                button.disabled = False
+            self._refresh_diagnostic_buttons()
+
+    def _refresh_diagnostic_buttons(self) -> None:
+        diagnostics = socketclaw_app(self).services.monitor.status.diagnostics
+        ping = self.query_one("#ping-host", Button)
+        ports = self.query_one("#scan-host", Button)
+        ping.label = "Ping now" if "ping" in diagnostics else "Ping unavailable"
+        ping.disabled = "ping" not in diagnostics
+        ports.disabled = "ports" not in diagnostics
 
     def selected_target(self) -> str | None:
         table = cast(DataTable[str], self.query_one("#hosts-table", DataTable))
         if table.row_count == 0:
             return None
-        key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
-        return str(key) if key is not None else None
+        row = min(table.cursor_row, table.row_count - 1)
+        return str(table.get_row_at(row)[0])
 
     def _show_state(self, message: str, *, error: bool = False) -> None:
         state = self.query_one("#hosts-state", Static)
-        state.update(message)
+        state.update(safe_text(message))
         state.set_class(error, "error")
 
 

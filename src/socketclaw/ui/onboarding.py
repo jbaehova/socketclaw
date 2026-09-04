@@ -8,12 +8,13 @@ from pydantic import ValidationError
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.events import Resize
 from textual.screen import Screen
 from textual.widgets import Button, ContentSwitcher, Input, Static
 
 from ..config import AppConfig
 from ..openai import OpenAIError
-from .context import socketclaw_app
+from .context import safe_text, socketclaw_app
 
 if TYPE_CHECKING:
     from .app import AppServices
@@ -22,15 +23,27 @@ if TYPE_CHECKING:
 class OnboardingScreen(Screen[None]):
     """Collect, validate, and persist the minimum useful first-run settings."""
 
-    def __init__(self, services: AppServices, initial_config: AppConfig) -> None:
+    def __init__(
+        self,
+        services: AppServices,
+        initial_config: AppConfig,
+        *,
+        existing_api_key: str | None = None,
+    ) -> None:
         super().__init__()
         self.services = services
         self.current_step = 0
-        self._pending_key = ""
+        self._existing_api_key = existing_api_key
+        self._pending_key = existing_api_key
         self._pending_config = initial_config.model_copy(deep=True)
 
     def on_mount(self) -> None:
+        self.set_class(self.size.height < 27 or self.size.width < 82, "compact")
+        self.query_one("#onboarding-skip", Button).display = False
         self.query_one("#onboarding-next", Button).focus()
+
+    def on_resize(self, event: Resize) -> None:
+        self.set_class(event.size.height < 27 or event.size.width < 82, "compact")
 
     def compose(self) -> ComposeResult:
         with Vertical(id="onboarding-shell"):
@@ -60,11 +73,16 @@ class OnboardingScreen(Screen[None]):
                     yield Static("Connect OpenAI", classes="step-title")
                     yield Static(
                         "The key and GPT-5.6 Luna access are validated without generating "
-                        "tokens, then stored in ~/.socketclaw/.env with private permissions.",
+                        "tokens, then stored privately. You can skip this and add a key "
+                        "later from Settings.",
                         classes="step-copy",
                     )
                     yield Input(
-                        placeholder="sk-proj-...",
+                        placeholder=(
+                            "Configured key will be kept"
+                            if self._pending_key is not None
+                            else "sk-proj-..."
+                        ),
                         password=True,
                         id="api-key",
                     )
@@ -98,13 +116,20 @@ class OnboardingScreen(Screen[None]):
                     yield Static("Ready to watch.", classes="step-title")
                     yield Static(
                         "Monitoring starts immediately. You can pause it with Space and "
-                        "change every setting from workspace 5.",
+                        "change watch targets, intervals, ports, logs, and theme from "
+                        "workspace 5.",
                         classes="step-copy",
                     )
-                    yield Static("", id="onboarding-summary", classes="step-note")
-            yield Static("", id="onboarding-error")
+                    yield Static(
+                        "",
+                        id="onboarding-summary",
+                        classes="step-note",
+                        markup=False,
+                    )
+            yield Static("", id="onboarding-error", markup=False)
             with Horizontal(id="onboarding-actions"):
-                yield Button("Back", id="onboarding-back")
+                yield Button("Back", id="onboarding-back", disabled=True)
+                yield Button("Skip for now", id="onboarding-skip")
                 yield Button("Continue", id="onboarding-next", variant="primary")
 
     @on(Button.Pressed, "#onboarding-back")
@@ -119,6 +144,12 @@ class OnboardingScreen(Screen[None]):
             self._show_step(1)
             return
         if self.current_step == 1:
+            if (
+                not self.query_one("#api-key", Input).value.strip()
+                and self._pending_key is not None
+            ):
+                self._show_step(2)
+                return
             await self._validate_key()
             return
         if self.current_step == 2:
@@ -129,12 +160,34 @@ class OnboardingScreen(Screen[None]):
             self.query_one("#onboarding-next", Button).label = "Start monitoring"
             return
         app = socketclaw_app(self)
-        await app.complete_onboarding(self._pending_config, self._pending_key)
+        button = self.query_one("#onboarding-next", Button)
+        button.disabled = True
+        button.label = "Starting…"
+        try:
+            await app.complete_onboarding(self._pending_config, self._pending_key)
+        except Exception as exc:
+            self._set_error(f"Setup could not be completed: {exc}")
+            button.disabled = False
+            button.label = "Start monitoring"
+
+    @on(Input.Submitted)
+    def submit_input(self) -> None:
+        self.query_one("#onboarding-next", Button).press()
+
+    @on(Button.Pressed, "#onboarding-skip")
+    def skip_openai(self) -> None:
+        if self.current_step != 1:
+            return
+        self._pending_key = self._existing_api_key
+        self.query_one("#api-key", Input).value = ""
+        self._show_step(2)
 
     async def _validate_key(self) -> None:
-        key = self.query_one("#api-key", Input).value
-        if not key.strip():
+        key_input = self.query_one("#api-key", Input)
+        key = key_input.value.strip()
+        if not key:
             self._set_error("Enter an OpenAI API key.")
+            key_input.focus()
             return
         button = self.query_one("#onboarding-next", Button)
         button.disabled = True
@@ -143,9 +196,11 @@ class OnboardingScreen(Screen[None]):
             await self.services.validate_key(key)
         except OpenAIError as exc:
             self._set_error(str(exc))
+            key_input.focus()
             return
         except Exception:
             self._set_error("OpenAI validation failed. Check your connection.")
+            key_input.focus()
             return
         finally:
             button.disabled = False
@@ -171,6 +226,7 @@ class OnboardingScreen(Screen[None]):
             )
         except (ValidationError, ValueError) as exc:
             self._set_error(_validation_message(exc))
+            self.query_one("#onboarding-targets", Input).focus()
             return False
         return True
 
@@ -189,20 +245,32 @@ class OnboardingScreen(Screen[None]):
         )
         self.query_one("#onboarding-progress", Static).update(progress)
         self.query_one("#onboarding-back", Button).disabled = step == 0
+        self.query_one("#onboarding-skip", Button).display = step == 1
+        next_button = self.query_one("#onboarding-next", Button)
+        # Moving to a new step is a distinct action, even when the same button is reused.
+        next_button.remove_class("-active")
         if step < 3:
-            self.query_one("#onboarding-next", Button).label = "Continue"
+            next_button.label = "Continue"
+        focus_targets = (
+            "#onboarding-next",
+            "#api-key",
+            "#onboarding-targets",
+            "#onboarding-next",
+        )
+        self.call_after_refresh(self.query_one(focus_targets[step]).focus)
 
     def _render_summary(self) -> None:
         preset = self._pending_config.preset
+        model_summary = preset.label if self._pending_key is not None else "Local monitoring only"
         self.query_one("#onboarding-summary", Static).update(
             f"{len(self._pending_config.targets)} target(s) / "
-            f"{preset.label} / {preset.reasoning_label} / "
+            f"{model_summary} / "
             f"Ping {self._pending_config.ping_interval:g}s / "
             f"Scan {self._pending_config.scan_interval:g}s"
         )
 
     def _set_error(self, message: str) -> None:
-        self.query_one("#onboarding-error", Static).update(message)
+        self.query_one("#onboarding-error", Static).update(safe_text(message))
 
 
 def _validation_message(error: Exception) -> str:

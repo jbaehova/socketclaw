@@ -12,7 +12,7 @@ from textual.widgets import Button, DataTable, Input, Markdown, Select, Static
 
 from ..domain import EventSource, SecurityEvent, Severity
 from ..storage import EventQuery, StoredEvent
-from .context import socketclaw_app
+from .context import escape_markdown, indented_code, safe_text, socketclaw_app
 
 
 class EventsView(Vertical):
@@ -22,6 +22,8 @@ class EventsView(Vertical):
         super().__init__(id="events-view", classes="workspace-view")
         self.events: list[StoredEvent] = []
         self._selected_id: UUID | None = None
+        self._investigating = False
+        self._exporting = False
 
     def compose(self) -> ComposeResult:
         yield Static("EVENTS / LOCAL EVIDENCE", classes="view-kicker")
@@ -44,17 +46,31 @@ class EventsView(Vertical):
                 allow_blank=False,
                 id="event-source",
             )
-        yield Static("Loading local event history…", id="events-state", classes="inline-state")
+        yield Static(
+            "Loading local event history…",
+            id="events-state",
+            classes="inline-state",
+            markup=False,
+        )
         with Horizontal(classes="split-workspace"):
             yield DataTable(
                 id="events-table",
                 cursor_type="row",
                 zebra_stripes=True,
             )
-            yield Markdown("Select an event to inspect its evidence.", id="event-detail")
+            yield Markdown(
+                "Select an event to inspect its evidence.",
+                id="event-detail",
+                open_links=False,
+            )
         with Horizontal(classes="action-row"):
-            yield Button("Investigate", id="investigate-event", variant="primary")
-            yield Button("Export .md", id="export-event")
+            yield Button(
+                "Investigate",
+                id="investigate-event",
+                variant="primary",
+                disabled=True,
+            )
+            yield Button("Export .md", id="export-event", disabled=True)
 
     def on_mount(self) -> None:
         table = cast(DataTable[str], self.query_one("#events-table", DataTable))
@@ -118,6 +134,7 @@ class EventsView(Vertical):
     @work(exclusive=True, group="event-investigation")
     async def _investigate(self, event_id: UUID) -> None:
         button = self.query_one("#investigate-event", Button)
+        self._investigating = True
         button.disabled = True
         self._show_state("Investigating with GPT-5.6 Luna on OpenAI…")
         try:
@@ -128,7 +145,8 @@ class EventsView(Vertical):
         else:
             self._show_state("Investigation complete. Open workspace 4 for the report.")
         finally:
-            button.disabled = False
+            self._investigating = False
+            self._refresh_actions()
 
     def export_selected(self) -> None:
         event = self.selected_event()
@@ -140,6 +158,7 @@ class EventsView(Vertical):
     @work(exclusive=True, group="event-export")
     async def _export(self, event_id: UUID) -> None:
         button = self.query_one("#export-event", Button)
+        self._exporting = True
         button.disabled = True
         try:
             app = socketclaw_app(self)
@@ -149,7 +168,8 @@ class EventsView(Vertical):
         else:
             self._show_state(f"Exported safely to {destination}")
         finally:
-            button.disabled = False
+            self._exporting = False
+            self._refresh_actions()
 
     @on(Input.Changed, "#event-search")
     @on(Select.Changed, "#event-severity")
@@ -175,14 +195,15 @@ class EventsView(Vertical):
 
     def _render_rows(self) -> None:
         table = cast(DataTable[str], self.query_one("#events-table", DataTable))
+        previous_selection = self._selected_id
         table.clear()
         for event in self.events:
             table.add_row(
                 event.observed_at.astimezone().strftime("%H:%M:%S"),
                 event.severity.value.upper(),
                 event.source.value,
-                event.target or "-",
-                event.title,
+                safe_text(event.target or "-"),
+                safe_text(event.title),
                 key=str(event.id),
             )
         if not self.events:
@@ -191,35 +212,51 @@ class EventsView(Vertical):
                 "No event is selected. Adjust the filters or wait for a new probe result."
             )
             self._show_state("No events match the current filters.")
+            self._refresh_actions()
             return
-        self._selected_id = self.events[0].id
-        table.move_cursor(row=0)
+        event_ids = {event.id for event in self.events}
+        self._selected_id = (
+            previous_selection if previous_selection in event_ids else self.events[0].id
+        )
+        table.move_cursor(row=table.get_row_index(str(self._selected_id)))
         self._show_state(f"{len(self.events)} event(s) in the current view.")
         self._render_detail()
+        self._refresh_actions()
 
     def _render_detail(self) -> None:
         event = self.selected_event()
         if event is None:
+            self.query_one("#event-detail", Markdown).update("No event is selected.")
             return
         signals = (
             "\n".join(
-                f"- **{signal.label}** `+{signal.points}` - {signal.detail}"
+                f"- **{escape_markdown(signal.label)}** `+{signal.points}` - "
+                f"{escape_markdown(signal.detail)}"
                 for signal in event.signals
             )
             or "- No deterministic signals were recorded."
         )
+        evidence = indented_code(event.model_dump_json(indent=2))
         self.query_one("#event-detail", Markdown).update(
-            f"## {event.title}\n\n"
+            f"## {escape_markdown(event.title)}\n\n"
             f"**{event.severity.value.upper()} / {event.score}/100**  \n"
-            f"`{event.event_type}` / `{event.target or 'no target'}`  \n"
+            f"`{escape_markdown(event.event_type)}` / "
+            f"`{escape_markdown(event.target or 'no target')}`  \n"
             f"{event.observed_at.astimezone().isoformat(timespec='seconds')}\n\n"
-            f"{event.summary}\n\n### Detection signals\n\n{signals}\n\n"
-            f"### Evidence\n\n```json\n{event.model_dump_json(indent=2)}\n```"
+            f"{escape_markdown(event.summary)}\n\n### Detection signals\n\n{signals}\n\n"
+            f"### Evidence\n\n{evidence}"
         )
+
+    def _refresh_actions(self) -> None:
+        has_selection = self.selected_event() is not None
+        self.query_one("#investigate-event", Button).disabled = (
+            not has_selection or self._investigating
+        )
+        self.query_one("#export-event", Button).disabled = not has_selection or self._exporting
 
     def _show_state(self, message: str, *, error: bool = False) -> None:
         state = self.query_one("#events-state", Static)
-        state.update(message)
+        state.update(safe_text(message))
         state.set_class(error, "error")
 
 
