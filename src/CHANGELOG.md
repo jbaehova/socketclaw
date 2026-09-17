@@ -4,6 +4,10 @@ All notable SocketClaw changes are documented here.
 
 ## Unreleased
 
+## 0.4.0 - 2026-09-17
+
+- Publish standalone macOS executables for Apple Silicon and Intel through
+  GitHub Releases, with a checksum-verifying installer.
 - Add an Incident desk with state filters, a wide-screen context pane, and a
   compact full-screen reader. Record acknowledgement, resolution, reopening,
   and notes with reasons through the same interface.
