@@ -43,6 +43,9 @@ class HelpScreen(ModalScreen[None]):
                 "[b]1-5[/b]  Switch workspace\n"
                 "[b]Space[/b] Pause or resume monitoring\n"
                 "[b]Ctrl+P[/b] Open command palette\n"
+                "[b]Enter[/b] Open detail  [b]Esc[/b] Return to your list\n"
+                "[b]L[/b] Log source progress and read errors\n"
+                "[b]H[/b] Collection health and scheduling\n"
                 "[b]R[/b] Run diagnostic  [b]I[/b] Investigate event\n"
                 "[b]E[/b] Export incident  [b]?[/b] Help  [b]Q[/b] Quit",
                 id="help-copy",
@@ -226,3 +229,35 @@ class ConfirmTargetRemovalScreen(ModalScreen[bool]):
     @on(Button.Pressed, "#confirm-target-removal")
     def confirm(self) -> None:
         self.dismiss(True)
+
+
+class SettingsConflictScreen(ModalScreen[str]):
+    """Resolve an overlapping edit using the loaded, saved, and draft values."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    SettingsConflictScreen { background: $surface; layout: vertical; padding: 1; }
+    SettingsConflictScreen > VerticalScroll { height: 1fr; }
+    SettingsConflictScreen > Horizontal { height: auto; }
+    SettingsConflictScreen Button { min-width: 16; margin-right: 1; }
+    """
+
+    def __init__(self, comparison: str) -> None:
+        super().__init__()
+        self.comparison = comparison
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(can_focus=True):
+            yield Static("These settings changed while you were editing.", markup=False)
+            yield Static(safe_text(self.comparison), markup=False)
+        with Horizontal():
+            yield Button("Cancel", id="conflict-cancel")
+            yield Button("Use saved", id="conflict-saved")
+            yield Button("Keep my changes", id="conflict-draft", variant="primary")
+
+    def action_cancel(self) -> None:
+        self.dismiss("cancel")
+
+    @on(Button.Pressed)
+    def resolve(self, event: Button.Pressed) -> None:
+        self.dismiss((event.button.id or "conflict-cancel").removeprefix("conflict-"))

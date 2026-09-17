@@ -240,3 +240,55 @@ async def test_unknown_theme_falls_back_visibly_without_crashing(
         await pilot.press("5")
         state = fixture.app.screen.query_one("#settings-state", Static)
         assert "unavailable" in str(state.render()).lower()
+
+
+async def test_external_target_change_preserves_unsaved_ping_draft(
+    app_factory: Callable[..., Any],
+) -> None:
+    fixture = app_factory(configured=True)
+    async with fixture.app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await pilot.press("5")
+        ping = fixture.app.screen.query_one("#settings-ping", Input)
+        ping.value = "17"
+        await fixture.app.update_config(
+            lambda current: current.model_copy(update={"targets": ["8.8.8.8"]})
+        )
+        assert ping.value == "17"
+        assert fixture.app.screen.query_one("#settings-targets", Input).value == "8.8.8.8"
+        await pilot.click("#save-settings")
+        await pilot.pause()
+        assert fixture.app.config.ping_interval == 17
+        assert fixture.app.config.targets == ["8.8.8.8"]
+
+
+@pytest.mark.parametrize("choice, expected", [("draft", 17), ("saved", 12)])
+async def test_overlapping_settings_changes_require_explicit_resolution(
+    app_factory: Callable[..., Any], choice: str, expected: int
+) -> None:
+    from socketclaw.ui.dialogs import SettingsConflictScreen
+
+    fixture = app_factory(configured=True)
+    async with fixture.app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await pilot.press("5")
+        dashboard = fixture.app.screen
+        dashboard.query_one("#settings-ping", Input).value = "17"
+        dashboard.query_one("#settings-scan", Input).value = "123"
+        await fixture.app.update_config(
+            lambda current: current.model_copy(update={"ping_interval": 12})
+        )
+        await pilot.click("#save-settings")
+        await pilot.pause()
+        assert isinstance(fixture.app.screen, SettingsConflictScreen)
+        assert "Loaded: 5" in fixture.app.screen.comparison
+        assert "Saved: 12" in fixture.app.screen.comparison
+        assert "Your draft: 17" in fixture.app.screen.comparison
+        assert fixture.app.config.ping_interval == 12
+        await pilot.click(f"#conflict-{choice}")
+        await pilot.pause()
+        assert fixture.app.config.ping_interval == expected
+        assert dashboard.query_one("#settings-ping", Input).value == str(expected)
+        assert dashboard.query_one("#settings-scan", Input).value == "123"
+        if choice == "draft":
+            assert fixture.app.config.scan_interval == 123

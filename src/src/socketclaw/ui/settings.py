@@ -12,6 +12,24 @@ from textual.widgets import Button, Input, Select, Static
 
 from ..config import AppConfig
 from .context import safe_text, socketclaw_app
+from .dialogs import SettingsConflictScreen
+from .rules import RuleSettingsScreen
+
+_FIELDS = {
+    "targets": "settings-targets",
+    "ping_interval": "settings-ping",
+    "scan_interval": "settings-scan",
+    "ports": "settings-ports",
+    "log_paths": "settings-log-paths",
+    "theme": "settings-theme",
+}
+
+
+class SettingsConflict(ValueError):
+    def __init__(self, fields: tuple[str, ...], current: AppConfig) -> None:
+        super().__init__("Settings changed elsewhere. Review the conflicting values.")
+        self.fields = fields
+        self.current = current
 
 
 class SettingsView(Vertical):
@@ -23,6 +41,7 @@ class SettingsView(Vertical):
     def compose(self) -> ComposeResult:
         app = socketclaw_app(self)
         config = app.config
+        self._baseline = config
         theme_value = _theme_value(app.available_themes, config.theme)
         theme_options = [
             ("SocketClaw dark", "textual-dark"),
@@ -103,7 +122,12 @@ class SettingsView(Vertical):
         with Vertical(id="settings-footer"):
             yield Static("", id="settings-state", classes="inline-state", markup=False)
             with Horizontal(classes="action-row"):
+                yield Button("Detection rules", id="edit-rules")
                 yield Button("Save settings", id="save-settings", variant="primary")
+
+    @on(Button.Pressed, "#edit-rules")
+    def edit_rules(self) -> None:
+        socketclaw_app(self).push_screen(RuleSettingsScreen(socketclaw_app(self).config.rules))
 
     @on(Button.Pressed, "#save-settings")
     def save(self) -> None:
@@ -128,9 +152,9 @@ class SettingsView(Vertical):
         button.disabled = True
         key_input = self.query_one("#settings-api-key", Input)
         replacement_key = key_input.value.strip()
+        baseline = self._baseline
         try:
             previous_key = app.services.config_store.load_api_key()
-            baseline = app.config
             submitted = AppConfig.model_validate(
                 {
                     "model": app.config.model,
@@ -175,9 +199,19 @@ class SettingsView(Vertical):
                 await app.services.validate_key(replacement_key)
                 app.services.config_store.save_api_key(replacement_key)
             try:
-                config = await app.update_config(
-                    lambda current: AppConfig.model_validate(current.model_copy(update=changed))
-                )
+
+                def merge(current: AppConfig) -> AppConfig:
+                    conflicts = tuple(
+                        field
+                        for field, value in changed.items()
+                        if getattr(current, field) != getattr(baseline, field)
+                        and getattr(current, field) != value
+                    )
+                    if conflicts:
+                        raise SettingsConflict(conflicts, current)
+                    return AppConfig.model_validate(current.model_copy(update=changed))
+
+                config = await app.update_config(merge)
             except BaseException:
                 if replacement_key:
                     if previous_key is None:
@@ -185,11 +219,26 @@ class SettingsView(Vertical):
                     else:
                         app.services.config_store.save_api_key(previous_key)
                 raise
+        except SettingsConflict as exc:
+            self._show_state(str(exc), error=True)
+            comparison = "\n\n".join(
+                f"{field.replace('_', ' ').title()}\n"
+                f"Loaded: {self._config_value(baseline, field)}\n"
+                f"Saved: {self._config_value(exc.current, field)}\n"
+                f"Your draft: {self._read_field(field)}"
+                for field in exc.fields
+            )
+            fields = exc.fields
+            app.push_screen(
+                SettingsConflictScreen(comparison),
+                lambda choice: self._resolve_conflicts(choice, fields),
+            )
         except (ValidationError, ValueError) as exc:
             self._show_state(_validation_message(exc), error=True)
         except Exception as exc:
             self._show_state(f"Settings were not saved: {exc}", error=True)
         else:
+            self._baseline = config
             key_input.value = ""
             if replacement_key:
                 self.query_one("#settings-key-label", Static).update(
@@ -201,21 +250,53 @@ class SettingsView(Vertical):
 
     def apply_config(self, config: AppConfig) -> None:
         """Synchronize the mounted editor after changes from another workspace."""
-        app = socketclaw_app(self)
         self.query_one("#model-policy", Static).update(
             f"{config.preset.label} / {config.preset.reasoning_label}"
         )
-        self.query_one("#settings-targets", Input).value = ", ".join(config.targets)
-        self.query_one("#settings-ping", Input).value = f"{config.ping_interval:g}"
-        self.query_one("#settings-scan", Input).value = f"{config.scan_interval:g}"
-        self.query_one("#settings-ports", Input).value = ", ".join(
-            str(port) for port in config.ports
+        clean: dict[str, object] = {}
+        for field in _FIELDS:
+            draft = self._read_field(field)
+            if draft in {
+                self._config_value(self._baseline, field),
+                self._config_value(config, field),
+            }:
+                self._write_field(field, self._config_value(config, field))
+                clean[field] = getattr(config, field)
+        self._baseline = self._baseline.model_copy(update=clean)
+
+    def _read_field(self, field: str) -> str:
+        selector = f"#{_FIELDS[field]}"
+        if field == "theme":
+            return _select_value(cast(Select[object], self.query_one(selector, Select)))
+        return self.query_one(selector, Input).value
+
+    def _write_field(self, field: str, value: str) -> None:
+        selector = f"#{_FIELDS[field]}"
+        if field == "theme":
+            self.query_one(selector, Select).value = value
+        else:
+            self.query_one(selector, Input).value = value
+
+    def _config_value(self, config: AppConfig, field: str) -> str:
+        if field in {"targets", "log_paths", "ports"}:
+            return ", ".join(str(value) for value in getattr(config, field))
+        if field in {"ping_interval", "scan_interval"}:
+            return f"{getattr(config, field):g}"
+        return _theme_value(socketclaw_app(self).available_themes, config.theme)
+
+    def _resolve_conflicts(self, choice: str | None, fields: tuple[str, ...]) -> None:
+        if choice not in {"saved", "draft"}:
+            return
+        current = socketclaw_app(self).config
+        self._baseline = self._baseline.model_copy(
+            update={field: getattr(current, field) for field in fields}
         )
-        self.query_one("#settings-log-paths", Input).value = ", ".join(config.log_paths)
-        self.query_one("#settings-theme", Select).value = _theme_value(
-            app.available_themes,
-            config.theme,
-        )
+        if choice == "saved":
+            for field in fields:
+                self._write_field(field, self._config_value(current, field))
+            self._show_state("Loaded the saved values for conflicting fields. Other drafts remain.")
+        else:
+            self._save()
 
     def _show_state(self, message: str, *, error: bool = False) -> None:
         state = self.query_one("#settings-state", Static)

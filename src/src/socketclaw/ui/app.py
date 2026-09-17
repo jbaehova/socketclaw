@@ -3,24 +3,29 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, Protocol
 from uuid import UUID
 
-from textual.app import App
+from textual.app import App, SystemCommand
 from textual.binding import Binding, BindingType
+from textual.screen import Screen
 from textual.theme import Theme
 
+from ..collection import CheckpointChange
 from ..config import AppConfig, ConfigStore
 from ..domain import InvestigationResult, SecurityEvent
-from ..export import export_markdown, write_managed_export
+from ..export import export_incident_markdown, export_markdown, write_managed_export
+from ..incident_store import IncidentStore
 from ..monitor import MonitorStatus
 from ..openai import ModelAccess, OpenAIClient, redact_secrets
 from ..storage import (
     EventQuery,
+    IncidentReport,
+    RelatedPage,
     ResponseStatus,
     SessionStats,
     StoredEvent,
@@ -30,7 +35,11 @@ from ..storage import (
 )
 from .dashboard import DashboardScreen
 from .dialogs import HelpScreen
+from .health import HealthScreen
+from .hosts import HostsView
+from .incidents import IncidentDesk
 from .onboarding import OnboardingScreen
+from .rules import RuleSettingsScreen
 
 
 class Monitor(Protocol):
@@ -51,9 +60,25 @@ class Monitor(Protocol):
 
 
 class DataRepository(Protocol):
+    @property
+    def incidents(self) -> IncidentStore | None: ...
+
+    async def load_checkpoint(self, probe_id: str) -> CheckpointChange: ...
+
     async def list_events(self, query: EventQuery | None = None) -> list[StoredEvent]: ...
 
     async def get_event(self, event_id: UUID) -> StoredEvent | None: ...
+
+    async def incident_report(self, identifier: UUID) -> IncidentReport | None: ...
+
+    async def incident_observations(
+        self,
+        identifier: UUID,
+        *,
+        watermark: int | None = None,
+        before: int | None = None,
+        limit: int = 100,
+    ) -> RelatedPage: ...
 
     async def list_investigations(
         self,
@@ -143,6 +168,8 @@ class SocketClawApp(App[None]):
             show=False,
         ),
         Binding("5", "show_view('settings-view')", "Settings", show=False),
+        Binding("l", "log_status", "Log sources", show=False),
+        Binding("h", "health", "Health", show=False),
         Binding("space", "toggle_monitor", "Pause / resume", show=True),
         Binding("question_mark", "help", "Help", show=True),
         Binding("q", "quit", "Quit", show=True),
@@ -403,6 +430,22 @@ class SocketClawApp(App[None]):
             await repository.fail_investigation(investigation_id, error=error)
         return None
 
+    async def export_incident(self, identifier: UUID) -> Path:
+        repository = self.services.repository
+        if repository is None:
+            raise RuntimeError("Incident storage is unavailable")
+        report = await repository.incident_report(identifier)
+        if report is None:
+            raise KeyError(str(identifier))
+        key = self.services.config_store.load_api_key()
+        rendered = export_incident_markdown(report, secrets=[key] if key else ())
+        return await asyncio.to_thread(
+            write_managed_export,
+            self.services.config_store.home,
+            f"incident-{identifier}.md",
+            rendered,
+        )
+
     async def export_event(self, event_id: UUID) -> Path:
         repository = self.services.repository
         if repository is None:
@@ -430,10 +473,16 @@ class SocketClawApp(App[None]):
                 None,
             )
         key = self.services.config_store.load_api_key()
+        suppressions = (
+            await repository.incidents.suppression_decisions(event_id)
+            if repository.incidents is not None
+            else []
+        )
         rendered = export_markdown(
             event,
             investigation,
             response_proposal=response_proposal,
+            suppressions=suppressions,
             secrets=[key] if key else (),
         )
         return write_managed_export(
@@ -478,6 +527,57 @@ class SocketClawApp(App[None]):
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    def get_system_commands(self, screen: Screen[object]) -> Iterable[SystemCommand]:
+        yield from super().get_system_commands(screen)  # pyright: ignore[reportUnknownMemberType]
+        if isinstance(screen, DashboardScreen):
+            yield SystemCommand(
+                "Incident desk", "Review and resolve correlated incidents", self.action_incidents
+            )
+            yield SystemCommand(
+                "Maintenance exceptions",
+                "Limit incident creation during planned work",
+                self.action_maintenance,
+            )
+            yield SystemCommand(
+                "Detection rules", "Edit thresholds and score contributions", self.action_rules
+            )
+            yield SystemCommand(
+                "Health", "Inspect collection health and scheduling", self.action_health
+            )
+            yield SystemCommand(
+                "Log sources", "Inspect committed log progress", self.action_log_status
+            )
+
+    def action_maintenance(self) -> None:
+        from .suppressions import MaintenanceScreen
+
+        repository = self.services.repository
+        if isinstance(self.screen, DashboardScreen) and repository and repository.incidents:
+            self.push_screen(MaintenanceScreen(repository.incidents))
+
+    def action_incidents(self) -> None:
+        repository = self.services.repository
+        if (
+            isinstance(self.screen, DashboardScreen)
+            and repository is not None
+            and repository.incidents is not None
+        ):
+            self.push_screen(IncidentDesk(repository.incidents))
+
+    def action_rules(self) -> None:
+        if isinstance(self.screen, DashboardScreen):
+            self.push_screen(RuleSettingsScreen(self.config.rules))
+
+    def action_health(self) -> None:
+        if isinstance(self.screen, DashboardScreen):
+            self.push_screen(HealthScreen(self.services.monitor))
+
+    async def action_log_status(self) -> None:
+        if not isinstance(self.screen, DashboardScreen):
+            return
+        self.screen.show_view("hosts-view")
+        self.screen.query_one(HostsView).open_logs()
 
     async def action_quit(self) -> None:
         with suppress(BaseException):

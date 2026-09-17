@@ -1,7 +1,8 @@
-"""Filterable incident timeline and event detail workspace."""
+"""Filterable observation timeline and event detail workspace."""
 
 from __future__ import annotations
 
+import asyncio
 from typing import cast
 from uuid import UUID
 
@@ -12,7 +13,8 @@ from textual.widgets import Button, DataTable, Input, Markdown, Select, Static
 
 from ..domain import EventSource, SecurityEvent, Severity
 from ..storage import EventQuery, StoredEvent
-from .context import escape_markdown, indented_code, safe_text, socketclaw_app
+from .context import safe_text, socketclaw_app
+from .detail import DetailScreen, event_detail_markdown
 
 
 class EventsView(Vertical):
@@ -24,11 +26,15 @@ class EventsView(Vertical):
         self._selected_id: UUID | None = None
         self._investigating = False
         self._exporting = False
+        self.live = True
+        self.pending_count = 0
+        self._dirty = False
+        self._rendering_rows = False
 
     def compose(self) -> ComposeResult:
         yield Static("EVENTS / LOCAL EVIDENCE", classes="view-kicker")
         with Horizontal(classes="view-heading"):
-            yield Static("Incident timeline", classes="view-title")
+            yield Static("Observation timeline", classes="view-title")
             yield Static("C critical  A all  I investigate  E export", classes="view-hint")
         with Horizontal(classes="filter-row"):
             yield Input(placeholder="Search title, target, or summary", id="event-search")
@@ -71,6 +77,12 @@ class EventsView(Vertical):
                 disabled=True,
             )
             yield Button("Export .md", id="export-event", disabled=True)
+            yield Button("Live", id="events-live")
+            yield Button("Incidents", id="open-incidents")
+
+    @on(Button.Pressed, "#open-incidents")
+    def open_incidents(self) -> None:
+        socketclaw_app(self).action_incidents()
 
     def on_mount(self) -> None:
         table = cast(DataTable[str], self.query_one("#events-table", DataTable))
@@ -79,6 +91,8 @@ class EventsView(Vertical):
 
     @work(exclusive=True, group="events-load")
     async def refresh_data(self) -> None:
+        if not self.live and self.events:
+            return
         app = socketclaw_app(self)
         repository = app.services.repository
         if repository is None:
@@ -112,6 +126,26 @@ class EventsView(Vertical):
         self.query_one("#event-source", Select).value = "all"
 
     def add_live_event(self, _event: SecurityEvent) -> None:
+        self.pending_count += 1
+        self._dirty = True
+
+    def refresh_live(self) -> None:
+        if not self._dirty:
+            return
+        if not self.live:
+            self._show_state(
+                f"Reading held / {self.pending_count} new observation(s). Choose Live to catch up."
+            )
+            return
+        self._dirty = False
+        self.pending_count = 0
+        self.refresh_data()
+
+    @on(Button.Pressed, "#events-live")
+    def return_to_live(self) -> None:
+        self.live = True
+        self.pending_count = 0
+        self._dirty = False
         self.refresh_data()
 
     def selected_event(self) -> StoredEvent | None:
@@ -175,12 +209,47 @@ class EventsView(Vertical):
     @on(Select.Changed, "#event-severity")
     @on(Select.Changed, "#event-source")
     def filters_changed(self) -> None:
+        self.live = True
+        self.pending_count = 0
+        self._reload_filters()
+
+    @work(exclusive=True, group="event-filter-debounce")
+    async def _reload_filters(self) -> None:
+        await asyncio.sleep(0.2)
         self.refresh_data()
+
+    @on(DataTable.RowSelected, "#events-table")
+    def open_detail(self) -> None:
+        event = self.selected_event()
+        if event is not None:
+            self.live = False
+            self._open_detail(event)
+
+    @work(exclusive=True, group="event-detail-open")
+    async def _open_detail(self, event: StoredEvent) -> None:
+        app = socketclaw_app(self)
+        screen = app.screen
+        try:
+            repository = app.services.repository
+            decisions = (
+                await repository.incidents.suppression_decisions(event.id)
+                if repository and repository.incidents
+                else []
+            )
+        except Exception as exc:
+            self._show_state(f"Cannot open evidence: {exc}", error=True)
+            return
+        if app.screen is screen:
+            app.push_screen(DetailScreen(event_detail_markdown(event, decisions)))
 
     @on(DataTable.RowHighlighted, "#events-table")
     def row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self._rendering_rows:
+            return
         try:
             self._selected_id = UUID(str(event.row_key.value))
+            if self.events and self._selected_id != self.events[0].id:
+                self.live = False
         except (TypeError, ValueError):
             self._selected_id = None
         self._render_detail()
@@ -196,6 +265,8 @@ class EventsView(Vertical):
     def _render_rows(self) -> None:
         table = cast(DataTable[str], self.query_one("#events-table", DataTable))
         previous_selection = self._selected_id
+        self._rendering_rows = True
+        self.call_after_refresh(self._finish_rendering)
         table.clear()
         for event in self.events:
             table.add_row(
@@ -223,29 +294,33 @@ class EventsView(Vertical):
         self._render_detail()
         self._refresh_actions()
 
+    def _finish_rendering(self) -> None:
+        self._rendering_rows = False
+
     def _render_detail(self) -> None:
         event = self.selected_event()
         if event is None:
             self.query_one("#event-detail", Markdown).update("No event is selected.")
             return
-        signals = (
-            "\n".join(
-                f"- **{escape_markdown(signal.label)}** `+{signal.points}` - "
-                f"{escape_markdown(signal.detail)}"
-                for signal in event.signals
+        content = event_detail_markdown(event)
+        detail = self.query_one("#event-detail", Markdown)
+        if detail.source != content:
+            detail.update(content)
+        self._render_exceptions(event)
+
+    @work(exclusive=True, group="event-preview-exceptions")
+    async def _render_exceptions(self, event: StoredEvent) -> None:
+        repository = socketclaw_app(self).services.repository
+        if not repository or not repository.incidents:
+            return
+        try:
+            decisions = await repository.incidents.suppression_decisions(event.id)
+        except Exception:
+            return  # Full reader reports failures; the raw preview remains usable.
+        if decisions and self._selected_id == event.id:
+            self.query_one("#event-detail", Markdown).update(
+                event_detail_markdown(event, decisions)
             )
-            or "- No deterministic signals were recorded."
-        )
-        evidence = indented_code(event.model_dump_json(indent=2))
-        self.query_one("#event-detail", Markdown).update(
-            f"## {escape_markdown(event.title)}\n\n"
-            f"**{event.severity.value.upper()} / {event.score}/100**  \n"
-            f"`{escape_markdown(event.event_type)}` / "
-            f"`{escape_markdown(event.target or 'no target')}`  \n"
-            f"{event.observed_at.astimezone().isoformat(timespec='seconds')}\n\n"
-            f"{escape_markdown(event.summary)}\n\n### Detection signals\n\n{signals}\n\n"
-            f"### Evidence\n\n{evidence}"
-        )
 
     def _refresh_actions(self) -> None:
         has_selection = self.selected_event() is not None

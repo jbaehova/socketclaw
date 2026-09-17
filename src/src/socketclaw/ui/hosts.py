@@ -8,11 +8,12 @@ from pydantic import ValidationError
 from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, DataTable, Input, Static
+from textual.widgets import Button, DataTable, Input, Static, TabbedContent, TabPane
 
 from ..config import AppConfig
 from .context import safe_text, socketclaw_app
 from .dialogs import ConfirmTargetRemovalScreen
+from .logs import LogSourcesView
 
 
 class HostsView(Vertical):
@@ -26,21 +27,53 @@ class HostsView(Vertical):
         with Horizontal(classes="view-heading"):
             yield Static("Local watch inventory", classes="view-title")
             yield Static("Manual diagnostics are read-only.", classes="view-hint")
-        with Horizontal(classes="filter-row"):
-            yield Input(placeholder="IP address or hostname", id="host-target")
-            yield Button("Add target", id="add-host", variant="primary")
-        yield Static("", id="hosts-state", classes="inline-state", markup=False)
-        yield DataTable(id="hosts-table", cursor_type="row", zebra_stripes=True)
-        with Horizontal(classes="action-row"):
-            yield Button("Ping now", id="ping-host", variant="primary")
-            yield Button("Scan ports", id="scan-host")
-            yield Button("Remove", id="remove-host", variant="error")
+        with TabbedContent(initial="host-targets", id="hosts-tabs"):
+            with TabPane("Targets", id="host-targets"):
+                with Horizontal(classes="filter-row"):
+                    yield Input(placeholder="IP address or hostname", id="host-target")
+                    yield Button("Add target", id="add-host", variant="primary")
+                yield Static("", id="hosts-state", classes="inline-state", markup=False)
+                yield DataTable(id="hosts-table", cursor_type="row", zebra_stripes=True)
+                with Horizontal(classes="action-row"):
+                    yield Button("Ping now", id="ping-host", variant="primary")
+                    yield Button("Scan ports", id="scan-host")
+                    yield Button("Remove", id="remove-host", variant="error")
+            with TabPane("Logs", id="host-logs"):
+                yield LogSourcesView()
 
     def on_mount(self) -> None:
         self.query_one("#hosts-table", DataTable).add_columns(
             "TARGET", "PING", "PORT SCAN", "PORTS"
         )
         self.refresh_targets()
+
+    def open_logs(self) -> None:
+        self.query_one("#hosts-tabs", TabbedContent).active = "host-logs"
+        self.query_one(LogSourcesView).refresh_data()
+        self.call_after_refresh(self.focus_workspace)
+
+    def focus_workspace(self) -> None:
+        logs = self.query_one("#hosts-tabs", TabbedContent).active == "host-logs"
+        self.query_one("#logs-table" if logs else "#hosts-table").focus()
+
+    def run_context_action(self) -> None:
+        if self.query_one("#hosts-tabs", TabbedContent).active == "host-logs":
+            self.query_one(LogSourcesView).test_source()
+        else:
+            self.run_diagnostic("ping")
+
+    @on(TabbedContent.TabActivated, "#hosts-tabs")
+    def activate_tab(self) -> None:
+        logs = self.query_one("#hosts-tabs", TabbedContent).active == "host-logs"
+        self.query_one(".view-kicker", Static).update(
+            "HOSTS / LOG SOURCES" if logs else "HOSTS / WATCH TARGETS"
+        )
+        self.query_one(".view-title", Static).update(
+            "Log source inventory" if logs else "Local watch inventory"
+        )
+        if logs:
+            self.query_one(LogSourcesView).refresh_data()
+        self.call_after_refresh(self.focus_workspace)
 
     def refresh_targets(self) -> None:
         app = socketclaw_app(self)

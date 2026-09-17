@@ -19,6 +19,7 @@ from ..storage import (
     StoredResponseStatus,
 )
 from .context import escape_markdown, safe_text, socketclaw_app
+from .detail import DetailScreen
 from .dialogs import ConfirmResponseScreen
 
 
@@ -100,6 +101,14 @@ class InvestigationsView(Vertical):
             if selected is not None:
                 return selected
         return self.investigations[0] if self.investigations else None
+
+    @on(DataTable.RowSelected, "#investigations-table")
+    def open_detail(self) -> None:
+        if self.selected_investigation() is not None:
+            self._render_detail()
+            socketclaw_app(self).push_screen(
+                DetailScreen(self.query_one("#investigation-detail", Markdown).source)
+            )
 
     @on(DataTable.RowHighlighted, "#investigations-table")
     def row_highlighted(self, event: DataTable.RowHighlighted) -> None:

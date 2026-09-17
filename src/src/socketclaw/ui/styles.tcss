@@ -646,3 +646,11 @@ OnboardingScreen.compact #onboarding-shell {
     padding: 0 2;
     border: none;
 }
+
+#hosts-tabs, #hosts-tabs ContentSwitcher, #hosts-tabs TabPane {
+    height: 1fr;
+}
+
+#hosts-tabs TabPane {
+    padding: 0;
+}

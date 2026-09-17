@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar, cast
+from uuid import UUID
 
 from textual import on, work
 from textual.app import ComposeResult
@@ -20,8 +21,11 @@ from textual.widgets import (
 )
 
 from ..config import AppConfig
+from ..domain import Severity
 from ..monitor import MonitorStatus
+from ..storage import EventQuery
 from .context import safe_text, socketclaw_app
+from .detail import DetailScreen, event_detail_markdown
 from .events import EventsView
 from .hosts import HostsView
 from .investigations import InvestigationsView
@@ -81,6 +85,33 @@ class OverviewView(Vertical):
         self.query_one("#overview-events", DataTable).add_columns("TIME", "SEV", "TARGET", "EVENT")
         self.refresh_data()
 
+    @on(DataTable.RowSelected, "#overview-events")
+    def open_selected(self, event: DataTable.RowSelected) -> None:
+        self._open_event(UUID(str(event.row_key.value)))
+
+    @work(exclusive=True, group="overview-detail")
+    async def _open_event(self, event_id: UUID) -> None:
+        app = socketclaw_app(self)
+        repository = app.services.repository
+        if repository is None:
+            return
+        try:
+            event = await repository.get_event(event_id)
+        except Exception as exc:
+            self.query_one("#overview-state", Static).update(safe_text(f"Cannot open event: {exc}"))
+            return
+        if event is None:
+            self.query_one("#overview-state", Static).update(
+                "This observation is no longer available."
+            )
+            return
+        decisions = (
+            await repository.incidents.suppression_decisions(event.id)
+            if repository.incidents
+            else []
+        )
+        app.push_screen(DetailScreen(event_detail_markdown(event, decisions)))
+
     @work(exclusive=True, group="overview-load")
     async def refresh_data(self) -> None:
         app = socketclaw_app(self)
@@ -91,12 +122,14 @@ class OverviewView(Vertical):
         try:
             stats = await repository.session_stats()
             events = await repository.list_events()
+            high_signal = await repository.list_events(
+                EventQuery(severities=(Severity.HIGH, Severity.CRITICAL), limit=8)
+            )
         except Exception as exc:
             state = self.query_one("#overview-state", Static)
             state.update(f"Could not load posture: {exc}")
             state.add_class("error")
             return
-        high_signal = [event for event in events if event.severity.value in {"high", "critical"}]
         self.query_one("#metric-events", Static).update(f"{stats.total_events:02d}\nEVENTS")
         self.query_one("#metric-incidents", Static).update(
             f"{stats.by_severity.get('high', 0) + stats.by_severity.get('critical', 0):02d}"
@@ -163,6 +196,7 @@ class DashboardScreen(Screen[None]):
         self.monitor = services.monitor
         self._monitor_error = startup_error
         self._startup_warning = startup_warning
+        self._overview_dirty = False
 
     def compose(self) -> ComposeResult:
         preset = self.config.preset
@@ -197,6 +231,7 @@ class DashboardScreen(Screen[None]):
         if self._monitor_error is not None:
             self.show_monitor_error(self._monitor_error)
         self.set_interval(1.0, self.refresh_run_state)
+        self.set_interval(0.25, self._refresh_dirty_views)
         self._consume_events()
 
     def on_resize(self, event: Resize) -> None:
@@ -216,7 +251,10 @@ class DashboardScreen(Screen[None]):
                 button.id is not None and _VIEWS.get(button.id) == view_id,
                 "active",
             )
-        self.query_one(_FOCUS_TARGETS[view_id]).focus()
+        if view_id == "hosts-view":
+            self.query_one(HostsView).focus_workspace()
+        else:
+            self.query_one(_FOCUS_TARGETS[view_id]).focus()
         if view_id == "overview-view":
             self.query_one(OverviewView).refresh_data()
         elif view_id == "events-view":
@@ -288,7 +326,7 @@ class DashboardScreen(Screen[None]):
 
     def action_context_retry(self) -> None:
         if self._current_view == "hosts-view":
-            self.query_one(HostsView).run_diagnostic("ping")
+            self.query_one(HostsView).run_context_action()
         elif self._current_view == "investigations-view":
             self.query_one("#retry-investigation", Button).press()
 
@@ -297,14 +335,22 @@ class DashboardScreen(Screen[None]):
         current = self.query_one("#workspace", ContentSwitcher).current
         return str(current or "")
 
+    def _refresh_dirty_views(self) -> None:
+        if socketclaw_app(self).screen is not self:
+            return
+        if self._current_view == "events-view":
+            self.query_one(EventsView).refresh_live()
+        elif self._current_view == "overview-view" and self._overview_dirty:
+            self._overview_dirty = False
+            self.query_one(OverviewView).refresh_data()
+
     @work(exclusive=True, group="live-events")
     async def _consume_events(self) -> None:
         try:
             async for event in self.monitor.events():
                 self._monitor_error = None
-                self.refresh_run_state()
                 self.query_one(EventsView).add_live_event(event)
-                self.query_one(OverviewView).refresh_data()
+                self._overview_dirty = True
         except Exception as exc:
             self.show_monitor_error(str(exc) or type(exc).__name__)
 

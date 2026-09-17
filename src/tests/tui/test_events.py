@@ -115,6 +115,13 @@ async def test_live_refresh_preserves_the_event_being_inspected(
         await fixture.monitor.publish(event_fixture(title="Incoming live event"))
         await pilot.pause(0.3)
 
+        assert table.cursor_row == 1
+        assert table.row_count == 2
+        assert "1 new observation" in str(
+            fixture.app.screen.query_one("#events-state", Static).render()
+        )
+        await pilot.click("#events-live")
+        await pilot.pause(0.3)
         assert table.cursor_row == 2
         assert (
             "Older event under review"
@@ -358,3 +365,30 @@ async def test_cancellation_during_completion_waits_for_durable_outcome(
             await task
 
         assert fixture.repository.investigations_data[0].status == "complete"
+
+
+async def test_inactive_event_workspace_waits_to_query_until_reentered(
+    app_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = app_factory(configured=True, events=[event_fixture()])
+    async with fixture.app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause(0.3)
+        await pilot.press("3")
+        await pilot.pause(0.3)
+        calls = 0
+        original = fixture.repository.list_events
+
+        async def counted(query=None):
+            nonlocal calls
+            calls += 1
+            return await original(query)
+
+        monkeypatch.setattr(fixture.repository, "list_events", counted)
+        for i in range(100):
+            await fixture.monitor.publish(event_fixture(title=f"Burst {i}"))
+        await pilot.pause(0.5)
+        assert calls == 0
+        await pilot.press("2")
+        await pilot.pause(0.3)
+        assert fixture.app.screen.query_one("#events-table", DataTable).row_count == 101
+        assert calls <= 2

@@ -9,8 +9,10 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from socketclaw.collection import CheckpointChange
 from socketclaw.config import AppConfig, ConfigStore
 from socketclaw.domain import Assessment, DetectionSignal, InvestigationResult, ModelUsage
+from socketclaw.health import ProbeHealth
 from socketclaw.monitor import MonitorStatus
 from socketclaw.openai import ModelAccess
 from socketclaw.storage import (
@@ -38,6 +40,7 @@ class TestMonitor:
         self.stop_error: Exception | None = None
         self.diagnostics: list[tuple[str, str]] = []
         self.available_diagnostics: frozenset[str] = frozenset({"ping", "ports"})
+        self.health_records: tuple[ProbeHealth, ...] = ()
         self._subscribers: set[asyncio.Queue[StoredEvent]] = set()
 
     @property
@@ -47,8 +50,9 @@ class TestMonitor:
             paused=self.paused,
             started_at=datetime.now().astimezone() if self.running else None,
             active_jobs=2 if self.running else 0,
-            last_error=None,
+            last_error=next((item.error for item in self.health_records if item.error), None),
             diagnostics=self.available_diagnostics,
+            probe_health=self.health_records,
         )
 
     async def start(self) -> None:
@@ -96,6 +100,11 @@ class TestMonitor:
 
 
 class FakeRepository:
+    incidents = None
+
+    async def load_checkpoint(self, probe_id: str) -> CheckpointChange:
+        return CheckpointChange(probe_id=probe_id, expected_revision=0, state={})
+
     def __init__(
         self,
         events: list[StoredEvent] | None = None,
@@ -119,6 +128,8 @@ class FakeRepository:
         rows = self.events_data
         if query.severity is not None:
             rows = [row for row in rows if row.severity == query.severity]
+        if query.severities:
+            rows = [row for row in rows if row.severity in query.severities]
         if query.source is not None:
             rows = [row for row in rows if row.source == query.source]
         if query.text:
