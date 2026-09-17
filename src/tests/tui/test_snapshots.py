@@ -96,6 +96,7 @@ def test_visual_states(
         if case.name.startswith("logs")
         else None,
     )
+    fixture.app.theme = "socketclaw-dark"
     if case.name.startswith("logs"):
 
         async def checkpoint(probe_id: str) -> CheckpointChange:

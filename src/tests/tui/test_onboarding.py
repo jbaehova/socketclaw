@@ -22,7 +22,7 @@ async def test_first_run_opens_onboarding_and_masks_key(
     async with fixture.app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
         assert isinstance(fixture.app.screen, OnboardingScreen)
-        assert await pilot.click("#onboarding-next", offset=(2, 1))
+        assert await pilot.click("#onboarding-next", offset=(2, 0))
         key = fixture.app.screen.query_one("#api-key", Input)
         assert key.password is True
         await pilot.click("#api-key")
@@ -144,7 +144,7 @@ async def test_onboarding_can_skip_openai_and_stays_complete_after_restart(
             fixture.app.screen.query_one("#onboarding-summary", Static).render()
         )
         assert fixture.app.screen.query_one("#onboarding-next", Button).disabled is False
-        assert await pilot.click("#onboarding-next", offset=(2, 1))
+        assert await pilot.click("#onboarding-next", offset=(2, 0))
         for _ in range(30):
             if isinstance(fixture.app.screen, DashboardScreen):
                 break

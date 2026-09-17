@@ -9,11 +9,11 @@ from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
 from ..storage import ResponseStatus, StoredResponseProposal
 from .context import safe_text
+from .layout import ResponsiveModalScreen as ModalScreen
 
 
 class ResponseReview(VerticalScroll, can_focus=True):
@@ -42,7 +42,8 @@ class HelpScreen(ModalScreen[None]):
             yield Static(
                 "[b]1-5[/b]  Switch workspace\n"
                 "[b]Space[/b] Pause or resume monitoring\n"
-                "[b]Ctrl+P[/b] Open command palette\n"
+                "[b]/[/b] Commands  [b]Ctrl+T[/b] Light / dark\n"
+                "[b]Ctrl+P[/b] Search all actions\n"
                 "[b]Enter[/b] Open detail  [b]Esc[/b] Return to your list\n"
                 "[b]L[/b] Log source progress and read errors\n"
                 "[b]H[/b] Collection health and scheduling\n"
@@ -236,9 +237,10 @@ class SettingsConflictScreen(ModalScreen[str]):
 
     BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel")]
     DEFAULT_CSS = """
-    SettingsConflictScreen { background: $surface; layout: vertical; padding: 1; }
-    SettingsConflictScreen > VerticalScroll { height: 1fr; }
-    SettingsConflictScreen > Horizontal { height: auto; }
+    SettingsConflictScreen { background: $surface; layout: vertical; }
+    #conflict-shell { height: 1fr; padding: 1 2; }
+    #conflict-shell > VerticalScroll { height: 1fr; }
+    #conflict-actions { height: 1; }
     SettingsConflictScreen Button { min-width: 16; margin-right: 1; }
     """
 
@@ -247,13 +249,14 @@ class SettingsConflictScreen(ModalScreen[str]):
         self.comparison = comparison
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(can_focus=True):
-            yield Static("These settings changed while you were editing.", markup=False)
-            yield Static(safe_text(self.comparison), markup=False)
-        with Horizontal():
-            yield Button("Cancel", id="conflict-cancel")
-            yield Button("Use saved", id="conflict-saved")
-            yield Button("Keep my changes", id="conflict-draft", variant="primary")
+        with Vertical(id="conflict-shell"):
+            with VerticalScroll(can_focus=True):
+                yield Static("These settings changed while you were editing.", markup=False)
+                yield Static(safe_text(self.comparison), markup=False)
+            with Horizontal(id="conflict-actions"):
+                yield Button("Cancel", id="conflict-cancel")
+                yield Button("Use saved", id="conflict-saved")
+                yield Button("Keep my changes", id="conflict-draft", variant="primary")
 
     def action_cancel(self) -> None:
         self.dismiss("cancel")

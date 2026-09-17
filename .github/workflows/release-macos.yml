@@ -33,14 +33,14 @@ jobs:
         run: |
           uv sync --project src --frozen --no-dev
           uv run --project src --frozen --no-dev --with pyinstaller==6.22.3 \
-            pyinstaller --clean --onefile --collect-data socketclaw \
+            pyinstaller --clean --onedir --collect-data socketclaw \
             --collect-submodules textual.widgets \
             --hidden-import aiosqlite \
             --hidden-import sqlalchemy.dialects.sqlite.aiosqlite \
             --name socketclaw src/scripts/frozen_main.py
-          ./dist/socketclaw version
-          SOCKETCLAW_HOME="$(mktemp -d)" ./dist/socketclaw doctor
-          SOCKETCLAW_HOME="$(mktemp -d)" ./dist/socketclaw db migrate
+          ./dist/socketclaw/socketclaw version
+          SOCKETCLAW_HOME="$(mktemp -d)" ./dist/socketclaw/socketclaw doctor
+          SOCKETCLAW_HOME="$(mktemp -d)" ./dist/socketclaw/socketclaw db migrate
           tar -czf "socketclaw-darwin-${{ matrix.architecture }}.tar.gz" -C dist socketclaw
       - uses: actions/upload-artifact@v4
         with:

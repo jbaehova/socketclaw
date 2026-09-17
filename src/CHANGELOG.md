@@ -4,6 +4,17 @@ All notable SocketClaw changes are documented here.
 
 ## Unreleased
 
+## 0.5.0 - 2026-09-17
+
+- Replace the framed dashboard with an inline terminal workspace, a plain
+  activity feed, and a shared command prompt. Preserve shell scrollback.
+- Add searchable slash commands, keyboard completion, and Ctrl+K access from forms.
+- Follow terminal colors by default, with saved light/dark choices and Ctrl+T.
+- Reflow forms and actions on resize. Keep focused fields visible and reserve
+  space for the prompt instead of drawing menus over inputs.
+- Unpack the standalone runtime during installation instead of every launch.
+  Load the full command stack only when needed.
+
 ## 0.4.0 - 2026-09-17
 
 - Publish standalone macOS executables for Apple Silicon and Intel through

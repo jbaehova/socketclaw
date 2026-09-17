@@ -8,7 +8,15 @@ from pydantic import ValidationError
 from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, DataTable, Input, Static, TabbedContent, TabPane
+from textual.widgets import (
+    Button,
+    ContentSwitcher,
+    DataTable,
+    Input,
+    Static,
+    TabbedContent,
+    TabPane,
+)
 
 from ..config import AppConfig
 from .context import safe_text, socketclaw_app
@@ -53,6 +61,8 @@ class HostsView(Vertical):
         self.call_after_refresh(self.focus_workspace)
 
     def focus_workspace(self) -> None:
+        if self.screen.query_one("#workspace", ContentSwitcher).current != "hosts-view":
+            return
         logs = self.query_one("#hosts-tabs", TabbedContent).active == "host-logs"
         self.query_one("#logs-table" if logs else "#hosts-table").focus()
 

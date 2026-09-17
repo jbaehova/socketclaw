@@ -211,7 +211,7 @@ async def test_socketclaw_theme_aliases_apply_real_registered_palette(
         await pilot.pause(0.2)
 
         assert fixture.app.theme == "socketclaw-dark"
-        assert fixture.app.current_theme.background == "#0a0f18"
+        assert fixture.app.current_theme.background == "#171717"
 
 
 @pytest.mark.asyncio

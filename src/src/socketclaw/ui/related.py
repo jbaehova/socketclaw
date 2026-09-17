@@ -9,12 +9,12 @@ from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal
-from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Static
 
 from ..storage import RelatedObservation
 from .context import safe_text, socketclaw_app
 from .detail import DetailScreen, event_detail_markdown
+from .layout import ResponsiveModalScreen as ModalScreen
 
 
 class RelatedObservations(ModalScreen[None]):

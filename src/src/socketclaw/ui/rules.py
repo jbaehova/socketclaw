@@ -9,12 +9,12 @@ from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Static
 
 from ..config import AppConfig
 from ..rules import RuleConfig
 from .context import safe_text, socketclaw_app
+from .layout import ResponsiveModalScreen as ModalScreen
 
 _THRESHOLDS = (
     ("window_seconds", "Correlation window / seconds (1-86400)"),

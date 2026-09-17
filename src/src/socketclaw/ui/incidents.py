@@ -11,12 +11,12 @@ from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Resize
-from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Markdown, Static, Tab, Tabs, TextArea
 
 from ..incident_store import IncidentStore
 from ..incidents import Incident, IncidentNote, Occurrence, Transition
 from .context import escape_markdown, safe_text, socketclaw_app
+from .layout import ResponsiveModalScreen as ModalScreen
 from .related import RelatedObservations
 
 _FAMILIES = {

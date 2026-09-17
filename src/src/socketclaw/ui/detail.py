@@ -9,12 +9,12 @@ from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import Button, Markdown, Static
 
 from ..incidents import SuppressionDecision
 from ..storage import StoredEvent
 from .context import escape_markdown, indented_code
+from .layout import ResponsiveModalScreen as ModalScreen
 
 
 class DetailScreen(ModalScreen[None]):

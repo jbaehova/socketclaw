@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import ClassVar, Protocol
 from uuid import UUID
@@ -13,7 +14,7 @@ from uuid import UUID
 from textual.app import App, SystemCommand
 from textual.binding import Binding, BindingType
 from textual.screen import Screen
-from textual.theme import Theme
+from textual.theme import BUILTIN_THEMES, Theme
 
 from ..collection import CheckpointChange
 from ..config import AppConfig, ConfigStore
@@ -158,6 +159,8 @@ class SocketClawApp(App[None]):
     CSS_PATH = "styles.tcss"
     ENABLE_COMMAND_PALETTE = True
     BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("ctrl+t", "toggle_appearance", "Theme", show=False),
+        Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
         Binding("1", "show_view('overview-view')", "Overview", show=False),
         Binding("2", "show_view('events-view')", "Events", show=False),
         Binding("3", "show_view('hosts-view')", "Hosts", show=False),
@@ -177,42 +180,49 @@ class SocketClawApp(App[None]):
 
     def __init__(self, services: AppServices) -> None:
         super().__init__()
+        self.animation_level = "none"
+        native = (
+            "ansi-light"
+            if os.environ.get("COLORFGBG", "").split(";")[-1] in {"7", "15"}
+            else "ansi-dark"
+        )
+        self.register_theme(replace(BUILTIN_THEMES[native], name="terminal"))
         self.register_theme(
             Theme(
                 name="socketclaw-dark",
-                primary="#66d9c5",
+                primary="#d1b98c",
                 warning="#f2c14e",
                 error="#ff6b6b",
-                foreground="#e7eef7",
-                background="#0a0f18",
-                surface="#111827",
-                panel="#182235",
+                foreground="#e6e3dc",
+                background="#171717",
+                surface="#171717",
+                panel="#242424",
                 variables={
-                    "border": "#2b3950",
-                    "text": "#e7eef7",
-                    "text-muted": "#8fa0b7",
-                    "footer-key-foreground": "#66d9c5",
-                    "button-color-foreground": "#0a0f18",
+                    "border": "#3a3a3a",
+                    "text": "#e6e3dc",
+                    "text-muted": "#9b9992",
+                    "footer-key-foreground": "#d1b98c",
+                    "button-color-foreground": "#171717",
                 },
             )
         )
         self.register_theme(
             Theme(
                 name="socketclaw-light",
-                primary="#087b6d",
+                primary="#805928",
                 warning="#936b00",
                 error="#b42318",
-                foreground="#101827",
-                background="#f4f7fb",
-                surface="#ffffff",
-                panel="#e7edf5",
+                foreground="#272624",
+                background="#faf9f6",
+                surface="#faf9f6",
+                panel="#eceae4",
                 dark=False,
                 variables={
-                    "border": "#c5d0dc",
-                    "text": "#101827",
-                    "text-muted": "#526174",
-                    "footer-key-foreground": "#087b6d",
-                    "button-color-foreground": "#ffffff",
+                    "border": "#d5d1c8",
+                    "text": "#272624",
+                    "text-muted": "#6e6b63",
+                    "footer-key-foreground": "#805928",
+                    "button-color-foreground": "#faf9f6",
                 },
             )
         )
@@ -593,6 +603,21 @@ class SocketClawApp(App[None]):
             return
         self._monitor_stopped = True
         await self.services.monitor.stop()
+
+    async def action_toggle_appearance(self) -> None:
+        await self.set_appearance("light" if self.current_theme.dark else "dark")
+
+    async def set_appearance(self, appearance: str) -> None:
+        name = "terminal" if appearance == "terminal" else f"socketclaw-{appearance}"
+        try:
+            if isinstance(self.screen, OnboardingScreen):
+                self.config = self.config.model_copy(update={"theme": name})
+                self.screen.set_appearance(name)
+                self._apply_theme(name)
+            else:
+                await self.update_config(lambda config: config.model_copy(update={"theme": name}))
+        except Exception:
+            self.notify("Could not save appearance. Try again in Settings.", severity="error")
 
     def _apply_theme(self, theme_name: str) -> None:
         """Apply a configured theme without letting a stale name crash startup."""

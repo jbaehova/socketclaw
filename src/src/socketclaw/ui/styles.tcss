@@ -1,656 +1,234 @@
-$sc-ink: $background;
-$sc-surface: $surface;
-$sc-panel: $panel;
-$sc-line: $border;
-$sc-text: $text;
-$sc-muted: $text-muted;
-$sc-accent: $primary;
-$sc-warning: $warning;
-$sc-danger: $error;
-
+/* SocketClaw lives on the terminal surface. Structure comes from spacing. */
 Screen {
-    background: $sc-ink;
-    color: $sc-text;
+    background: $background;
+    color: $text;
+    scrollbar-size: 1 1;
 }
-
+Screen:inline {
+    height: 85vh;
+    min-height: 12;
+    max-height: 40;
+    border: none;
+}
+Screen:blur { text-opacity: 100%; }
+DashboardScreen { padding: 1 2 0 2; }
 #topbar {
-    height: 3;
-    padding: 0 2;
-    background: $sc-surface;
-    border-bottom: solid $sc-line;
-    align-vertical: middle;
-}
-
-#brand {
-    width: 22;
-    text-style: bold;
-    color: $sc-text;
-    content-align: left middle;
-}
-
-#active-model {
-    width: 1fr;
-    color: $sc-muted;
-    content-align: center middle;
-}
-
-#run-state {
-    width: 18;
-    color: $sc-accent;
-    text-style: bold;
-    content-align: right middle;
-}
-
-#run-state.paused {
-    color: $sc-warning;
-}
-
-#run-state.degraded,
-#run-state.offline {
-    color: $sc-warning;
-}
-
-#primary-nav {
-    height: 3;
-    padding: 0 1;
-    background: $sc-surface;
-    border-bottom: solid $sc-line;
-}
-
-.nav-button {
-    width: auto;
-    min-width: 14;
-    height: 3;
-    margin: 0;
-    padding: 0 2;
+    height: 1;
+    margin-bottom: 1;
     background: transparent;
-    color: $sc-muted;
+}
+#brand { width: 1fr; text-style: bold; }
+#run-state { width: auto; min-width: 10; color: $success; content-align: right middle; }
+#run-state.paused, #run-state.degraded, #run-state.offline { color: $warning; }
+#workspace { height: 1fr; min-height: 1; }
+.workspace-view { height: 1fr; padding: 0; }
+.view-kicker { display: none; }
+.view-heading { height: auto; min-height: 1; margin-bottom: 1; }
+.view-title { height: auto; min-height: 1; width: 1fr; text-style: bold; }
+.view-hint { height: auto; width: auto; max-width: 50%; color: $text-muted; }
+.view-copy { height: auto; width: 100%; color: $text-muted; }
+.section-label { height: auto; margin-top: 1; margin-bottom: 1; text-style: bold; }
+#watch-targets { height: auto; margin-top: 1; }
+#watch-summary { height: auto; color: $text-muted; margin-bottom: 1; }
+#overview-events { height: 1fr; border: none; padding: 0; background: transparent; }
+#overview-events > .option-list--option { padding: 0 0 1 0; }
+#overview-events > .option-list--option-highlighted { background: $panel; color: $text; }
+#activity-empty { height: 1fr; color: $text-muted; }
+#command-bar { height: auto; max-height: 50%; padding-top: 1; }
+#command-menu {
+    height: auto;
+    max-height: 7;
     border: none;
-    content-align: center middle;
-}
-
-.nav-button:hover,
-.nav-button:focus {
-    background: $sc-panel;
-    color: $sc-text;
-    text-style: none;
-}
-
-.nav-button.active {
-    color: $sc-accent;
-    text-style: bold;
-    background: $sc-panel;
-}
-
-#workspace {
-    height: 1fr;
-    background: $sc-ink;
-}
-
-.workspace-view {
-    height: 1fr;
-    padding: 1 3;
-}
-
-.view-kicker {
-    height: 1;
-    color: $sc-accent;
-    text-style: bold;
-}
-
-.view-title {
-    width: 1fr;
-    height: 2;
-    color: $sc-text;
-    text-style: bold;
-}
-
-.view-heading {
-    height: 2;
-    margin-top: 1;
-    align-vertical: middle;
-}
-
-.view-hint {
-    width: auto;
-    height: 2;
-    color: $sc-muted;
-    content-align: right middle;
-}
-
-.view-copy {
-    width: 70;
-    height: 3;
-    color: $sc-muted;
-}
-
-#overview-metrics {
-    height: 5;
-    border-top: solid $sc-line;
-    border-bottom: solid $sc-line;
-}
-
-.metric {
-    width: 1fr;
-    padding: 1 2;
-    color: $sc-muted;
-    content-align: left middle;
-    border-right: solid $sc-line;
-}
-
-#overview-body {
-    height: 1fr;
-    margin-top: 1;
-}
-
-#activity-panel {
-    width: 2fr;
-    padding-right: 2;
-    border-right: solid $sc-line;
-}
-
-#recent-panel {
-    width: 3fr;
-    padding-left: 2;
-}
-
-.section-label {
-    height: 2;
-    color: $sc-muted;
-    text-style: bold;
-}
-
-#activity-sparkline {
-    height: 5;
-    color: $sc-accent;
-}
-
-#activity-sparkline > .sparkline--max-color {
-    color: $sc-accent;
-}
-
-#activity-sparkline > .sparkline--min-color {
-    color: $sc-accent 35%;
-}
-
-#overview-events {
-    height: 1fr;
-}
-
-#activity-empty,
-.empty-state {
-    margin-top: 2;
-    padding: 1 0;
-    color: $sc-muted;
-}
-
-.target-list,
-.settings-summary {
-    margin-top: 2;
-    color: $sc-muted;
-}
-
-.filter-row {
-    height: 3;
-    margin-bottom: 1;
-}
-
-.filter-row Input {
-    width: 1fr;
-    margin-right: 1;
-}
-
-.filter-row Select {
-    width: 22;
-    margin-left: 1;
-}
-
-.filter-row Button {
-    width: auto;
-    min-width: 14;
-}
-
-.inline-state {
-    height: 2;
-    color: $sc-muted;
-}
-
-.inline-state.error {
-    color: $sc-danger;
-}
-
-.split-workspace {
-    height: 1fr;
-    border-top: solid $sc-line;
-    border-bottom: solid $sc-line;
-}
-
-#events-table,
-#investigations-table {
-    width: 3fr;
-    height: 1fr;
-}
-
-#event-detail,
-#investigation-detail {
-    width: 2fr;
-    height: 1fr;
-    padding: 1 2;
-    background: $sc-surface;
-    border-left: solid $sc-line;
-}
-
-#hosts-table {
-    height: 1fr;
-    border-top: solid $sc-line;
-    border-bottom: solid $sc-line;
-}
-
-.action-row {
-    height: 3;
-    align-horizontal: right;
-}
-
-.action-row Button {
-    width: auto;
-    min-width: 15;
-    margin-left: 1;
-}
-
-Button.-primary {
-    background: $sc-accent;
-    color: $sc-ink;
-    border-top: tall $sc-accent;
-    border-bottom: tall $sc-accent;
-}
-
-Button.-primary:hover,
-Button.-primary:focus {
-    background: $sc-accent 85%;
-    color: $sc-ink;
-    border-top: tall $sc-accent;
-    border-bottom: tall $sc-accent;
-}
-
-Input:focus {
-    border: tall $sc-accent;
-}
-
-Select:focus > SelectCurrent {
-    border: tall $sc-accent;
-}
-
-DataTable {
-    background: $sc-ink;
-    color: $sc-text;
-}
-
-DataTable > .datatable--header {
-    background: $sc-surface;
-    color: $sc-muted;
-    text-style: bold;
-}
-
-DataTable > .datatable--cursor {
-    background: $sc-panel;
-    color: $sc-accent;
-}
-
-MarkdownH2,
-MarkdownH3,
-MarkdownBullet {
-    color: $sc-accent;
-}
-
-.settings-grid {
-    height: auto;
-    min-height: 17;
-    margin-bottom: 1;
-    border-top: solid $sc-line;
-    padding-top: 1;
-}
-
-.settings-grid > Vertical {
-    width: 1fr;
-    padding-right: 2;
-}
-
-.settings-guidance {
-    height: auto;
-    margin-top: 1;
-    color: $sc-muted;
-}
-
-#settings-footer {
-    height: 5;
-    background: $sc-ink;
-}
-
-#settings-scroll {
-    height: 1fr;
-}
-
-.compact-fields {
-    height: 4;
-}
-
-.compact-fields > Vertical {
-    width: 1fr;
-    margin-right: 1;
-}
-
-Footer {
-    height: 1;
-    background: $sc-surface;
-    color: $sc-muted;
-}
-
-OnboardingScreen {
-    align: center middle;
-    background: $sc-ink;
-}
-
-#onboarding-shell {
-    width: 74;
-    height: 26;
-    padding: 1 2;
-    background: $sc-surface;
-    border: solid $sc-line;
-}
-
-#onboarding-brand {
-    height: 2;
-    color: $sc-text;
-    text-style: bold;
-}
-
-#onboarding-kicker {
-    height: 1;
-    color: $sc-muted;
-}
-
-#onboarding-progress {
-    height: 2;
-    margin-top: 1;
-    color: $sc-accent;
-}
-
-#onboarding-steps {
-    height: 1fr;
-    border-top: solid $sc-line;
-    padding-top: 1;
-}
-
-.onboarding-step {
-    height: 1fr;
-}
-
-.step-title {
-    height: 3;
-    color: $sc-text;
-    text-style: bold;
-}
-
-.step-copy {
-    height: 4;
-    width: 64;
-    color: $sc-muted;
-}
-
-.step-note {
-    margin-top: 1;
-    color: $sc-accent;
-}
-
-#api-key,
-#onboarding-targets {
-    width: 1fr;
-    margin-top: 1;
-}
-
-.interval-row {
-    height: 5;
-    margin-top: 1;
-}
-
-.interval-row > Vertical {
-    width: 1fr;
-    margin-right: 2;
-}
-
-.field-label {
-    height: 1;
-    color: $sc-muted;
-}
-
-#onboarding-error {
-    height: 2;
-    color: $sc-danger;
-}
-
-#onboarding-actions {
-    height: 3;
-    align-horizontal: right;
-}
-
-#onboarding-actions Button {
-    min-width: 14;
-    margin-left: 1;
-}
-
-HelpScreen {
-    align: center middle;
-    background: #000000 60%;
-}
-
-#help-dialog {
-    width: 58;
-    height: 16;
-    padding: 1 2;
-    background: $sc-surface;
-    border: solid $sc-accent;
-}
-
-#help-title {
-    height: 2;
-    color: $sc-accent;
-    text-style: bold;
-}
-
-#help-copy {
-    height: 1fr;
-    color: $sc-muted;
-}
-
-#help-close {
-    align-horizontal: right;
-}
-
-ConfirmResponseScreen {
-    align: center middle;
-    background: #000000 70%;
-}
-
-ConfirmTargetRemovalScreen {
-    align: center middle;
-    background: #000000 70%;
-}
-
-#target-removal-dialog {
-    width: 58;
-    height: 14;
-    padding: 1 2;
-    background: $sc-surface;
-    border: solid $sc-danger;
-}
-
-#target-removal-title {
-    height: 2;
-    color: $sc-text;
-    text-style: bold;
-}
-
-#target-removal-copy {
-    height: 1fr;
-    color: $sc-muted;
-}
-
-#target-removal-actions {
-    height: 3;
-    align-horizontal: right;
-}
-
-#target-removal-actions Button {
-    width: auto;
-    min-width: 16;
-    margin-left: 1;
-}
-
-#response-dialog {
-    width: 62;
-    height: 20;
-    padding: 1 2;
-    background: $sc-surface;
-    border: solid $sc-warning;
-}
-
-.dialog-kicker {
-    height: 2;
-    color: $sc-warning;
-    text-style: bold;
-}
-
-#response-title {
-    height: 3;
-    color: $sc-text;
-    text-style: bold;
-}
-
-#response-review {
-    height: 1fr;
-}
-
-#response-copy {
-    height: auto;
-    color: $sc-muted;
-}
-
-.response-section-label {
-    height: 2;
-    margin-top: 1;
-    color: $sc-warning;
-    text-style: bold;
-}
-
-.response-model-content {
-    height: auto;
-    padding-left: 1;
-    color: $sc-text;
-    border-left: solid $sc-line;
-}
-
-#response-disclaimer {
-    height: auto;
-    margin-top: 1;
-    color: $sc-muted;
-}
-
-#response-dialog-actions {
-    height: 3;
-    align-horizontal: right;
-}
-
-#response-dialog-actions Button {
-    width: auto;
-    min-width: 18;
-    margin-left: 1;
-}
-
-.narrow #active-model {
-    display: none;
-}
-
-.narrow #run-state {
-    width: 1fr;
-}
-
-.narrow .workspace-view {
-    padding: 0 2;
-}
-
-.narrow .view-hint,
-.narrow #event-source,
-.narrow #recent-panel {
-    display: none;
-}
-
-.narrow .view-kicker {
-    display: none;
-}
-
-.narrow .view-heading {
-    height: 2;
-    margin-top: 0;
-}
-
-.narrow .filter-row {
-    margin-bottom: 0;
-}
-
-.narrow .inline-state {
-    height: 1;
-}
-
-.narrow #activity-panel {
-    width: 1fr;
-    border-right: none;
-}
-
-.narrow .metric {
-    padding: 1 1;
-}
-
-.narrow #events-table,
-.narrow #investigations-table {
-    width: 1fr;
-}
-
-.narrow #event-detail,
-.narrow #investigation-detail {
-    display: none;
-}
-
-.narrow .settings-grid > Vertical {
-    padding-right: 1;
-}
-
-.narrow .settings-grid {
-    height: auto;
-    min-height: 17;
-}
-
-.narrow .nav-button {
-    min-width: 10;
-    padding: 0 1;
-}
-
-.narrow #onboarding-shell {
-    width: 100%;
-    height: 100%;
-    border: none;
-}
-
-OnboardingScreen.compact #onboarding-shell {
-    width: 100%;
-    height: 100%;
-    padding: 0 2;
-    border: none;
-}
-
-#hosts-tabs, #hosts-tabs ContentSwitcher, #hosts-tabs TabPane {
-    height: 1fr;
-}
-
-#hosts-tabs TabPane {
     padding: 0;
+    margin: 0 0 1 2;
+    background: $background;
 }
+#command-menu > .option-list--option-highlighted { color: $primary; background: $panel; }
+#command-line { height: 1; }
+#command-marker { width: 2; color: $primary; text-style: bold; }
+#command-input, #command-input:focus { height: 1; padding: 0; border: none; background: transparent; }
+#command-hint { height: 1; margin-top: 1; color: $text-muted; }
+
+/* Controls use one line and a visible focus indicator, without button boxes. */
+Button {
+    height: 1;
+    min-height: 1;
+    min-width: 0;
+    width: auto;
+    padding: 0 1;
+    border: none;
+    background: transparent;
+    color: $text-muted;
+    content-align: left middle;
+}
+Button:hover { background: transparent; text-style: underline; }
+Button:focus { background: transparent; text-style: reverse; color: $text; }
+Button.-primary, Button.-primary:hover { background: transparent; color: $primary; border: none; text-style: bold; }
+Button.-primary:focus { text-style: bold reverse; }
+Button.-error { background: transparent; color: $error; border: none; }
+Button.-success { background: transparent; color: $success; border: none; }
+Button:disabled { opacity: 60%; }
+Input {
+    height: 1;
+    min-height: 1;
+    border: none;
+    padding: 0 1;
+    background: $surface;
+    margin: 0;
+}
+Input:focus { border: none; border-left: solid $primary; padding-left: 0; background: $panel; }
+Select { height: 1; min-height: 1; border: none; padding: 0; }
+SelectCurrent { height: 1; min-height: 1; padding: 0 1; border: none; background: $surface; }
+Select:focus > SelectCurrent { border: none; background: $panel; text-style: underline; }
+SelectOverlay { max-height: 8; border: solid $border; padding: 0; background: $background; }
+TextArea { border: solid $border; background: $surface; }
+TextArea:focus { border: solid $primary; }
+.field-label { height: auto; color: $text-muted; margin-bottom: 0; }
+.filter-row { height: auto; min-height: 1; margin-bottom: 1; }
+.filter-row Input { width: 1fr; margin-right: 1; }
+.filter-row Select { width: 18; margin-left: 1; }
+.filter-row Button { width: auto; min-width: 0; }
+.inline-state { height: auto; min-height: 1; max-height: 3; color: $text-muted; margin-bottom: 1; }
+.inline-state.error { color: $error; }
+.split-workspace { height: 1fr; border: none; }
+#events-table, #investigations-table, #hosts-table { width: 1fr; height: 1fr; border: none; }
+#event-detail, #investigation-detail { display: none; }
+.action-row { height: auto; min-height: 1; margin-top: 1; align-horizontal: left; }
+.action-row Button { width: auto; min-width: 0; margin: 0 1 0 0; }
+DataTable { background: transparent; color: $text; scrollbar-size: 1 1; }
+DataTable > .datatable--header { background: transparent; color: $text-muted; text-style: none; }
+DataTable > .datatable--odd-row, DataTable > .datatable--even-row { background: transparent; }
+DataTable > .datatable--cursor { background: $panel; color: $primary; text-style: bold; }
+DataTable > .datatable--hover { background: $panel; }
+Markdown { background: transparent; padding: 0; }
+MarkdownH1, MarkdownH2, MarkdownH3 { color: $text; background: transparent; }
+MarkdownH2 { border: none; }
+MarkdownBullet { color: $primary; }
+Footer { height: 1; background: transparent; color: $text-muted; }
+Tabs { height: 2; }
+Tab { height: 1; padding: 0 1; }
+Tabs > .tabs--background { background: transparent; }
+#hosts-tabs, #hosts-tabs ContentSwitcher, #hosts-tabs TabPane { height: 1fr; }
+#hosts-tabs TabPane { padding: 0; }
+
+/* A form scrolls as one document; its action row stays outside that scroll. */
+#settings-scroll { height: 1fr; }
+.settings-grid { height: auto; margin-bottom: 1; }
+.settings-grid > Vertical { width: 1fr; height: auto; padding-right: 3; }
+.settings-grid Input, .settings-grid Select { margin-bottom: 1; }
+.settings-guidance { height: auto; margin: 1 0; color: $text-muted; }
+#model-policy { height: auto; }
+#settings-footer { height: auto; padding-top: 1; }
+#settings-state { height: auto; max-height: 3; }
+.compact-fields { height: auto; }
+.compact-fields > Vertical { width: 1fr; height: auto; margin-right: 1; }
+
+/* First run follows the same left-aligned terminal rhythm. */
+OnboardingScreen { align: left top; padding: 1 2 0 2; }
+#onboarding-shell { width: 100%; max-width: 88; height: 1fr; padding: 0; background: transparent; border: none; }
+#onboarding-brand { height: 1; text-style: bold; }
+#onboarding-kicker { height: auto; color: $text-muted; margin-bottom: 1; }
+#onboarding-progress { height: 1; color: $primary; margin-bottom: 1; }
+#onboarding-steps { height: 1fr; min-height: 2; border: none; padding: 0; }
+.onboarding-step { height: 1fr; }
+.step-title { height: auto; text-style: bold; margin-bottom: 1; }
+.step-copy { height: auto; width: 100%; max-width: 70; color: $text-muted; margin-bottom: 1; }
+.step-note { height: auto; margin-top: 1; color: $text-muted; }
+#api-key, #onboarding-targets { width: 100%; margin: 1 0; }
+.interval-row { height: auto; margin-top: 1; }
+.interval-row > Vertical { width: 1fr; height: auto; margin-right: 2; }
+#onboarding-error { height: auto; max-height: 3; color: $error; margin-top: 1; }
+#onboarding-actions { height: auto; min-height: 1; margin: 1 0; align-horizontal: left; }
+#onboarding-actions Button { min-width: 0; width: auto; margin-right: 2; }
+OnboardingScreen.compact #onboarding-shell { width: 100%; height: 1fr; padding: 0; border: none; }
+
+/* Readers and decision forms occupy the same surface, with no floating frame. */
+HelpScreen, ConfirmResponseScreen, ConfirmTargetRemovalScreen, IncidentComment,
+MaintenanceEditor { align: left top; background: $background; padding: 0; }
+#help-dialog, #response-dialog, #target-removal-dialog, #case-comment-dialog, #exception-dialog {
+    width: 100%; max-width: 90; height: 1fr; max-height: 100%;
+    padding: 1 2; border: none; background: $background;
+}
+#help-title, #target-removal-title, .dialog-kicker { height: auto; margin-bottom: 1; color: $primary; text-style: bold; }
+#help-copy, #target-removal-copy { height: 1fr; overflow-y: auto; color: $text-muted; }
+#response-title { height: auto; margin-bottom: 1; text-style: bold; }
+#response-review { height: 1fr; }
+#response-copy, #response-disclaimer, .response-model-content { height: auto; }
+.response-section-label { height: auto; margin-top: 1; color: $primary; }
+.response-model-content { padding-left: 1; }
+#help-close { align-horizontal: left; }
+#target-removal-actions, #response-dialog-actions, #case-comment-buttons, #exception-actions {
+    height: auto; min-height: 1; margin-top: 1; align-horizontal: left;
+}
+#target-removal-actions Button, #response-dialog-actions Button, #exception-actions Button {
+    width: auto; min-width: 0; margin: 0 1 0 0;
+}
+DetailScreen, HealthScreen, RuleSettingsScreen, RelatedObservations, IncidentDesk,
+IncidentReader, MaintenanceScreen, SettingsConflictScreen {
+    background: $background; padding: 0 2; border: none;
+}
+DetailScreen > Button, HealthScreen > Button { height: 1; margin-top: 1; }
+#desk-heading, #desk-title, #case-heading, #case-title { height: auto; min-height: 1; padding: 0; }
+#desk-shortcuts { display: none; }
+#desk-status, #desk-selection, #case-feedback, #rule-feedback, #maintenance-selection { height: auto; max-height: 3; }
+#desk-toolbar { height: 2; margin-bottom: 1; }
+#desk-search { height: 1; }
+#desk-inspector { display: none; }
+#incident-table { width: 1fr; }
+#desk-actions, #case-actions, #rule-actions, #maintenance-actions {
+    height: auto; min-height: 1; align-horizontal: left; margin-top: 1;
+}
+#desk-actions Button, #case-actions Button, #rule-actions Button, #maintenance-actions Button {
+    width: auto; min-width: 0; margin: 0 1 0 0;
+}
+#rule-fields Input { height: 1; margin-bottom: 1; }
+#case-heading Button { min-width: 0; height: 1; }
+#exception-title { height: auto; margin-bottom: 1; }
+#exception-feedback { height: auto; max-height: 3; }
+#case-comment-title, #case-comment-copy { height: auto; margin-bottom: 1; }
+#case-comment-body { height: 1fr; margin-bottom: 0; }
+#related-title, #related-state, #maintenance-heading, #maintenance-copy { height: auto; }
+#related-actions { height: auto; margin-top: 1; align-horizontal: left; }
+
+/* Width and height are handled independently, including live resize. */
+.narrow .view-hint { display: none; }
+.narrow .settings-grid { layout: vertical; }
+.narrow .settings-grid > Vertical { width: 100%; padding: 0; margin-bottom: 1; }
+.narrow #event-source { display: none; }
+.short #command-hint { margin-top: 0; }
+.short #watch-summary { margin-bottom: 0; }
+.short .section-label { margin: 0; }
+.short .inline-state { margin-bottom: 0; }
+.tiny #command-hint { content-align: left middle; }
+.tiny #command-menu { max-height: 4; }
+.tiny .filter-row { layout: vertical; }
+.tiny .filter-row Input, .tiny .filter-row Select, .tiny .filter-row Button {
+    width: 100%; margin: 0 0 1 0;
+}
+.tiny .action-row, .tiny #desk-actions, .tiny #case-actions, .tiny #rule-actions,
+.tiny #maintenance-actions, .tiny #onboarding-actions, .tiny #response-dialog-actions,
+.tiny #target-removal-actions, .tiny #exception-actions {
+    layout: grid; grid-size: 2; grid-rows: 1; grid-gutter: 0 1; height: auto;
+}
+.tiny .action-row Button, .tiny #desk-actions Button, .tiny #case-actions Button,
+.tiny #rule-actions Button, .tiny #maintenance-actions Button,
+.tiny #onboarding-actions Button, .tiny #response-dialog-actions Button,
+.tiny #target-removal-actions Button, .tiny #exception-actions Button {
+    width: 1fr; min-width: 0; margin: 0; padding: 0;
+}
+.tiny .interval-row, .tiny .compact-fields { layout: vertical; height: auto; }
+.tiny .interval-row > Vertical, .tiny .compact-fields > Vertical {
+    width: 100%; height: auto; margin: 0;
+}
+.tiny #desk-toolbar { layout: vertical; height: 4; }
+.tiny #desk-tabs, .tiny #desk-search { width: 100%; }
+.tiny #desk-tabs Tab { padding: 0 1; }
+.tiny #case-heading { layout: grid; grid-size: 2; height: auto; grid-rows: 1; }
+.tiny #case-title { column-span: 2; }
+
+OnboardingScreen:inline { height: 22; max-height: 85vh; }
+Screen#_default:inline { height: 1; min-height: 1; }
+SettingsConflictScreen { padding: 0; }
+#conflict-actions { height: 1; margin: 0; padding: 0; }
+SettingsConflictScreen Button { width: 1fr; min-width: 0; margin: 0; padding: 0; }
+SettingsConflictScreen.tiny #conflict-actions { layout: grid; grid-size: 2; grid-rows: 1; height: 2; }

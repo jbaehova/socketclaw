@@ -13,8 +13,8 @@ Platform when deeper incident analysis is requested.
   log watchers in one resilient process.
 - Scores every event locally with visible detection signals; monitoring keeps
   working without an API key or OpenAI connectivity.
-- Presents a keyboard-first Textual interface for posture, events, hosts,
-  investigations, and settings.
+- Runs an inline terminal workspace with a plain activity feed and `/` commands.
+  Forms adapt to narrow windows, and colors follow your terminal or a light/dark theme.
 - Persists events and model operations in a local SQLite database. This includes
   estimated costs, failures, and response proposals.
 - Exports redacted Markdown or JSON incident records.
@@ -35,14 +35,11 @@ Platform when deeper incident analysis is requested.
 
 ### macOS standalone executable
 
-After a versioned [GitHub Release](https://github.com/jbaehova/SocketClaw/releases)
-is published, install the executable without Python or uv:
+Install the latest [GitHub Release](https://github.com/jbaehova/SocketClaw/releases)
+without Python or uv:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jbaehova/SocketClaw/main/scripts/install.sh -o socketclaw-install.sh
-sh socketclaw-install.sh
-rm socketclaw-install.sh
-socketclaw doctor
+curl -fsSL https://raw.githubusercontent.com/jbaehova/SocketClaw/main/scripts/install.sh | sh
 socketclaw
 ```
 
@@ -51,6 +48,10 @@ SHA-256 checksum, and installs `socketclaw` to `~/.local/bin`. If that directory
 is not on your `PATH`, add it to your shell profile or run
 `~/.local/bin/socketclaw` directly. Set `SOCKETCLAW_INSTALL_DIR` to select a
 different destination. Release binaries are ad-hoc signed, not Apple notarized.
+The runtime is unpacked once into `~/.local/share/socketclaw/releases`; subsequent
+launches do not extract it again. Set `SOCKETCLAW_DATA_DIR` to move this directory.
+Run the installer again to update. Existing bundles remain available to running
+processes until you remove them after quitting those sessions.
 
 ### Install from source
 
@@ -111,8 +112,18 @@ durable, retryable investigation failure instead of falling back.
 
 ## Keyboard reference
 
+Type `/` to browse commands. Use `Ctrl+K` to reach the command prompt while editing
+a field. Arrow keys select a command, `Tab` completes it, and `Enter` runs it.
+`Esc` returns from a workspace to your watch without discarding form drafts.
+
+The default `terminal` appearance uses your terminal's colors. Use `/theme light`,
+`/theme dark`, or `/theme terminal` to choose and save an appearance. Existing
+installations keep their saved theme until you change it.
+
 | Key | Action |
 |---|---|
+| `/` or `Ctrl+K` | Open commands |
+| `Ctrl+T` | Toggle light and dark |
 | `1`–`5` | Open Overview, Events, Hosts, Investigations, or Settings |
 | `Space` | Pause or resume scheduled monitoring |
 | `C` / `A` | Show critical events / clear event filters |
@@ -124,7 +135,7 @@ durable, retryable investigation failure instead of falling back.
 | `R` | Run the context action (host ping, log test read, or investigation retry) |
 | `Ctrl+P` | Open the Textual command palette |
 | `?` | Show keyboard help |
-| `Q` | Stop monitoring and quit cleanly |
+| `Q` or `Ctrl+C` | Stop monitoring and quit cleanly |
 
 ## Response safety
 

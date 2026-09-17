@@ -7,14 +7,14 @@ from typing import TYPE_CHECKING
 from pydantic import ValidationError
 from textual import on
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Resize
-from textual.screen import Screen
 from textual.widgets import Button, ContentSwitcher, Input, Static
 
 from ..config import AppConfig
 from ..openai import OpenAIError
 from .context import safe_text, socketclaw_app
+from .layout import ResponsiveScreen as Screen
 
 if TYPE_CHECKING:
     from .app import AppServices
@@ -37,6 +37,9 @@ class OnboardingScreen(Screen[None]):
         self._pending_key = existing_api_key
         self._pending_config = initial_config.model_copy(deep=True)
 
+    def set_appearance(self, theme: str) -> None:
+        self._pending_config = self._pending_config.model_copy(update={"theme": theme})
+
     def on_mount(self) -> None:
         self.set_class(self.size.height < 27 or self.size.width < 82, "compact")
         self.query_one("#onboarding-skip", Button).display = False
@@ -47,34 +50,32 @@ class OnboardingScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="onboarding-shell"):
-            yield Static("SOCKETCLAW", id="onboarding-brand")
+            yield Static("socketclaw", id="onboarding-brand")
             yield Static(
-                "LOCAL NETWORK OPERATIONS / FIRST RUN",
+                "A quiet watch on your network",
                 id="onboarding-kicker",
             )
-            yield Static("01  02  03  04", id="onboarding-progress")
+            yield Static("1 / 4   Welcome", id="onboarding-progress")
             with ContentSwitcher(
                 initial="onboarding-welcome",
                 id="onboarding-steps",
             ):
-                with Vertical(id="onboarding-welcome", classes="onboarding-step"):
-                    yield Static("See what changed on your network.", classes="step-title")
+                with VerticalScroll(id="onboarding-welcome", classes="onboarding-step"):
+                    yield Static("Let's set up your watch.", classes="step-title")
                     yield Static(
-                        "SocketClaw watches configured hosts and logs, keeps a local "
-                        "incident timeline, and asks OpenAI only when an event needs "
-                        "deeper analysis.",
+                        "Watch hosts and logs from this terminal. "
+                        "Observations stay on your Mac. AI investigations are optional.",
                         classes="step-copy",
                     )
                     yield Static(
                         "Files stay under ~/.socketclaw by default.",
                         classes="step-note",
                     )
-                with Vertical(id="onboarding-key", classes="onboarding-step"):
+                with VerticalScroll(id="onboarding-key", classes="onboarding-step"):
                     yield Static("Connect OpenAI", classes="step-title")
                     yield Static(
-                        "The key and GPT-5.6 Luna access are validated without generating "
-                        "tokens, then stored privately. You can skip this and add a key "
-                        "later from Settings.",
+                        "Add an API key for investigations, or skip to monitor locally. "
+                        "You can connect later with /settings.",
                         classes="step-copy",
                     )
                     yield Input(
@@ -86,7 +87,7 @@ class OnboardingScreen(Screen[None]):
                         password=True,
                         id="api-key",
                     )
-                with Vertical(id="onboarding-target-step", classes="onboarding-step"):
+                with VerticalScroll(id="onboarding-target-step", classes="onboarding-step"):
                     yield Static("Set the first watch targets", classes="step-title")
                     yield Static(
                         "Use hostnames or IP addresses separated by commas.",
@@ -112,12 +113,11 @@ class OnboardingScreen(Screen[None]):
                                 type="number",
                                 id="onboarding-scan-interval",
                             )
-                with Vertical(id="onboarding-ready", classes="onboarding-step"):
+                with VerticalScroll(id="onboarding-ready", classes="onboarding-step"):
                     yield Static("Ready to watch.", classes="step-title")
                     yield Static(
-                        "Monitoring starts immediately. You can pause it with Space and "
-                        "change watch targets, intervals, ports, logs, and theme from "
-                        "workspace 5.",
+                        "Use / to browse commands. Pause with Space. "
+                        "Switch appearance with Ctrl+T.",
                         classes="step-copy",
                     )
                     yield Static(
@@ -239,10 +239,8 @@ class OnboardingScreen(Screen[None]):
         )
         self.current_step = step
         self.query_one("#onboarding-steps", ContentSwitcher).current = ids[step]
-        progress = "  ".join(
-            f"[b reverse]{index:02d}[/]" if index == step + 1 else f"{index:02d}"
-            for index in range(1, 5)
-        )
+        label = ("Welcome", "Optional connection", "Watch targets", "Ready")[step]
+        progress = f"{step + 1} / 4   {label}"
         self.query_one("#onboarding-progress", Static).update(progress)
         self.query_one("#onboarding-back", Button).disabled = step == 0
         self.query_one("#onboarding-skip", Button).display = step == 1

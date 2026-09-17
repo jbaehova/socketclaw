@@ -272,7 +272,7 @@ async def _run_tui(store: ConfigStore) -> None:
                 reconfigure=reconfigure,
             )
         )
-        await socketclaw.run_async()
+        await socketclaw.run_async(inline=True, inline_no_clear=True)
         clean_shutdown = True
     except BaseException as exc:
         failure = exc

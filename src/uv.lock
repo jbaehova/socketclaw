@@ -735,7 +735,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
-    { name = "textual", specifier = ">=2.0" },
+    { name = "textual", specifier = ">=8.2.8" },
     { name = "typer", specifier = ">=0.16" },
 ]
 

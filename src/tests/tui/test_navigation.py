@@ -27,7 +27,7 @@ async def test_direct_navigation_and_pause_binding(
         assert switcher.current == "events-view"
         await pilot.press("5")
         assert switcher.current == "settings-view"
-        await pilot.click("#nav-overview")
+        await pilot.press("escape")
         assert switcher.current == "overview-view"
 
         await pilot.press("space")

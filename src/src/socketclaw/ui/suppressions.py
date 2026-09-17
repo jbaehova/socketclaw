@@ -9,7 +9,6 @@ from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Select, Static, TextArea
 
 from ..domain import utc_now
@@ -19,6 +18,7 @@ from ..rules import RulePoints
 from .context import safe_text, socketclaw_app
 from .detail import DetailScreen
 from .incidents import IncidentComment
+from .layout import ResponsiveModalScreen as ModalScreen
 
 _FAMILIES: tuple[Family, ...] = (
     "availability",

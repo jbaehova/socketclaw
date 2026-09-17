@@ -2,45 +2,42 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, ClassVar
 from uuid import UUID
 
+from rich.text import Text
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Resize
-from textual.screen import Screen
 from textual.widgets import (
     Button,
     ContentSwitcher,
-    DataTable,
-    Footer,
-    Sparkline,
+    Input,
+    OptionList,
     Static,
 )
+from textual.widgets.option_list import Option
 
+from .. import __version__
 from ..config import AppConfig
 from ..domain import Severity
 from ..monitor import MonitorStatus
 from ..storage import EventQuery
+from .commands import CommandBar
 from .context import safe_text, socketclaw_app
 from .detail import DetailScreen, event_detail_markdown
 from .events import EventsView
 from .hosts import HostsView
 from .investigations import InvestigationsView
+from .layout import ResponsiveScreen
 from .settings import SettingsView
 
 if TYPE_CHECKING:
     from .app import AppServices
 
-_VIEWS = {
-    "nav-overview": "overview-view",
-    "nav-events": "events-view",
-    "nav-hosts": "hosts-view",
-    "nav-investigations": "investigations-view",
-    "nav-settings": "settings-view",
-}
+_VIEWS = {"overview-view", "events-view", "hosts-view", "investigations-view", "settings-view"}
 _FOCUS_TARGETS = {
     "overview-view": "#overview-events",
     "events-view": "#events-table",
@@ -59,35 +56,28 @@ class OverviewView(Vertical):
         self.startup_warning = startup_warning
 
     def compose(self) -> ComposeResult:
-        yield Static("OVERVIEW / LIVE POSTURE", classes="view-kicker")
-        with Horizontal(classes="view-heading"):
-            yield Static("Network changes, prioritized.", classes="view-title")
-            yield Static("Local evidence / explicit model spend", classes="view-hint")
-        with Horizontal(id="overview-metrics"):
-            yield Static("00\nEVENTS", id="metric-events", classes="metric")
-            yield Static("00\nHIGH + CRITICAL", id="metric-incidents", classes="metric")
-            yield Static("00\nINVESTIGATIONS", id="metric-investigations", classes="metric")
-            yield Static("$0.000000\nEST. COST", id="metric-cost", classes="metric")
-        with Horizontal(id="overview-body"):
-            with Vertical(id="activity-panel"):
-                yield Static("RECENT SEVERITY PULSE", classes="section-label")
-                yield Sparkline([0], id="activity-sparkline")
-                yield Static("", id="overview-state", classes="inline-state", markup=False)
-            with Vertical(id="recent-panel"):
-                yield Static("RECENT HIGH-SIGNAL EVENTS", classes="section-label")
-                yield DataTable(
-                    id="overview-events",
-                    cursor_type="row",
-                    zebra_stripes=True,
-                )
+        yield Static("Your watch", classes="view-title")
+        yield Static("", id="watch-targets", markup=False)
+        yield Static("", id="watch-summary", markup=False)
+        yield Static("", id="overview-state", classes="inline-state", markup=False)
+        yield Static("Recent activity", id="activity-label", classes="section-label")
+        yield OptionList(id="overview-events")
+        yield Static(
+            "No observations yet. Your first probe results will appear here.\n"
+            "Use /hosts to add a target, or /logs to watch a log file.",
+            id="activity-empty",
+            markup=False,
+        )
 
     def on_mount(self) -> None:
-        self.query_one("#overview-events", DataTable).add_columns("TIME", "SEV", "TARGET", "EVENT")
+        self.query_one("#overview-state").can_focus = True
+        self._activity_signature: tuple[tuple[str, str], ...] = ()
         self.refresh_data()
 
-    @on(DataTable.RowSelected, "#overview-events")
-    def open_selected(self, event: DataTable.RowSelected) -> None:
-        self._open_event(UUID(str(event.row_key.value)))
+    @on(OptionList.OptionSelected, "#overview-events")
+    def open_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option.id is not None:
+            self._open_event(UUID(event.option.id))
 
     @work(exclusive=True, group="overview-detail")
     async def _open_event(self, event_id: UUID) -> None:
@@ -130,38 +120,39 @@ class OverviewView(Vertical):
             state.update(f"Could not load posture: {exc}")
             state.add_class("error")
             return
-        self.query_one("#metric-events", Static).update(f"{stats.total_events:02d}\nEVENTS")
-        self.query_one("#metric-incidents", Static).update(
-            f"{stats.by_severity.get('high', 0) + stats.by_severity.get('critical', 0):02d}"
-            "\nHIGH + CRITICAL"
+        self.query_one("#watch-targets", Static).update(
+            "Watching " + ", ".join(self.config.targets)
         )
-        self.query_one("#metric-investigations", Static).update(
-            f"{stats.completed_investigations:02d}\nINVESTIGATIONS"
+        attention = stats.by_severity.get("high", 0) + stats.by_severity.get("critical", 0)
+        self.query_one("#watch-summary", Static).update(
+            f"{stats.total_events} observations   {attention} need attention   "
+            f"{stats.completed_investigations} investigations   ${stats.cost_usd:.4f}"
         )
-        self.query_one("#metric-cost", Static).update(f"${stats.cost_usd:.6f}\nEST. COST")
-        weights = {
-            "info": 1,
-            "low": 2,
-            "medium": 4,
-            "high": 7,
-            "critical": 10,
-        }
-        self.query_one("#activity-sparkline", Sparkline).data = [
-            weights[event.severity.value] for event in reversed(events[:30])
-        ] or [0]
-        table = cast(
-            DataTable[str],
-            self.query_one("#overview-events", DataTable),
+        selected_events = high_signal or events[:30]
+        self.query_one("#activity-label", Static).update(
+            "Needs attention" if high_signal else "Recent activity"
         )
-        table.clear()
-        for event in high_signal[:8]:
-            table.add_row(
-                event.observed_at.astimezone().strftime("%H:%M:%S"),
-                event.severity.value.upper(),
-                safe_text(event.target or "-"),
-                safe_text(event.title),
-                key=str(event.id),
-            )
+        activity = self.query_one("#overview-events", OptionList)
+        self.query_one("#activity-empty").display = not selected_events
+        activity.display = bool(selected_events)
+        signature = tuple((str(item.id), item.model_dump_json()) for item in selected_events)
+        if signature != self._activity_signature:
+            previous = None
+            if activity.highlighted is not None and activity.option_count:
+                previous = activity.get_option_at_index(activity.highlighted).id
+            activity.clear_options()
+            for item in selected_events:
+                stamp = item.observed_at.astimezone().strftime("%H:%M:%S")
+                prompt = Text(f"{stamp}  {item.severity.value.upper()}  ")
+                prompt.append(safe_text(item.target or "local"))
+                prompt.append("\n" + safe_text(item.title), style="bold")
+                prompt.append("\n" + safe_text(item.summary))
+                activity.add_option(Option(prompt, id=str(item.id)))
+            if previous in {str(item.id) for item in selected_events}:
+                activity.highlighted = activity.get_option_index(previous)
+            elif selected_events:
+                activity.highlighted = 0
+            self._activity_signature = signature
         state = self.query_one("#overview-state", Static)
         if self.startup_warning is not None:
             state.update(safe_text(self.startup_warning))
@@ -171,10 +162,13 @@ class OverviewView(Vertical):
             state.remove_class("error")
 
 
-class DashboardScreen(Screen[None]):
-    """Calm, dense shell containing all operational screens."""
+class DashboardScreen(ResponsiveScreen[None]):
+    """Inline terminal workspace with a shared command prompt."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("slash", "command_prompt", "Commands", show=False),
+        Binding("ctrl+k", "command_prompt", "Commands", show=False, priority=True),
+        Binding("escape", "overview", "Your watch", show=False),
         Binding("c", "critical_events", "Critical", show=False),
         Binding("a", "all_events", "All events", show=False),
         Binding("i", "investigate", "Investigate", show=False),
@@ -199,31 +193,16 @@ class DashboardScreen(Screen[None]):
         self._overview_dirty = False
 
     def compose(self) -> ComposeResult:
-        preset = self.config.preset
         with Horizontal(id="topbar"):
-            yield Static("SOCKETCLAW", id="brand")
-            yield Static(
-                f"{preset.label} / {preset.reasoning_label}",
-                id="active-model",
-            )
+            yield Static(f"socketclaw [dim]{__version__}[/]", id="brand")
             yield Static("", id="run-state", markup=False)
-        with Horizontal(id="primary-nav"):
-            yield Button("1  Overview", id="nav-overview", classes="nav-button active")
-            yield Button("2  Events", id="nav-events", classes="nav-button")
-            yield Button("3  Hosts", id="nav-hosts", classes="nav-button")
-            yield Button(
-                "4  Investigations",
-                id="nav-investigations",
-                classes="nav-button",
-            )
-            yield Button("5  Settings", id="nav-settings", classes="nav-button")
         with ContentSwitcher(initial="overview-view", id="workspace"):
             yield OverviewView(self.config, startup_warning=self._startup_warning)
             yield EventsView()
             yield HostsView()
             yield InvestigationsView()
             yield SettingsView()
-        yield Footer()
+        yield CommandBar()
 
     def on_mount(self) -> None:
         self.set_class(self.size.width < 90, "narrow")
@@ -233,28 +212,16 @@ class DashboardScreen(Screen[None]):
         self.set_interval(1.0, self.refresh_run_state)
         self.set_interval(0.25, self._refresh_dirty_views)
         self._consume_events()
+        self.call_after_refresh(self._focus_view, "overview-view")
 
     def on_resize(self, event: Resize) -> None:
         self.set_class(event.size.width < 90, "narrow")
 
-    @on(Button.Pressed, ".nav-button")
-    def select_navigation(self, event: Button.Pressed) -> None:
-        if event.button.id in _VIEWS:
-            self.show_view(_VIEWS[event.button.id])
-
     def show_view(self, view_id: str) -> None:
-        if view_id not in _VIEWS.values():
+        if view_id not in _VIEWS:
             return
         self.query_one("#workspace", ContentSwitcher).current = view_id
-        for button in self.query(".nav-button").results(Button):
-            button.set_class(
-                button.id is not None and _VIEWS.get(button.id) == view_id,
-                "active",
-            )
-        if view_id == "hosts-view":
-            self.query_one(HostsView).focus_workspace()
-        else:
-            self.query_one(_FOCUS_TARGETS[view_id]).focus()
+        self.call_after_refresh(self._focus_view, view_id)
         if view_id == "overview-view":
             self.query_one(OverviewView).refresh_data()
         elif view_id == "events-view":
@@ -262,10 +229,66 @@ class DashboardScreen(Screen[None]):
         elif view_id == "investigations-view":
             self.query_one(InvestigationsView).refresh_data()
 
+    def _focus_view(self, view_id: str) -> None:
+        if view_id == "hosts-view":
+            self.query_one(HostsView).focus_workspace()
+        else:
+            target = self.query_one(_FOCUS_TARGETS[view_id])
+            if view_id == "overview-view" and not target.display:
+                target = self.query_one("#overview-state")
+            target.focus()
+            target.scroll_visible(animate=False)
+            if view_id == "settings-view":
+                scroll = self.query_one("#settings-scroll", VerticalScroll)
+                self.call_after_refresh(scroll.scroll_home, animate=False)
+
+    def action_command_prompt(self) -> None:
+        self.query_one(CommandBar).activate()
+
+    def action_overview(self) -> None:
+        self.show_view("overview-view")
+
+    @on(CommandBar.Cancelled)
+    def cancel_command(self) -> None:
+        self._focus_view(self._current_view)
+
+    @on(CommandBar.Submitted)
+    async def run_command(self, event: CommandBar.Submitted) -> None:
+        app = socketclaw_app(self)
+        value = event.value.lower()
+        destinations = {
+            "/overview": "overview-view",
+            "/events": "events-view",
+            "/hosts": "hosts-view",
+            "/investigations": "investigations-view",
+            "/settings": "settings-view",
+        }
+        if value in destinations:
+            self.show_view(destinations[value])
+        elif value == "/logs":
+            await app.action_log_status()
+        elif value == "/pause":
+            await app.action_toggle_monitor()
+        elif value == "/quit":
+            await app.action_quit()
+        elif value.startswith("/theme "):
+            selected = value.removeprefix("/theme ")
+            if selected in {"light", "dark", "terminal"}:
+                await app.set_appearance(selected)
+        elif value in {"/help", "/health", "/rules", "/incidents"}:
+            {
+                "/help": app.action_help,
+                "/health": app.action_health,
+                "/rules": app.action_rules,
+                "/incidents": app.action_incidents,
+            }[value]()
+        else:
+            self.query_one("#command-hint", Static).update("Unknown command. Type / to browse.")
+        if app.screen is self and self.query_one("#command-input", Input).has_focus:
+            self.cancel_command()
+
     def apply_config(self, config: AppConfig) -> None:
         self.config = config
-        preset = config.preset
-        self.query_one("#active-model", Static).update(f"{preset.label} / {preset.reasoning_label}")
         overview = self.query_one(OverviewView)
         overview.config = config
         self.query_one(HostsView).refresh_targets()

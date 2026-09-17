@@ -39,9 +39,24 @@ if [ "$actual" != "$expected" ]; then
   exit 1
 fi
 
-tar -xzf "$temporary/$asset" -C "$temporary" socketclaw
+tar -xzf "$temporary/$asset" -C "$temporary"
 mkdir -p "$install_dir"
-install -m 755 "$temporary/socketclaw" "$install_dir/socketclaw.new.$$"
+# New releases keep their runtime unpacked so launch doesn't extract it again.
+# Retain old single-file releases for explicit version installs.
+if [ -d "$temporary/socketclaw" ]; then
+  if [ ! -x "$temporary/socketclaw/socketclaw" ]; then
+    echo "Release archive does not contain the SocketClaw executable." >&2
+    exit 1
+  fi
+  data_dir="${SOCKETCLAW_DATA_DIR:-$HOME/.local/share/socketclaw}"
+  mkdir -p "$data_dir/releases"
+  data_dir=$(cd "$data_dir" && pwd)
+  bundle=$(mktemp -d "$data_dir/releases/bundle.XXXXXXXX")
+  cp -R "$temporary/socketclaw/." "$bundle/"
+  ln -s "$bundle/socketclaw" "$install_dir/socketclaw.new.$$"
+else
+  install -m 755 "$temporary/socketclaw" "$install_dir/socketclaw.new.$$"
+fi
 mv -f "$install_dir/socketclaw.new.$$" "$install_dir/socketclaw"
 echo "Installed SocketClaw to $install_dir/socketclaw"
 case ":$PATH:" in

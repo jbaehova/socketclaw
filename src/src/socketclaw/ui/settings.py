@@ -44,33 +44,66 @@ class SettingsView(Vertical):
         self._baseline = config
         theme_value = _theme_value(app.available_themes, config.theme)
         theme_options = [
+            ("Terminal colors", "terminal"),
             ("SocketClaw dark", "textual-dark"),
             ("SocketClaw light", "textual-light"),
         ]
         if theme_value not in {value for _, value in theme_options}:
             theme_options.append((_theme_label(theme_value), theme_value))
         with VerticalScroll(id="settings-scroll"):
-            yield Static("SETTINGS / PRIVATE LOCAL CONFIG", classes="view-kicker")
+            yield Static("Settings", classes="view-kicker")
             with Horizontal(classes="view-heading"):
-                yield Static("Runtime configuration", classes="view-title")
+                yield Static("Settings", classes="view-title")
                 yield Static("Secrets remain in ~/.socketclaw/.env", classes="view-hint")
             with Horizontal(classes="settings-grid"):
                 with Vertical():
-                    yield Static("ANALYSIS MODEL", classes="field-label")
+                    yield Static("Watch targets", classes="field-label")
+                    yield Input(
+                        value=", ".join(config.targets),
+                        id="settings-targets",
+                    )
+                    with Horizontal(classes="compact-fields"):
+                        with Vertical():
+                            yield Static("Ping interval (seconds)", classes="field-label")
+                            yield Input(
+                                value=f"{config.ping_interval:g}",
+                                type="number",
+                                id="settings-ping",
+                            )
+                        with Vertical():
+                            yield Static("Scan interval (seconds)", classes="field-label")
+                            yield Input(
+                                value=f"{config.scan_interval:g}",
+                                type="number",
+                                id="settings-scan",
+                            )
+                    yield Static("TCP ports", classes="field-label")
+                    yield Input(
+                        value=", ".join(str(port) for port in config.ports),
+                        id="settings-ports",
+                    )
+                    yield Static("Log files", classes="field-label")
+                    yield Input(
+                        value=", ".join(config.log_paths),
+                        placeholder="/var/log/auth.log, /var/log/system.log",
+                        id="settings-log-paths",
+                    )
+                with Vertical():
+                    yield Static("Analysis model", classes="field-label")
                     yield Static(
                         f"{config.preset.label} / {config.preset.reasoning_label}",
                         id="model-policy",
                     )
                     yield Static(
-                        "Investigations and response transitions are always operator initiated.",
+                        "AI runs only when you request an investigation.",
                         classes="settings-guidance",
                         markup=False,
                     )
                     yield Static(
                         (
-                            "REPLACE OPENAI KEY / OPTIONAL"
+                            "Replace API key (optional)"
                             if app.config_store.load_api_key() is not None
-                            else "ADD OPENAI KEY / OPTIONAL"
+                            else "API key (optional)"
                         ),
                         id="settings-key-label",
                         classes="field-label",
@@ -80,44 +113,12 @@ class SettingsView(Vertical):
                         password=True,
                         id="settings-api-key",
                     )
-                    yield Static("THEME", classes="field-label")
+                    yield Static("Appearance", classes="field-label")
                     yield Select(
                         theme_options,
                         value=theme_value,
                         allow_blank=False,
                         id="settings-theme",
-                    )
-                with Vertical():
-                    yield Static("WATCH TARGETS / COMMA SEPARATED", classes="field-label")
-                    yield Input(
-                        value=", ".join(config.targets),
-                        id="settings-targets",
-                    )
-                    with Horizontal(classes="compact-fields"):
-                        with Vertical():
-                            yield Static("PING SECONDS", classes="field-label")
-                            yield Input(
-                                value=f"{config.ping_interval:g}",
-                                type="number",
-                                id="settings-ping",
-                            )
-                        with Vertical():
-                            yield Static("SCAN SECONDS", classes="field-label")
-                            yield Input(
-                                value=f"{config.scan_interval:g}",
-                                type="number",
-                                id="settings-scan",
-                            )
-                    yield Static("TCP PORTS / COMMA SEPARATED", classes="field-label")
-                    yield Input(
-                        value=", ".join(str(port) for port in config.ports),
-                        id="settings-ports",
-                    )
-                    yield Static("LOG PATHS / COMMA SEPARATED", classes="field-label")
-                    yield Input(
-                        value=", ".join(config.log_paths),
-                        placeholder="/var/log/auth.log, /var/log/system.log",
-                        id="settings-log-paths",
                     )
         with Vertical(id="settings-footer"):
             yield Static("", id="settings-state", classes="inline-state", markup=False)
@@ -241,9 +242,7 @@ class SettingsView(Vertical):
             self._baseline = config
             key_input.value = ""
             if replacement_key:
-                self.query_one("#settings-key-label", Static).update(
-                    "REPLACE OPENAI KEY / OPTIONAL"
-                )
+                self.query_one("#settings-key-label", Static).update("Replace API key (optional)")
             self._show_state(f"Saved / {config.preset.label} / {config.preset.reasoning_label}")
         finally:
             button.disabled = False
@@ -318,6 +317,10 @@ def _select_value(widget: Select[object]) -> str:
 
 
 def _theme_value(available: object, configured: str) -> str:
+    configured = {
+        "socketclaw-dark": "textual-dark",
+        "socketclaw-light": "textual-light",
+    }.get(configured, configured)
     if isinstance(available, dict) and configured in available:
         return configured
     return "textual-dark"

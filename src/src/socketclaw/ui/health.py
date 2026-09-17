@@ -8,7 +8,6 @@ from typing import ClassVar, Protocol, cast
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Static
 
 from ..domain import utc_now
@@ -16,6 +15,7 @@ from ..health import ProbeHealth
 from ..monitor import MonitorStatus
 from .context import escape_markdown, safe_text, socketclaw_app
 from .detail import DetailScreen
+from .layout import ResponsiveModalScreen as ModalScreen
 
 
 class HealthSource(Protocol):

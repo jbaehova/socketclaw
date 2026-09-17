@@ -79,7 +79,7 @@ class AppConfig(BaseModel):
         max_length=1024,
     )
     log_paths: list[LogPath] = Field(default_factory=list, max_length=256)
-    theme: str = Field(default="textual-dark", min_length=1, max_length=80)
+    theme: str = Field(default="terminal", min_length=1, max_length=80)
 
     @field_validator("targets")
     @classmethod

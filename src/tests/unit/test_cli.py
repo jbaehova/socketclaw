@@ -468,7 +468,8 @@ def test_launch_records_clean_run_and_reconfigures_existing_monitor(
         def __init__(self, services) -> None:
             self.services = services
 
-        async def run_async(self) -> None:
+        async def run_async(self, *, inline: bool, inline_no_clear: bool) -> None:
+            assert inline and inline_no_clear
             operations.append("run")
             assert self.services.monitor is monitor
             assert self.services.reconfigure is not None
@@ -522,7 +523,8 @@ def test_launch_records_unclean_run_and_closes_repository(
         def __init__(self, _services) -> None:
             pass
 
-        async def run_async(self) -> None:
+        async def run_async(self, *, inline: bool, inline_no_clear: bool) -> None:
+            assert inline and inline_no_clear
             operations.append("run")
             raise RuntimeError("TUI failed")
 
@@ -581,7 +583,8 @@ def test_monitor_stop_failure_still_terminates_run_and_closes_repository(
         def __init__(self, _services) -> None:
             pass
 
-        async def run_async(self) -> None:
+        async def run_async(self, *, inline: bool, inline_no_clear: bool) -> None:
+            assert inline and inline_no_clear
             operations.append("run")
 
     monkeypatch.setattr(cli_module, "Repository", lambda _path: FakeRepository())

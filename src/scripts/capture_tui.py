@@ -234,6 +234,8 @@ async def _capture(capture: Capture, home: Path, destination: Path) -> None:
                 repository=repository,
             )
         )
+        # SVG cannot resolve the user's ANSI terminal background.
+        app.theme = "socketclaw-dark"
         async with app.run_test(size=capture.size) as pilot:
             await pilot.pause(0.25)
             if capture.key is not None:

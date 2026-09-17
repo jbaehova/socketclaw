@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 from textual.containers import VerticalScroll
-from textual.widgets import DataTable, Markdown
+from textual.widgets import DataTable, Markdown, OptionList
 
 from socketclaw.ui.detail import DetailScreen
 
@@ -58,9 +58,9 @@ async def test_overview_queries_critical_event_behind_recent_ordinary_events(
     )
     async with fixture.app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        table = fixture.app.screen.query_one("#overview-events", DataTable)
-        assert table.row_count == 1
-        assert str(table.get_row_at(0)[-1]) == "Older critical event"
+        table = fixture.app.screen.query_one("#overview-events", OptionList)
+        assert table.option_count == 1
+        assert "Older critical event" in str(table.get_option_at_index(0).prompt)
         table.focus()
         await pilot.press("enter")
         assert isinstance(fixture.app.screen, DetailScreen)
