@@ -1,6 +1,7 @@
 name: macOS standalone release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -22,6 +23,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v10
       - name: Check version tag
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
@@ -48,6 +50,7 @@ jobs:
 
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
