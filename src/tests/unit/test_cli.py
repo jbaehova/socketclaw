@@ -369,7 +369,7 @@ async def test_probe_planner_reconfigures_intersecting_logs_and_rolls_back_failu
     )
 
     class BrokenMonitor:
-        async def reconfigure(self, *, jobs, diagnostics) -> None:
+        async def reconfigure(self, *, jobs, diagnostics, detector) -> None:
             assert jobs
             assert diagnostics
             raise RuntimeError("reconfigure failed")
@@ -454,7 +454,7 @@ def test_launch_records_clean_run_and_reconfigures_existing_monitor(
             operations.append("close")
 
     class FakeMonitor:
-        async def reconfigure(self, *, jobs, diagnostics) -> None:
+        async def reconfigure(self, *, jobs, diagnostics, detector) -> None:
             operations.append("reconfigure")
             assert jobs
             assert "ports" in diagnostics
@@ -682,3 +682,27 @@ def test_help_lists_operational_commands() -> None:
     assert result.exit_code == 0
     for command in ("doctor", "config", "export", "version"):
         assert command in result.stdout
+
+
+async def test_probe_planner_preserves_common_scope_when_ports_change() -> None:
+    from socketclaw.cli import _ProbePlanner
+
+    planner = _ProbePlanner(which=lambda _command: None)
+    config = AppConfig(targets=["example.com"], ports=[22, 80])
+    first = planner.prepare(config)
+    states = {22: True, 80: False, 443: True}
+
+    async def connector(_host: str, port: int, _timeout: float) -> bool:
+        return states[port]
+
+    first.port_probe.connector = connector
+    await first.port_probe.collect("example.com", config.ports)
+    planner.commit(first)
+    states[80] = True
+    changed = planner.prepare(config.model_copy(update={"ports": [80, 443]}))
+    event = await changed.port_probe.collect("example.com", [80, 443])
+    assert event.evidence["newly_opened"] == [80]
+    assert event.evidence["newly_closed"] == []
+    assert event.evidence["scope_removed"] == [22]
+    assert event.evidence["scope_added"] == [443]
+    assert event.evidence["initial_open_ports"] == [443]

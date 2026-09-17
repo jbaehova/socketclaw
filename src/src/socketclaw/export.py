@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
+from .incidents import SuppressionDecision
 from .openai import redact_secrets
-from .storage import StoredEvent, StoredInvestigation, StoredResponseProposal
+from .storage import IncidentReport, StoredEvent, StoredInvestigation, StoredResponseProposal
 
 
 def write_managed_export(home: Path, filename: str, content: str) -> Path:
@@ -103,12 +104,13 @@ def export_json(
     investigation: StoredInvestigation | None,
     *,
     response_proposal: StoredResponseProposal | None = None,
+    suppressions: Sequence[SuppressionDecision] = (),
     secrets: Sequence[str] = (),
 ) -> str:
     """Export one incident as stable, redacted JSON."""
     _validate_investigation(investigation)
     _validate_response_proposal(event, investigation, response_proposal)
-    payload = {
+    payload: dict[str, object] = {
         "event": event.model_dump(mode="json"),
         "investigation": (
             investigation.model_dump(mode="json") if investigation is not None else None
@@ -117,6 +119,8 @@ def export_json(
             response_proposal.model_dump(mode="json") if response_proposal is not None else None
         ),
     }
+    if suppressions:
+        payload["suppressions"] = [item.model_dump(mode="json") for item in suppressions]
     redacted_payload = _redact_data(payload, secrets)
     rendered = json.dumps(
         redacted_payload,
@@ -132,6 +136,7 @@ def export_markdown(
     investigation: StoredInvestigation | None,
     *,
     response_proposal: StoredResponseProposal | None = None,
+    suppressions: Sequence[SuppressionDecision] = (),
     secrets: Sequence[str] = (),
 ) -> str:
     """Export one incident as an operator-readable Markdown report."""
@@ -165,6 +170,9 @@ def export_markdown(
         f"**Observed:** {text(event.observed_at.isoformat())}  ",
         f"**Severity:** {event.severity.value.upper()} ({event.score}/100)  ",
         f"**Source:** {code(event.source.value)}  ",
+        "**Rule version:** "
+        + (code(str(event.rule_version)) if event.rule_version else "Unknown (legacy or imported)")
+        + "  ",
         f"**Target:** {text(event.target or '-')}",
         "",
         f"## {text(event.title)}",
@@ -291,6 +299,24 @@ def export_markdown(
                         "",
                     ]
                 )
+    if suppressions:
+        sections.extend(
+            [
+                "## Maintenance exceptions",
+                "",
+                "Original scores are preserved. The following decisions limited incident creation.",
+                "",
+            ]
+        )
+        for decision in suppressions:
+            sections.extend(
+                [
+                    f"- {text(decision.reason)}",
+                    f"  Expires: {decision.expires_at.isoformat()}",
+                    f"  Rules: {text(', '.join(decision.rule_codes))}",
+                    "",
+                ]
+            )
     return "\n".join(sections).rstrip() + "\n"
 
 
@@ -395,3 +421,102 @@ def _redacted_text(
         preserve_layout=preserve_layout,
     )
     return redact_secrets(normalized, secrets)
+
+
+def export_incident_json(report: IncidentReport, *, secrets: Sequence[str] = ()) -> str:
+    return (
+        json.dumps(
+            _redact_data(report.model_dump(mode="json"), secrets),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def export_incident_markdown(report: IncidentReport, *, secrets: Sequence[str] = ()) -> str:
+    def text(value: str) -> str:
+        return _markdown_text(_redacted_text(value, secrets, preserve_layout=True))
+
+    history = report.history
+    item = history.incident
+    sections = [
+        "# SocketClaw Incident",
+        "",
+        f"## {text(item.title)}",
+        "",
+        f"**Incident ID:** {item.id}  ",
+        f"**Status:** {item.status.upper()}  ",
+        f"**Target:** {text(item.target or 'Local source')}  ",
+        f"**Highest severity:** {item.highest_severity.value.upper()} ({item.highest_score}/100)  ",
+        f"**First seen:** {item.first_seen_at.isoformat()}  ",
+        f"**Last seen:** {item.last_seen_at.isoformat()}  ",
+        "**Last reopened:** "
+        + (item.last_reopened_at.isoformat() if item.last_reopened_at else "Never")
+        + "  ",
+        f"**Resolved:** {item.resolved_at.isoformat() if item.resolved_at else 'Not resolved'}  ",
+        f"**Observations:** {item.observation_count}  ",
+        f"**Occurrences:** {item.occurrence_count}  ",
+        f"**Rule version:** {item.rule_version}  ",
+        f"**Revision:** {item.revision}",
+        "",
+        "## Activity",
+        "",
+    ]
+    for change in history.transitions:
+        sections += [
+            f"- {change.at.isoformat()} / {text(change.action)} / {change.actor}",
+            f"  {text(change.reason)}",
+            "",
+        ]
+    sections += ["## Occurrences", ""]
+    for occurrence in history.occurrences:
+        sections += [
+            f"### Occurrence {occurrence.number}",
+            "",
+            f"Started: {occurrence.started_at.isoformat()}  ",
+            f"Observations: {occurrence.observation_count}  ",
+            "Measured recovery: "
+            + (occurrence.recovered_at.isoformat() if occurrence.recovered_at else "Not observed"),
+            "",
+        ]
+    sections += ["## Notes", ""]
+    for note in history.notes:
+        sections += [f"### {note.at.isoformat()}", "", text(note.body), ""]
+        if note.supersedes_id:
+            sections += [f"Correction of note {note.supersedes_id}.", ""]
+    if not history.notes:
+        sections += ["No notes recorded.", ""]
+    sections += [
+        "## Related observations",
+        "",
+        "Measured recovery and operator resolution are separate facts.",
+        "",
+    ]
+    links = {link.event_id: link for link in history.links}
+    for event in report.observations:
+        link = links[event.id]
+        sections += [
+            f"### {text(event.title)}",
+            "",
+            f"**Event ID:** {event.id}  ",
+            f"**Relationship:** {link.kind}  ",
+            f"**Occurrence:** {link.occurrence_id}  ",
+            f"**Severity:** {event.severity.value.upper()} ({event.score}/100)  ",
+            f"**Observed:** {event.observed_at.isoformat()}",
+            "",
+            text(event.summary),
+            "",
+            *_fenced_block(
+                json.dumps(
+                    _redact_data(event.model_dump(mode="json"), secrets),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "json",
+            ),
+            "",
+        ]
+    return "\n".join(sections).rstrip() + "\n"

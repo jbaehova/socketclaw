@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
@@ -10,7 +11,9 @@ from typing import cast
 
 from pydantic import JsonValue
 
-from ..domain import EventSource, SecurityEvent
+from ..collection import PortBaselineState, ProbeBatch
+from ..domain import EventSource, ObservationOutcome, SecurityEvent, utc_now
+from ..storage import Repository
 
 Connector = Callable[[str, int, float], Awaitable[bool | None]]
 
@@ -32,6 +35,8 @@ class PortProbe:
         self.timeout = timeout
         self._connection_slots = asyncio.Semaphore(concurrency)
         self._previous: dict[str, set[int]] = {}
+        self._scopes: dict[str, set[int]] = {}
+        self._known: dict[str, set[int]] = {}
         self._target_locks: dict[str, asyncio.Lock] = {}
 
     def retained_for_targets(self, targets: Iterable[str]) -> PortProbe:
@@ -44,6 +49,12 @@ class PortProbe:
         )
         replacement._previous = {
             target: set(ports) for target, ports in self._previous.items() if target in active
+        }
+        replacement._scopes = {
+            target: set(ports) for target, ports in self._scopes.items() if target in active
+        }
+        replacement._known = {
+            target: set(ports) for target, ports in self._known.items() if target in active
         }
         return replacement
 
@@ -59,10 +70,84 @@ class PortProbe:
         async with target_lock:
             return await self._collect_locked(target, candidates)
 
+    async def collect_batch(
+        self,
+        target: str,
+        ports: Iterable[int],
+        repository: Repository,
+        *,
+        baseline_ttl: float = 86400.0,
+    ) -> ProbeBatch:
+        """Prepare a scan without advancing its last committed baseline."""
+        if not target or target != target.strip() or len(target) > 253 or target.startswith("-"):
+            raise ValueError("port scan target must be a non-empty host or address")
+        if not math.isfinite(baseline_ttl) or baseline_ttl <= 0:
+            raise ValueError("baseline TTL must be finite and positive")
+        candidates = _validated_ports(ports)
+        async with self._target_locks.setdefault(target, asyncio.Lock()):
+            checkpoint = await repository.load_checkpoint(port_probe_id(target))
+            baseline = PortBaselineState.model_validate(checkpoint.state)
+            now = utc_now()
+            stale = {
+                port
+                for port, confirmed in baseline.confirmed_at.items()
+                if not 0 <= (now - confirmed).total_seconds() <= baseline_ttl
+            }
+            maps = self._previous, self._scopes, self._known
+            previous = tuple(mapping.get(target) for mapping in maps)
+            try:
+                for mapping in maps:
+                    mapping.pop(target, None)
+                if checkpoint.expected_revision:
+                    self._previous[target] = set(baseline.opened)
+                    self._scopes[target] = set(baseline.scope)
+                    self._known[target] = set(baseline.confirmed_at)
+                event = await self._collect_locked(target, candidates, stale_ports=stale)
+                unresolved = set(cast(list[int], event.evidence["unresolved_ports"]))
+                confirmed_at = {
+                    port: baseline.confirmed_at[port] if port in unresolved else event.observed_at
+                    for port in self._known[target]
+                }
+                candidate = PortBaselineState(
+                    scope=tuple(candidates),
+                    opened=tuple(sorted(self._previous[target])),
+                    confirmed_at=confirmed_at,
+                )
+                evidence = dict(event.evidence)
+                evidence.update(
+                    baseline_stale=bool(stale & set(candidates)),
+                    baseline_stale_ports=cast(list[JsonValue], sorted(stale & set(candidates))),
+                    baseline_ttl_seconds=baseline_ttl,
+                    baseline_revision=checkpoint.expected_revision,
+                    baseline_oldest_confirmation_at=(
+                        min(baseline.confirmed_at.values()).isoformat()
+                        if baseline.confirmed_at
+                        else None
+                    ),
+                    scope_revision=hashlib.sha256(
+                        ",".join(str(port) for port in candidates).encode()
+                    ).hexdigest(),
+                )
+                event = event.model_copy(update={"evidence": evidence})
+                return ProbeBatch(
+                    observations=(event,),
+                    checkpoints=(
+                        checkpoint.model_copy(update={"state": candidate.model_dump(mode="json")}),
+                    ),
+                )
+            finally:
+                for mapping, value in zip(maps, previous, strict=True):
+                    if value is None:
+                        mapping.pop(target, None)
+                    else:
+                        mapping[target] = value
+
     async def _collect_locked(
         self,
         target: str,
         candidates: list[int],
+        *,
+        stale_ports: set[int] | None = None,
     ) -> SecurityEvent:
         queue = asyncio.Queue[int]()
         for port in candidates:
@@ -97,13 +182,19 @@ class PortProbe:
 
         current = {port for port, opened in results if opened}
         unresolved = {port for port, opened in results if opened is None}
-        previous = self._previous.get(target)
-        if previous is not None:
-            current.update(previous & unresolved)
-        baseline = previous is None
-        newly_opened = [] if previous is None else sorted(current - previous)
-        newly_closed = [] if previous is None else sorted(previous - current)
-        self._previous[target] = current
+        previous = self._previous.get(target, set())
+        scope = set(candidates)
+        previous_scope = self._scopes.get(target, set())
+        known = self._known.get(target, set()) & scope & previous_scope
+        comparable = known - (stale_ports or set())
+        closed = {port for port, opened in results if opened is False}
+        baseline = target not in self._scopes
+        newly_opened = sorted((current - previous) & comparable)
+        newly_closed = sorted(closed & previous & comparable)
+        initial_open = sorted(current - comparable)
+        self._previous[target] = current | (previous & unresolved & known)
+        self._known[target] = known | current | closed
+        self._scopes[target] = scope
 
         if newly_opened:
             title = f"{len(newly_opened)} new port(s) on {target}"
@@ -120,6 +211,15 @@ class PortProbe:
             "newly_closed": cast(list[JsonValue], newly_closed),
             "unresolved_ports": cast(list[JsonValue], sorted(unresolved)),
             "baseline": baseline,
+            "scope_added": cast(list[JsonValue], sorted(scope - previous_scope)),
+            "scope_removed": cast(list[JsonValue], sorted(previous_scope - scope)),
+            "initial_open_ports": cast(list[JsonValue], initial_open),
+            "last_known_open_ports": cast(list[JsonValue], sorted(self._previous[target])),
+            "outcome": "unknown"
+            if len(unresolved) == len(candidates)
+            else "partial"
+            if unresolved
+            else "ok",
         }
         return SecurityEvent(
             source=EventSource.PORT_SCAN,
@@ -128,6 +228,7 @@ class PortProbe:
             summary=(f"{target}: {len(current)} open of {len(candidates)} scanned TCP ports"),
             target=target,
             evidence=evidence,
+            outcome=ObservationOutcome(str(evidence["outcome"])),
         )
 
 
@@ -162,3 +263,7 @@ def _port_state(value: object) -> bool | None:
     if value is None or isinstance(value, bool):
         return value
     raise TypeError("port connector must return bool or None")
+
+
+def port_probe_id(target: str) -> str:
+    return "ports:" + hashlib.sha256(target.casefold().encode()).hexdigest()

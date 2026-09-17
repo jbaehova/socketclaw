@@ -169,8 +169,14 @@ async def inspect_environment(
 
 
 async def _probe_database(store: ConfigStore) -> DiagnosticCheck:
+    if not store.database_path.exists() and not store.database_path.is_symlink():
+        return DiagnosticCheck(
+            name="SQLite database",
+            status="pass",
+            detail="not created yet; the first TUI launch will initialize storage",
+        )
     try:
-        repository = Repository(store.database_path)
+        repository = Repository(store.database_path, read_only=True)
     except Exception as exc:
         return DiagnosticCheck(
             name="SQLite database",
@@ -182,7 +188,6 @@ async def _probe_database(store: ConfigStore) -> DiagnosticCheck:
     info = None
     error: Exception | None = None
     try:
-        await repository.initialize()
         info = await repository.database_info()
     except asyncio.CancelledError:
         with suppress(Exception):

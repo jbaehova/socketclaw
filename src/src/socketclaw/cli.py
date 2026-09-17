@@ -21,16 +21,24 @@ import typer
 from click import ClickException
 
 from . import __version__
+from .collection import ProbeBatch
 from .config import AppConfig, ConfigStore
 from .detection import Detector
 from .doctor import inspect_environment
 from .domain import SecurityEvent
-from .export import export_json, export_markdown, write_managed_export
+from .export import (
+    export_incident_json,
+    export_incident_markdown,
+    export_json,
+    export_markdown,
+    write_managed_export,
+)
 from .monitor import Diagnostic, MonitorService, ProbeJob
 from .openai import redact_secrets
 from .probes.logs import LogProbe
 from .probes.ping import PingProbe
 from .probes.ports import PortProbe
+from .rules import RuleConfig
 from .storage import EventQuery, Repository
 from .ui.app import AppServices, SocketClawApp
 
@@ -43,6 +51,8 @@ app = typer.Typer(
 )
 config_app = typer.Typer(help="Inspect the effective local configuration.")
 app.add_typer(config_app, name="config")
+db_app = typer.Typer(help="Inspect and migrate local storage.")
+app.add_typer(db_app, name="db")
 
 
 @app.callback()
@@ -106,14 +116,26 @@ def export_command(
             help="Specific event UUID. Defaults to the newest event.",
         ),
     ] = None,
+    incident_id: Annotated[
+        str | None,
+        typer.Option("--incident", help="Operational incident UUID, including its full history."),
+    ] = None,
 ) -> None:
-    """Export one durable incident without exposing configured secrets."""
+    """Export an observation or operational incident without exposing configured secrets."""
     normalized_format = format_.casefold()
     if normalized_format not in {"markdown", "json"}:
         raise typer.BadParameter(
             "choose markdown or json",
             param_hint="--format",
         )
+    if event_id is not None and incident_id is not None:
+        raise typer.BadParameter("choose either --event or --incident")
+    incident_uuid: UUID | None = None
+    if incident_id is not None:
+        try:
+            incident_uuid = UUID(incident_id)
+        except ValueError as exc:
+            raise typer.BadParameter("incident must be a UUID", param_hint="--incident") from exc
     selected_id: UUID | None = None
     if event_id is not None:
         try:
@@ -127,17 +149,21 @@ def export_command(
     store = ConfigStore()
     try:
         store.ensure_home()
-        rendered, event_uuid = asyncio.run(_render_export(store, normalized_format, selected_id))
+        rendered, event_uuid = asyncio.run(
+            _render_export(store, normalized_format, selected_id, incident_uuid)
+        )
     except Exception as exc:
         raise ClickException(f"Cannot export incident: {_error_detail(exc)}") from exc
     if rendered is None or event_uuid is None:
-        if selected_id is None:
+        if incident_uuid is not None:
+            typer.echo(f"Incident {incident_uuid} was not found.")
+        elif selected_id is None:
             typer.echo("No events are available to export.")
         else:
             typer.echo(f"Event {selected_id} was not found.")
         raise typer.Exit(1)
     suffix = "md" if normalized_format == "markdown" else "json"
-    filename = f"{event_uuid}.{suffix}"
+    filename = f"{'incident-' if incident_uuid else ''}{event_uuid}.{suffix}"
     if output is None:
         try:
             destination = write_managed_export(store.home, filename, rendered)
@@ -152,6 +178,55 @@ def export_command(
     _validate_export_destination(store, destination)
     _atomic_private_write(destination, rendered)
     typer.echo(f"Exported {event_uuid} to {_terminal_text(str(destination))}")
+
+
+@db_app.command("migrate")
+def migrate_database() -> None:
+    """Upgrade storage with a verified recovery backup under the home writer lock."""
+    store = ConfigStore()
+    try:
+        store.ensure_home()
+        store.load()  # Validate configuration before modifying storage.
+        lock = _ApplicationLock(store.home / ".instance.lock")
+        lock.acquire()
+        try:
+            asyncio.run(_migrate_database(store))
+        finally:
+            lock.release()
+    except Exception as exc:
+        raise ClickException(f"Cannot migrate storage: {_error_detail(exc)}") from exc
+
+
+async def _migrate_database(store: ConfigStore) -> None:
+    repository = Repository(store.database_path)
+    try:
+        await repository.initialize()
+        info = await repository.database_info()
+        typer.echo(
+            f"Storage schema {info.schema_version} verified. "
+            f"Backups: {_terminal_text(str(store.home / 'backups'))}"
+        )
+    finally:
+        await repository.close()
+
+
+@db_app.command("status")
+def database_status() -> None:
+    """Check storage without migrating or recovering work owned by another process."""
+
+    async def inspect_status() -> None:
+        store = ConfigStore()
+        repository = Repository(store.database_path, read_only=True)
+        try:
+            info = await repository.database_info()
+            typer.echo(f"Schema {info.schema_version} / {info.journal_mode.upper()} / integrity OK")
+        finally:
+            await repository.close()
+
+    try:
+        asyncio.run(inspect_status())
+    except Exception as exc:
+        raise ClickException(f"Cannot inspect storage: {_error_detail(exc)}") from exc
 
 
 def _launch_tui(store: ConfigStore) -> None:
@@ -174,10 +249,10 @@ async def _run_tui(store: ConfigStore) -> None:
     clean_shutdown = False
     failure: BaseException | None = None
     try:
+        active_config = store.load()
         await repository.initialize()
         run_id = (await repository.start_run(__version__)).id
-        active_config = store.load()
-        planner = _ProbePlanner()
+        planner = _ProbePlanner(repository=repository)
         monitor = _build_monitor(active_config, repository, planner=planner)
 
         async def reconfigure(config: AppConfig) -> None:
@@ -234,17 +309,14 @@ def _build_monitor(
     planner: _ProbePlanner | None = None,
 ) -> MonitorService:
     if planner is None:
-        jobs, diagnostics = _build_probe_plan(config)
+        jobs, diagnostics = _build_probe_plan(config, repository=repository)
         return MonitorService(
-            repository,
-            Detector(),
-            jobs=jobs,
-            diagnostics=diagnostics,
+            repository, Detector(config.rules), jobs=jobs, diagnostics=diagnostics
         )
     plan = planner.prepare(config)
     monitor = MonitorService(
         repository,
-        Detector(),
+        Detector(config.rules),
         jobs=plan.jobs,
         diagnostics=plan.diagnostics,
     )
@@ -259,6 +331,7 @@ CommandFinder = Callable[[str], str | None]
 class _PreparedProbePlan:
     jobs: tuple[ProbeJob, ...]
     diagnostics: dict[str, Diagnostic]
+    rules: RuleConfig
     port_numbers: tuple[int, ...]
     targets: tuple[str, ...]
     port_probe: PortProbe
@@ -271,15 +344,18 @@ class _PreparedProbePlan:
 class _ProbePlanner:
     """Stage probe plans while preserving stateful collectors when safe."""
 
-    def __init__(self, *, which: CommandFinder = shutil.which) -> None:
+    def __init__(
+        self, *, which: CommandFinder = shutil.which, repository: Repository | None = None
+    ) -> None:
         self._which = which
+        self._repository = repository
         self._committed: _PreparedProbePlan | None = None
 
     def prepare(self, config: AppConfig) -> _PreparedProbePlan:
         previous = self._committed
         port_numbers = tuple(config.ports)
         targets = tuple(config.targets)
-        if previous is not None and previous.port_numbers == port_numbers:
+        if previous is not None:
             port_probe = (
                 previous.port_probe
                 if previous.targets == targets
@@ -297,7 +373,7 @@ class _ProbePlanner:
         log_probe = (
             previous.log_probe
             if retain_log_probe and previous is not None
-            else (LogProbe(list(log_paths)) if log_paths else None)
+            else (LogProbe(list(log_paths), repository=self._repository) if log_paths else None)
         )
         ping_executable = _resolve_command("ping", self._which)
         ping_probe = (
@@ -313,10 +389,12 @@ class _ProbePlanner:
             ping=ping_probe,
             ports=port_probe,
             logs=log_probe,
+            repository=self._repository,
         )
         return _PreparedProbePlan(
             jobs=jobs,
             diagnostics=diagnostics,
+            rules=config.rules,
             port_numbers=port_numbers,
             targets=targets,
             port_probe=port_probe,
@@ -349,6 +427,7 @@ class _ProbePlanner:
             await monitor.reconfigure(
                 jobs=plan.jobs,
                 diagnostics=plan.diagnostics,
+                detector=Detector(plan.rules),
             )
         except BaseException:
             if reused_changed_log and previous is not None and log_probe is not None:
@@ -362,9 +441,10 @@ def _build_probe_plan(
     config: AppConfig,
     *,
     which: CommandFinder = shutil.which,
+    repository: Repository | None = None,
 ) -> tuple[tuple[ProbeJob, ...], dict[str, Diagnostic]]:
     """Build fresh collectors for startup and in-place runtime reconfiguration."""
-    plan = _ProbePlanner(which=which).prepare(config)
+    plan = _ProbePlanner(which=which, repository=repository).prepare(config)
     return plan.jobs, plan.diagnostics
 
 
@@ -374,6 +454,7 @@ def _compose_probe_plan(
     ping: PingProbe | None,
     ports: PortProbe,
     logs: LogProbe | None,
+    repository: Repository | None = None,
 ) -> tuple[tuple[ProbeJob, ...], dict[str, Diagnostic]]:
     jobs: list[ProbeJob] = []
     selected_ports = tuple(config.ports)
@@ -391,15 +472,23 @@ def _compose_probe_plan(
         async def collect_ports(
             selected: str = target,
             scan_ports: tuple[int, ...] = selected_ports,
-        ) -> Sequence[SecurityEvent]:
+        ) -> Sequence[SecurityEvent] | ProbeBatch:
+            if repository is not None:
+                return await ports.collect_batch(
+                    selected, scan_ports, repository, baseline_ttl=config.port_baseline_ttl
+                )
             return (await ports.collect(selected, scan_ports),)
 
         jobs.append(ProbeJob(f"ports:{target}", config.scan_interval, collect_ports))
 
     if logs is not None:
-        jobs.append(ProbeJob("logs", 1.0, logs.poll))
+        jobs.append(ProbeJob("logs", 1.0, logs.collect))
 
-    async def diagnose_ports(target: str) -> SecurityEvent:
+    async def diagnose_ports(target: str) -> SecurityEvent | ProbeBatch:
+        if repository is not None:
+            return await ports.collect_batch(
+                target, selected_ports, repository, baseline_ttl=config.port_baseline_ttl
+            )
         return await ports.collect(target, selected_ports)
 
     diagnostics: dict[str, Diagnostic] = {"ports": diagnose_ports}
@@ -429,8 +518,10 @@ def _monitoring_settings(config: AppConfig) -> tuple[object, ...]:
         tuple(config.targets),
         config.ping_interval,
         config.scan_interval,
+        config.port_baseline_ttl,
         tuple(config.ports),
         tuple(config.log_paths),
+        config.rules,
     )
 
 
@@ -543,10 +634,20 @@ async def _render_export(
     store: ConfigStore,
     format_: str,
     event_id: UUID | None,
+    incident_id: UUID | None = None,
 ) -> tuple[str | None, UUID | None]:
-    repository = Repository(store.database_path)
+    if not store.database_path.exists() and not store.database_path.is_symlink():
+        return None, None
+    repository = Repository(store.database_path, read_only=True)
     try:
-        await repository.initialize()
+        await repository.require_current_schema()
+        if incident_id is not None:
+            report = await repository.incident_report(incident_id)
+            if report is None:
+                return None, None
+            key = store.load_api_key()
+            renderer = export_incident_json if format_ == "json" else export_incident_markdown
+            return renderer(report, secrets=[key] if key else ()), incident_id
         if event_id is None:
             events = await repository.list_events(EventQuery(limit=1))
             event = events[0] if events else None
@@ -575,11 +676,13 @@ async def _render_export(
                 ),
                 None,
             )
+        suppressions = await repository.incidents.suppression_decisions(event.id)
         rendered = (
             export_json(
                 event,
                 investigation,
                 response_proposal=response_proposal,
+                suppressions=suppressions,
                 secrets=secrets,
             )
             if format_ == "json"
@@ -587,6 +690,7 @@ async def _render_export(
                 event,
                 investigation,
                 response_proposal=response_proposal,
+                suppressions=suppressions,
                 secrets=secrets,
             )
         )

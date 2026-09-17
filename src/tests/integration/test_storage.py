@@ -139,7 +139,7 @@ async def test_initialize_is_idempotent_and_enables_database_safety(
     await repo.initialize()
     info = await repo.database_info()
 
-    assert info.schema_version == 1
+    assert info.schema_version == 4
     assert info.journal_mode == "wal"
     assert info.foreign_keys is True
     assert (tmp_path / "nested" / "socketclaw.db").exists()
@@ -1061,7 +1061,7 @@ async def test_preexisting_managed_database_remains_usable(tmp_path: Path) -> No
     reopened = Repository(database_path)
     await reopened.initialize()
 
-    assert (await reopened.database_info()).schema_version == 1
+    assert (await reopened.database_info()).schema_version == 4
     assert len(await reopened.list_events()) == 1
     await reopened.close()
 
@@ -1078,5 +1078,38 @@ async def test_concurrent_initialization_is_idempotent(tmp_path: Path) -> None:
         first.database_info(),
         second.database_info(),
     )
-    assert first_info.schema_version == second_info.schema_version == 1
+    assert first_info.schema_version == second_info.schema_version == 4
     await asyncio.gather(first.close(), second.close())
+
+
+async def test_severity_filter_precedes_limit_in_real_sqlite(repository: Repository) -> None:
+    from socketclaw.detection import Detector
+
+    important = event_fixture(observed_at=NOW - timedelta(minutes=1))
+    await repository.save_event(important, detection_fixture())
+    for _ in range(110):
+        ordinary = event_fixture().model_copy(update={"evidence": {"packet_loss": 0}})
+        await repository.save_event(ordinary, Detector().score(ordinary, []))
+    selected = await repository.list_events(
+        EventQuery(severities=(Severity.HIGH, Severity.CRITICAL), limit=8)
+    )
+    assert [event.id for event in selected] == [important.id]
+
+
+async def test_correlation_query_exact_window_excludes_other_sources_and_future(
+    repository: Repository,
+) -> None:
+    current = event_fixture(target="EXAMPLE.COM")
+    boundary = event_fixture(target="example.com", observed_at=NOW - timedelta(minutes=5))
+    before = event_fixture(
+        target="example.com", observed_at=boundary.observed_at - timedelta(microseconds=1)
+    )
+    future = event_fixture(target="example.com", observed_at=NOW + timedelta(microseconds=1))
+    unrelated = event_fixture(target="another.example")
+    other_source = event_fixture(target="example.com", source="log")
+    current = current.model_copy(update={"ingested_at": current.observed_at})
+    for event in (current, boundary, before, future, unrelated, other_source):
+        event = event.model_copy(update={"ingested_at": event.observed_at})
+        await repository.save_event(event, detection_fixture())
+    history = await repository.correlation_history(current, timedelta(minutes=5))
+    assert [event.id for event in history] == [boundary.id]

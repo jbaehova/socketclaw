@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from pydantic import JsonValue
 
-from ..domain import EventSource, SecurityEvent
+from ..domain import EventSource, ObservationOutcome, SecurityEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,32 +53,33 @@ class PingProbe:
         _validate_request(target, count, timeout)
         command = _ping_command(self._executable, self._platform, target, count, timeout)
         deadline = count * timeout + 2.0
+        evidence: dict[str, JsonValue]
         try:
             async with self._slots:
                 result = await self._runner(command, deadline)
-            evidence: dict[str, JsonValue] = _parse_ping(result.stdout, count)
-            statistics_parsed = "packet_loss" in evidence
-            if not statistics_parsed:
-                evidence["packet_loss"] = 0.0 if result.returncode == 0 else 100.0
-            evidence["statistics_parsed"] = statistics_parsed
-            evidence["returncode"] = result.returncode
-            if result.stderr.strip():
-                evidence["stderr"] = result.stderr.strip()[:1000]
+            evidence = _normalize_result(result, count, self._platform)
         except (TimeoutError, OSError) as exc:
+            is_timeout = isinstance(exc, TimeoutError)
             evidence = {
-                "sent": count,
-                "received": 0,
-                "packet_loss": 100.0,
+                "requested_count": count,
+                "outcome": "unknown" if is_timeout else "error",
+                "reason": "deadline_exceeded" if is_timeout else "execution_failed",
+                "statistics_parsed": False,
+                "returncode": None,
                 "error": (str(exc).strip() or type(exc).__name__)[:2000],
             }
 
-        loss = _as_float(evidence["packet_loss"])
-        if loss >= 100:
-            title = f"{target} is unreachable"
-        elif loss > 0:
+        outcome = evidence["outcome"]
+        if outcome == "unreachable":
+            title = f"{target}: no ICMP replies"
+        elif outcome == "partial":
             title = f"{target} has packet loss"
-        else:
+        elif outcome == "ok":
             title = f"{target} is reachable"
+        elif outcome == "error":
+            title = f"Ping collection failed for {target}"
+        else:
+            title = f"Ping result unknown for {target}"
         return SecurityEvent(
             source=EventSource.PING,
             event_type="ping.result",
@@ -86,7 +87,53 @@ class PingProbe:
             summary=_ping_summary(target, evidence),
             target=target,
             evidence=evidence,
+            outcome=ObservationOutcome(str(evidence["outcome"])),
         )
+
+
+def _normalize_result(
+    result: CommandResult, count: int, platform_name: str
+) -> dict[str, JsonValue]:
+    parsed = _parse_ping(result.stdout, count)
+    output = f"{result.stdout}\n{result.stderr}".casefold()
+    reason = None
+    if any(
+        term in output for term in ("permission denied", "operation not permitted", "access denied")
+    ):
+        reason = "permission"
+    elif any(
+        term in output
+        for term in (
+            "unknown host",
+            "could not find host",
+            "name or service not known",
+            "cannot resolve",
+            "temporary failure in name resolution",
+            "nodename nor servname",
+        )
+    ):
+        reason = "dns"
+    elif result.returncode not in ({0, 1, 2} if platform_name == "Darwin" else {0, 1}):
+        # BSD ping uses 2 for a measured no-reply result; Linux uses 2 for errors.
+        reason = "command_failed"
+    statistics_parsed = "packet_loss" in parsed
+    if reason is not None or not statistics_parsed:
+        evidence: dict[str, JsonValue] = {
+            "requested_count": count,
+            "outcome": "error" if reason is not None else "unknown",
+            "reason": reason or "unparsed_statistics",
+        }
+    else:
+        evidence = parsed
+        loss = _as_float(parsed["packet_loss"])
+        evidence["outcome"] = "unreachable" if loss >= 100 else "partial" if loss else "ok"
+        evidence["reason"] = "measured_statistics"
+    evidence["statistics_parsed"] = statistics_parsed
+    evidence["returncode"] = result.returncode
+    evidence["stdout"] = result.stdout.strip()[:2000]
+    if result.stderr.strip():
+        evidence["stderr"] = result.stderr.strip()[:1000]
+    return evidence
 
 
 def _ping_command(
@@ -164,17 +211,11 @@ def _parse_ping(output: str, requested_count: int) -> dict[str, JsonValue]:
     if received is None:
         received = re.search(r"Received\s*=\s*(\d+)", output, re.IGNORECASE)
 
-    sent = int(transmitted.group(1)) if transmitted else requested_count
+    evidence: dict[str, JsonValue] = {"requested_count": requested_count}
+    if transmitted is not None:
+        evidence["sent"] = int(transmitted.group(1))
     if received is not None:
-        received_count = int(received.group(1))
-    elif loss is not None:
-        received_count = round(sent * (1 - loss / 100))
-    else:
-        received_count = sent
-    evidence: dict[str, JsonValue] = {
-        "sent": max(0, sent),
-        "received": min(max(0, sent), max(0, received_count)),
-    }
+        evidence["received"] = int(received.group(1))
     if loss is not None:
         evidence["packet_loss"] = loss
 
@@ -208,6 +249,8 @@ def _parse_ping(output: str, requested_count: int) -> dict[str, JsonValue]:
 
 
 def _ping_summary(target: str, evidence: Mapping[str, JsonValue]) -> str:
+    if evidence.get("outcome") in {"error", "unknown"}:
+        return f"{target}: ICMP response state unknown ({evidence['reason']})"
     loss = _as_float(evidence["packet_loss"])
     average = evidence.get("rtt_avg_ms")
     if average is not None:

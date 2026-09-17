@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import math
@@ -10,13 +11,14 @@ import os
 import re
 import stat
 from collections.abc import Collection
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import (
+    CheckConstraint,
     Float,
     ForeignKey,
     Index,
@@ -29,6 +31,7 @@ from sqlalchemy import (
     inspect,
     or_,
     select,
+    text,
     update,
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -37,12 +40,22 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
     AsyncEngine,
+    AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql.elements import ColumnElement
 
+from .collection import (
+    CheckpointChange,
+    IngestGap,
+    LogCheckpointState,
+    PortBaselineState,
+    ProbeBatch,
+)
+from .db import Base
+from .detection import Detector
 from .domain import (
     Assessment,
     DetectionResult,
@@ -51,22 +64,35 @@ from .domain import (
     InvestigationResult,
     InvestigationState,
     ModelUsage,
+    ObservationOutcome,
     ResponseProposal,
     SecurityEvent,
     Severity,
     utc_now,
 )
+from .health import ProbeHealth
+from .incident_store import (
+    IncidentLinkRow,
+    IncidentStore,
+    project_observation,
+    read_history,
+    validate_incidents,
+)
+from .incidents import IncidentHistory, IncidentLink
+from .migrations import (
+    SCHEMA_VERSION,
+    migrate_v1_to_v2,
+    migrate_v2_to_v3,
+    migrate_v3_to_v4,
+    recovery_backup,
+)
+from .rules import RuleConfig, RuleVersion
 
-SCHEMA_VERSION = 1
 _EVIDENCE_MAX_BYTES = 32 * 1024
 _INVESTIGATION_ERROR_MAX_LENGTH = 4000
 _ERROR_TRUNCATION_MARKER = "\n[truncated]"
 _OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 _BEARER_TOKEN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
-
-
-class Base(DeclarativeBase):
-    pass
 
 
 class SchemaMetaRow(Base):
@@ -76,17 +102,91 @@ class SchemaMetaRow(Base):
     value: Mapped[str] = mapped_column(String(200), nullable=False)
 
 
+class ProbeCheckpointRow(Base):
+    __tablename__ = "probe_checkpoints"
+
+    probe_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    state_json: Mapped[str] = mapped_column(Text, nullable=False)
+    committed_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[str] = mapped_column(String(40), nullable=False)
+
+
+class IngestBatchRow(Base):
+    __tablename__ = "ingest_batches"
+
+    batch_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    committed_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    committed_at: Mapped[str] = mapped_column(String(40), nullable=False)
+
+
+class IngestGapRow(Base):
+    __tablename__ = "ingest_gaps"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    probe_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    gap_json: Mapped[str] = mapped_column(Text, nullable=False)
+    committed_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class MigrationRow(Base):
+    __tablename__ = "schema_migrations"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    applied_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    backup_path: Mapped[str] = mapped_column(Text, nullable=False)
+    backup_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class ProbeHealthRow(Base):
+    __tablename__ = "probe_health"
+
+    probe_id: Mapped[str] = mapped_column(String(300), primary_key=True)
+    health_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class HealthTransitionRow(Base):
+    __tablename__ = "health_transitions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    probe_id: Mapped[str] = mapped_column(String(300), nullable=False, index=True)
+    recorded_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    health_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class RuleVersionRow(Base):
+    __tablename__ = "rule_versions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    applied_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
 class EventRow(Base):
     __tablename__ = "events"
     __table_args__ = (
+        CheckConstraint("ingest_seq > 0", name="ck_events_ingest_seq_positive"),
         Index("ix_events_observed_at", "observed_at"),
         Index("ix_events_severity", "severity"),
         Index("ix_events_source", "source"),
         Index("ix_events_target", "target"),
+        Index("ix_events_ingest_seq", "ingest_seq", unique=True),
+        Index("ix_events_source_key", "source_key", unique=True),
+        Index("ix_events_correlation", "rule_version", "source", "ingested_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     observed_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    ingest_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    ingested_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    source_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    source_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    rule_version: Mapped[str | None] = mapped_column(ForeignKey("rule_versions.id"), nullable=True)
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
+    observed_quality: Mapped[str] = mapped_column(String(30), nullable=False, default="recorded")
+    ingest_order_origin: Mapped[str] = mapped_column(String(30), nullable=False, default="recorded")
     source: Mapped[str] = mapped_column(String(30), nullable=False)
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -159,6 +259,7 @@ class EventQuery(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", str_strip_whitespace=True)
 
     severity: Severity | None = None
+    severities: tuple[Severity, ...] = ()
     source: EventSource | None = None
     target: str | None = Field(default=None, min_length=1, max_length=253)
     text: str | None = Field(default=None, min_length=1, max_length=200)
@@ -187,6 +288,28 @@ class StoredEvent(SecurityEvent):
     """A persisted event with explainable detection signals."""
 
     signals: tuple[DetectionSignal, ...] = ()
+    ingest_seq: int | None = Field(default=None, ge=1)
+    ingest_order_origin: Literal["recorded", "legacy_reconstructed"] = "recorded"
+
+
+class RelatedObservation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    event: StoredEvent
+    link: IncidentLink
+
+
+class RelatedPage(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    items: tuple[RelatedObservation, ...]
+    watermark: int
+    next_before: int | None
+    has_more: bool
+
+
+class IncidentReport(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    history: IncidentHistory
+    observations: tuple[StoredEvent, ...]
 
 
 InvestigationStatus = Literal["queued", "running", "complete", "failed"]
@@ -324,69 +447,154 @@ class DatabaseInfo(BaseModel):
 class Repository:
     """Method-scoped async persistence with detached typed results."""
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, *, read_only: bool = False) -> None:
         self.database_path = Path(database_path)
+        self.read_only = read_only
+        url = URL.create(
+            "sqlite+aiosqlite",
+            database=self.database_path.absolute().as_uri()
+            if read_only
+            else str(self.database_path),
+            query={"mode": "ro", "uri": "true"} if read_only else {},
+        )
         self._engine: AsyncEngine = create_async_engine(
-            URL.create("sqlite+aiosqlite", database=str(self.database_path)),
+            url,
             echo=False,
         )
         self._sessions = async_sessionmaker(self._engine, expire_on_commit=False)
+        self.incidents = IncidentStore(self._sessions)
         event.listen(self._engine.sync_engine, "connect", _configure_sqlite)
 
     async def initialize(self) -> None:
+        """Initialize a new home or migrate existing data under the owner's lock."""
+        if self.read_only:
+            raise RuntimeError("Cannot initialize or migrate a read-only repository")
         _validate_database_files(self.database_path)
         self.database_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         _validate_database_files(self.database_path)
         async with self._engine.connect() as connection:
-            table_names = await connection.run_sync(
-                lambda sync_connection: inspect(sync_connection).get_table_names()
-            )
-            if "schema_meta" not in table_names and table_names:
-                raise RuntimeError("SocketClaw database has tables but no schema metadata")
-            if "schema_meta" in table_names:
-                version_value = (
-                    await connection.execute(
-                        select(SchemaMetaRow.value).where(SchemaMetaRow.key == "schema_version")
-                    )
-                ).scalar_one_or_none()
-                if version_value is not None:
-                    _require_schema_version(version_value)
+            # Inspect before setting WAL or changing permissions on an unknown schema.
+            version = await self._schema_version(connection)
+            if version is not None and (version < 1 or version > SCHEMA_VERSION):
+                raise RuntimeError(f"Unsupported SocketClaw schema version {version}")
+            await connection.commit()
             await _enable_wal(connection)
             await connection.commit()
             await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            backup = None
             try:
-                await connection.run_sync(Base.metadata.create_all)
-                await connection.execute(
-                    sqlite_insert(SchemaMetaRow)
-                    .values(key="schema_version", value=str(SCHEMA_VERSION))
-                    .on_conflict_do_nothing(index_elements=[SchemaMetaRow.key])
-                )
-                version_value = (
+                version = await self._schema_version(connection)
+                if version is None:
+                    await connection.run_sync(Base.metadata.create_all)
                     await connection.execute(
-                        select(SchemaMetaRow.value).where(SchemaMetaRow.key == "schema_version")
+                        sqlite_insert(SchemaMetaRow),
+                        [
+                            {"key": "schema_version", "value": str(SCHEMA_VERSION)},
+                            {"key": "ingest_sequence", "value": "0"},
+                        ],
                     )
-                ).scalar_one_or_none()
-                _require_schema_version(version_value)
-            except BaseException:
-                await connection.rollback()
-                raise
-            else:
+                elif version < SCHEMA_VERSION:
+                    worker = asyncio.create_task(
+                        asyncio.to_thread(recovery_backup, self.database_path, version)
+                    )
+                    try:
+                        backup = await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        await worker
+                        raise
+                    before = await self._historical_counts(connection)
+                    for destination in range(version + 1, SCHEMA_VERSION + 1):
+                        migration = {2: migrate_v1_to_v2, 3: migrate_v2_to_v3, 4: migrate_v3_to_v4}[
+                            destination
+                        ]
+                        await migration(connection)
+                        await connection.execute(
+                            sqlite_insert(MigrationRow).values(
+                                version=destination,
+                                applied_at=_timestamp(utc_now()),
+                                backup_path=str(backup.path),
+                                backup_sha256=backup.sha256,
+                            )
+                        )
+                    await connection.execute(
+                        update(SchemaMetaRow)
+                        .where(SchemaMetaRow.key == "schema_version")
+                        .values(value=str(SCHEMA_VERSION))
+                    )
+                    await self._validate_domain_rows(connection)
+                    if await self._historical_counts(connection) != before:
+                        raise RuntimeError("Migration changed historical row counts")
+                    if (await connection.exec_driver_sql("PRAGMA foreign_key_check")).all():
+                        raise RuntimeError("Migration failed foreign key validation")
+                    if (await connection.exec_driver_sql("PRAGMA quick_check")).scalars().all() != [
+                        "ok"
+                    ]:
+                        raise RuntimeError("Migration failed integrity validation")
+                elif version != SCHEMA_VERSION:
+                    raise RuntimeError(f"Unsupported SocketClaw schema version {version}")
                 await connection.commit()
+            except BaseException as exc:
+                await connection.rollback()
+                if isinstance(exc, Exception) and backup is not None:
+                    raise RuntimeError(
+                        f"Migration rolled back. Recovery backup: {backup.path}. {exc}"
+                    ) from exc
+                raise
         try:
             os.chmod(self.database_path, 0o600)
         except OSError as exc:
             raise RuntimeError("Cannot secure the SocketClaw database file") from exc
 
+    async def _schema_version(self, connection: AsyncConnection) -> int | None:
+        names = await connection.run_sync(lambda sync: inspect(sync).get_table_names())
+        if not names:
+            return None
+        if "schema_meta" not in names:
+            raise RuntimeError("SocketClaw database has tables but no schema metadata")
+        value = (
+            await connection.execute(
+                select(SchemaMetaRow.value).where(SchemaMetaRow.key == "schema_version")
+            )
+        ).scalar_one_or_none()
+        if value is None:
+            raise RuntimeError("SocketClaw database has no schema version")
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid SocketClaw schema version {value!r}") from exc
+
+    async def _historical_counts(self, connection: AsyncConnection) -> tuple[int, ...]:
+        return tuple(
+            [
+                int(
+                    (await connection.execute(select(func.count()).select_from(table))).scalar_one()
+                )
+                for table in (EventRow, InvestigationRow, ResponseProposalRow, RunRow)
+            ]
+        )
+
+    async def require_current_schema(self) -> None:
+        """Read-only compatibility check; never initialize, migrate, or recover work."""
+        _validate_database_files(self.database_path)
+        if not self.database_path.exists():
+            raise FileNotFoundError("SocketClaw database has not been created")
+        async with self._engine.connect() as connection:
+            version = await self._schema_version(connection)
+        _require_schema_version(str(version) if version is not None else None)
+
     async def close(self) -> None:
         await self._engine.dispose()
 
     async def database_info(self) -> DatabaseInfo:
+        await self.require_current_schema()
         async with self._engine.connect() as connection:
             journal_mode = (await connection.exec_driver_sql("PRAGMA journal_mode")).scalar_one()
             foreign_keys = (await connection.exec_driver_sql("PRAGMA foreign_keys")).scalar_one()
             integrity_values = (
                 (await connection.exec_driver_sql("PRAGMA quick_check")).scalars().all()
             )
+            if (await connection.exec_driver_sql("PRAGMA foreign_key_check")).all():
+                raise RuntimeError("SocketClaw database failed foreign key validation")
             if [str(value) for value in integrity_values] != ["ok"]:
                 raise RuntimeError("SocketClaw database failed SQLite quick_check")
         async with self._sessions() as session:
@@ -401,9 +609,69 @@ class Repository:
             foreign_keys=bool(foreign_keys),
         )
 
-    async def _validate_domain_rows(self) -> None:
+    async def _validate_domain_rows(self, connection: AsyncConnection | None = None) -> None:
         """Stream every persisted record through its safe domain decoder."""
-        async with self._sessions() as session:
+        sessions = (
+            async_sessionmaker(connection, expire_on_commit=False) if connection else self._sessions
+        )
+        async with sessions() as session:
+            try:
+                await validate_incidents(session)
+            except Exception as exc:
+                raise RuntimeError("SocketClaw database has invalid incident history") from exc
+            counter = await session.get(SchemaMetaRow, "ingest_sequence")
+            maximum = await session.scalar(select(func.max(EventRow.ingest_seq)))
+            if (
+                counter is None
+                or not counter.value.isdecimal()
+                or int(counter.value) < (maximum or 0)
+            ):
+                raise RuntimeError("SocketClaw database has an invalid ingestion watermark")
+            checkpoints = await session.stream_scalars(select(ProbeCheckpointRow))
+            async for checkpoint in checkpoints:
+                try:
+                    if checkpoint.revision < 1 or not 0 <= checkpoint.committed_seq <= int(
+                        counter.value
+                    ):
+                        raise ValueError("invalid checkpoint revision or sequence")
+                    _parse_timestamp(checkpoint.updated_at)
+                    if checkpoint.probe_id.startswith("log:"):
+                        LogCheckpointState.model_validate_json(checkpoint.state_json)
+                    elif checkpoint.probe_id.startswith("ports:"):
+                        PortBaselineState.model_validate_json(checkpoint.state_json)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "SocketClaw database has an invalid collector checkpoint"
+                    ) from exc
+            gaps = await session.stream_scalars(select(IngestGapRow))
+            async for gap in gaps:
+                try:
+                    decoded = IngestGap.model_validate_json(gap.gap_json)
+                    if str(decoded.id) != gap.id or decoded.probe_id != gap.probe_id:
+                        raise ValueError("gap identity mismatch")
+                    if not 0 <= gap.committed_seq <= int(counter.value):
+                        raise ValueError("gap sequence exceeds ingestion watermark")
+                except Exception as exc:
+                    raise RuntimeError("SocketClaw database has an invalid ingestion gap") from exc
+            health_rows = await session.stream_scalars(select(ProbeHealthRow))
+            async for health in health_rows:
+                try:
+                    decoded_health = ProbeHealth.model_validate_json(health.health_json)
+                    if decoded_health.probe_id != health.probe_id:
+                        raise ValueError("health identity mismatch")
+                except Exception as exc:
+                    raise RuntimeError(
+                        "SocketClaw database has an invalid probe health record"
+                    ) from exc
+            versions = await session.stream_scalars(select(RuleVersionRow))
+            async for version in versions:
+                try:
+                    _rule_version(version)
+                except Exception as exc:
+                    raise RuntimeError("SocketClaw database has an invalid rule version") from exc
+            active = await session.get(SchemaMetaRow, "active_rule_version")
+            if active is not None and await session.get(RuleVersionRow, active.value) is None:
+                raise RuntimeError("Active rule version is missing")
             event_rows = await session.stream_scalars(select(EventRow))
             async for row in event_rows:
                 try:
@@ -441,44 +709,265 @@ class Repository:
         security_event: SecurityEvent,
         detection: DetectionResult,
     ) -> StoredEvent:
-        normalized = security_event.model_copy(
-            update={
-                "score": detection.score,
-                "severity": detection.severity,
-            }
-        )
-        evidence_json = json.dumps(
-            normalized.evidence,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        if len(evidence_json.encode("utf-8")) > _EVIDENCE_MAX_BYTES:
-            raise ValueError(f"event evidence must not exceed {_EVIDENCE_MAX_BYTES} UTF-8 bytes")
-        row = EventRow(
-            id=str(normalized.id),
-            observed_at=_timestamp(normalized.observed_at),
-            source=normalized.source.value,
-            event_type=normalized.event_type,
-            title=normalized.title,
-            summary=normalized.summary,
-            target=normalized.target,
-            evidence_json=evidence_json,
-            score=normalized.score,
-            severity=normalized.severity.value,
-            signals_json=json.dumps(
-                [signal.model_dump(mode="json") for signal in detection.signals],
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-            investigation_state=normalized.investigation_state.value,
-            created_at=_timestamp(normalized.created_at),
-        )
+        row = _event_row(security_event, detection)
         async with self._sessions() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
+            counter = await session.get(SchemaMetaRow, "ingest_sequence")
+            if counter is None or not counter.value.isdecimal():
+                raise RuntimeError("Missing or invalid ingest sequence counter")
+            row.ingest_seq = int(counter.value) + 1
+            counter.value = str(row.ingest_seq)
             session.add(row)
             await session.commit()
         return _stored_event(row)
+
+    async def load_checkpoint(self, probe_id: str) -> CheckpointChange:
+        async with self._sessions() as session:
+            row = await session.get(ProbeCheckpointRow, probe_id)
+            if row is None:
+                return CheckpointChange(probe_id=probe_id, expected_revision=0, state={})
+            return CheckpointChange(
+                probe_id=probe_id,
+                expected_revision=row.revision,
+                state=json.loads(row.state_json),
+            )
+
+    async def save_probe_health(self, health: ProbeHealth) -> None:
+        """Replace the projection and audit meaningful state transitions together."""
+        async with self._sessions() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
+            previous = await session.get(ProbeHealthRow, health.probe_id)
+            previous_health = (
+                ProbeHealth.model_validate_json(previous.health_json) if previous else None
+            )
+            payload = health.model_dump_json()
+            if previous_health is None or (
+                previous_health.state,
+                previous_health.error_kind,
+                previous_health.error,
+            ) != (health.state, health.error_kind, health.error):
+                session.add(
+                    HealthTransitionRow(
+                        id=str(uuid4()),
+                        probe_id=health.probe_id,
+                        recorded_at=_timestamp(health.updated_at),
+                        health_json=payload,
+                    )
+                )
+            await session.merge(ProbeHealthRow(probe_id=health.probe_id, health_json=payload))
+            await session.commit()
+
+    async def list_probe_health(self, probe_ids: Collection[str]) -> list[ProbeHealth]:
+        if not probe_ids:
+            return []
+        async with self._sessions() as session:
+            rows = await session.scalars(
+                select(ProbeHealthRow).where(ProbeHealthRow.probe_id.in_(probe_ids))
+            )
+            return [ProbeHealth.model_validate_json(row.health_json) for row in rows]
+
+    async def list_health_transitions(self, probe_id: str, *, limit: int = 50) -> list[ProbeHealth]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("health history limit must be between 1 and 1000")
+        async with self._sessions() as session:
+            rows = await session.scalars(
+                select(HealthTransitionRow)
+                .where(HealthTransitionRow.probe_id == probe_id)
+                .order_by(HealthTransitionRow.recorded_at.desc(), HealthTransitionRow.id)
+                .limit(limit)
+            )
+            return [ProbeHealth.model_validate_json(row.health_json) for row in rows]
+
+    async def list_ingest_gaps(self, probe_id: str, *, limit: int = 100) -> list[IngestGap]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("gap query limit must be between 1 and 1000")
+        async with self._sessions() as session:
+            rows = await session.scalars(
+                select(IngestGapRow)
+                .where(IngestGapRow.probe_id == probe_id)
+                .order_by(IngestGapRow.committed_seq.desc(), IngestGapRow.id)
+                .limit(limit)
+            )
+            return [IngestGap.model_validate_json(row.gap_json) for row in rows]
+
+    async def _activate_rules(self, session: AsyncSession, config: RuleConfig) -> UUID:
+        active = await session.get(SchemaMetaRow, "active_rule_version")
+        if active is not None:
+            row = await session.get(RuleVersionRow, active.value)
+            if row is None:
+                raise RuntimeError("Active rule version is missing")
+            version = _rule_version(row)
+            if version.fingerprint == config.fingerprint:
+                return version.id
+        identifier = uuid4()
+        session.add(
+            RuleVersionRow(
+                id=str(identifier),
+                applied_at=_timestamp(utc_now()),
+                snapshot_json=config.snapshot(),
+                fingerprint=config.fingerprint,
+            )
+        )
+        await session.flush()
+        await session.merge(SchemaMetaRow(key="active_rule_version", value=str(identifier)))
+        await session.flush()
+        return identifier
+
+    async def get_rule_version(self, identifier: UUID) -> RuleVersion | None:
+        async with self._sessions() as session:
+            row = await session.get(RuleVersionRow, str(identifier))
+            return _rule_version(row) if row else None
+
+    async def ingest_batch(self, batch: ProbeBatch, detector: Detector) -> list[StoredEvent]:
+        """Commit observations, deduplication receipt, and cursors together.
+
+        A repeated receipt returns no new events. Failed or canceled transactions
+        leave both the observation sequence and collector checkpoints untouched.
+        """
+        if not batch.observations and not batch.checkpoints and not batch.gaps:
+            return []
+        payload_hash = hashlib.sha256(batch.model_dump_json().encode()).hexdigest()
+        stored: list[StoredEvent] = []
+        async with self._sessions() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
+            receipt = await session.get(IngestBatchRow, str(batch.batch_id))
+            if receipt is not None:
+                if receipt.payload_hash != payload_hash:
+                    raise ValueError("Batch ID was reused with different content")
+                return []
+            for candidate in batch.checkpoints:
+                checkpoint = await session.get(ProbeCheckpointRow, candidate.probe_id)
+                actual_revision = checkpoint.revision if checkpoint is not None else 0
+                if actual_revision != candidate.expected_revision:
+                    raise ValueError("Collector checkpoint changed before this batch committed")
+            counter = await session.get(SchemaMetaRow, "ingest_sequence")
+            if counter is None or not counter.value.isdecimal():
+                raise RuntimeError("Missing or invalid ingest sequence counter")
+            rule_version: UUID | None = None
+            for observation in batch.observations:
+                if observation.source_key is not None:
+                    existing = (
+                        await session.execute(
+                            select(EventRow.id).where(EventRow.source_key == observation.source_key)
+                        )
+                    ).scalar_one_or_none()
+                    if existing is not None:
+                        continue
+                if rule_version is None:
+                    rule_version = await self._activate_rules(session, detector.config)
+                observation = observation.model_copy(
+                    update={
+                        "ingested_at": batch.collected_at,
+                        "rule_version": rule_version,
+                    }
+                )
+                recent = await self.correlation_history(
+                    observation, detector.window, session=session
+                )
+                detection = detector.score(observation, recent)
+                row = _event_row(observation, detection)
+                row.ingest_seq = int(counter.value) + 1
+                counter.value = str(row.ingest_seq)
+                session.add(row)
+                await session.flush()
+                await project_observation(session, observation, detection, detector.config)
+                stored.append(_stored_event(row))
+            for candidate in batch.checkpoints:
+                state_json = json.dumps(candidate.state, separators=(",", ":"), allow_nan=False)
+                if len(state_json.encode()) > 64 * 1024:
+                    raise ValueError("Collector checkpoint exceeds 64 KiB")
+                await session.merge(
+                    ProbeCheckpointRow(
+                        probe_id=candidate.probe_id,
+                        revision=candidate.expected_revision + 1,
+                        state_json=state_json,
+                        committed_seq=int(counter.value),
+                        updated_at=_timestamp(utc_now()),
+                    )
+                )
+            for gap in batch.gaps:
+                session.add(
+                    IngestGapRow(
+                        id=str(gap.id),
+                        probe_id=gap.probe_id,
+                        gap_json=gap.model_dump_json(),
+                        committed_seq=int(counter.value),
+                    )
+                )
+            session.add(
+                IngestBatchRow(
+                    batch_id=str(batch.batch_id),
+                    payload_hash=payload_hash,
+                    committed_seq=int(counter.value),
+                    committed_at=_timestamp(utc_now()),
+                )
+            )
+            await session.commit()
+        return stored
+
+    async def incident_report(self, identifier: UUID) -> IncidentReport | None:
+        async with self._sessions() as session:
+            await session.execute(text("BEGIN"))
+            history = await read_history(session, identifier)
+            if history is None:
+                return None
+            rows = await session.scalars(
+                select(EventRow)
+                .join(IncidentLinkRow, IncidentLinkRow.event_id == EventRow.id)
+                .where(IncidentLinkRow.incident_id == str(identifier))
+                .order_by(EventRow.ingest_seq, EventRow.id)
+            )
+            return IncidentReport(
+                history=history, observations=tuple(_stored_event(row) for row in rows)
+            )
+
+    async def incident_observations(
+        self,
+        identifier: UUID,
+        *,
+        watermark: int | None = None,
+        before: int | None = None,
+        limit: int = 100,
+    ) -> RelatedPage:
+        if not 1 <= limit <= 200:
+            raise ValueError("Observation page size must be 1-200")
+        async with self._sessions() as session:
+            await session.execute(text("BEGIN"))
+            if watermark is None:
+                watermark = int(
+                    await session.scalar(
+                        select(func.max(EventRow.ingest_seq))
+                        .join(IncidentLinkRow, IncidentLinkRow.event_id == EventRow.id)
+                        .where(IncidentLinkRow.incident_id == str(identifier))
+                    )
+                    or 0
+                )
+            query = (
+                select(EventRow, IncidentLinkRow)
+                .join(IncidentLinkRow, IncidentLinkRow.event_id == EventRow.id)
+                .where(
+                    IncidentLinkRow.incident_id == str(identifier), EventRow.ingest_seq <= watermark
+                )
+            )
+            if before is not None:
+                query = query.where(EventRow.ingest_seq < before)
+            rows = (
+                await session.execute(query.order_by(EventRow.ingest_seq.desc()).limit(limit + 1))
+            ).all()
+            items = tuple(
+                RelatedObservation(
+                    event=_stored_event(event),
+                    link=IncidentLink.model_validate_json(link.data_json),
+                )
+                for event, link in rows[:limit]
+            )
+            more = len(rows) > limit
+            return RelatedPage(
+                items=items,
+                watermark=watermark,
+                has_more=more,
+                next_before=items[-1].event.ingest_seq if more else None,
+            )
 
     async def get_event(self, event_id: UUID) -> StoredEvent | None:
         async with self._sessions() as session:
@@ -493,6 +982,10 @@ class Repository:
         statement = select(EventRow)
         if filters.severity is not None:
             statement = statement.where(EventRow.severity == filters.severity.value)
+        if filters.severities:
+            statement = statement.where(
+                EventRow.severity.in_([severity.value for severity in filters.severities])
+            )
         if filters.source is not None:
             statement = statement.where(EventRow.source == filters.source.value)
         if filters.target is not None:
@@ -523,6 +1016,44 @@ class Repository:
         )
         async with self._sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
+        return [_stored_event(row) for row in rows]
+
+    async def correlation_history(
+        self, observation: SecurityEvent, window: timedelta, *, session: AsyncSession | None = None
+    ) -> list[StoredEvent]:
+        """Read the exact rule window independently of UI history limits.
+
+        The monitor serializes this query with scoring and persistence under its
+        ingest lock. Only committed observations contribute, including on restart.
+        """
+        if observation.ingested_at is None or observation.source not in {
+            EventSource.PING,
+            EventSource.LOG,
+        }:
+            return []
+        statement = select(EventRow).where(
+            EventRow.source == observation.source.value,
+            EventRow.id != str(observation.id),
+            EventRow.ingested_at >= _timestamp(observation.ingested_at - window),
+            EventRow.ingested_at <= _timestamp(observation.ingested_at),
+            EventRow.rule_version
+            == (str(observation.rule_version) if observation.rule_version else None),
+        )
+        if observation.target is not None:
+            statement = statement.where(func.lower(EventRow.target) == observation.target.lower())
+        else:
+            path = observation.evidence.get("path")
+            if observation.source != EventSource.LOG or not isinstance(path, str) or not path:
+                return []
+            statement = statement.where(
+                EventRow.target.is_(None),
+                func.json_extract(EventRow.evidence_json, "$.path") == path,
+            )
+        if session is not None:
+            rows = (await session.execute(statement)).scalars().all()
+        else:
+            async with self._sessions() as reader:
+                rows = (await reader.execute(statement)).scalars().all()
         return [_stored_event(row) for row in rows]
 
     async def queue_investigation(
@@ -1070,10 +1601,64 @@ def _validate_database_files(database_path: Path) -> None:
             raise RuntimeError(f"SocketClaw database path must not be hard-linked: {candidate}")
 
 
+def _event_row(security_event: SecurityEvent, detection: DetectionResult) -> EventRow:
+    normalized = security_event.model_copy(
+        update={
+            "score": detection.score,
+            "severity": detection.severity,
+        }
+    )
+    evidence_json = json.dumps(
+        normalized.evidence,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(evidence_json.encode("utf-8")) > _EVIDENCE_MAX_BYTES:
+        raise ValueError(f"event evidence must not exceed {_EVIDENCE_MAX_BYTES} UTF-8 bytes")
+    return EventRow(
+        id=str(normalized.id),
+        observed_at=_timestamp(normalized.observed_at),
+        ingested_at=_timestamp(normalized.ingested_at or utc_now()),
+        source_at=_timestamp(normalized.source_at) if normalized.source_at else None,
+        source_key=normalized.source_key,
+        rule_version=str(normalized.rule_version) if normalized.rule_version else None,
+        outcome=normalized.outcome.value,
+        observed_quality=normalized.observed_quality,
+        ingest_order_origin="recorded",
+        source=normalized.source.value,
+        event_type=normalized.event_type,
+        title=normalized.title,
+        summary=normalized.summary,
+        target=normalized.target,
+        evidence_json=evidence_json,
+        score=normalized.score,
+        severity=normalized.severity.value,
+        signals_json=json.dumps(
+            [signal.model_dump(mode="json") for signal in detection.signals],
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        investigation_state=normalized.investigation_state.value,
+        created_at=_timestamp(normalized.created_at),
+    )
+
+
 def _stored_event(row: EventRow) -> StoredEvent:
     return StoredEvent(
         id=UUID(row.id),
         observed_at=_parse_timestamp(row.observed_at),
+        ingest_seq=row.ingest_seq,
+        ingest_order_origin=cast(
+            Literal["recorded", "legacy_reconstructed"], row.ingest_order_origin
+        ),
+        ingested_at=_parse_timestamp(row.ingested_at) if row.ingested_at else None,
+        source_at=_parse_timestamp(row.source_at) if row.source_at else None,
+        source_key=row.source_key,
+        rule_version=UUID(row.rule_version) if row.rule_version else None,
+        outcome=ObservationOutcome(row.outcome),
+        observed_quality=cast(Literal["recorded", "legacy_unknown"], row.observed_quality),
         source=EventSource(row.source),
         event_type=_normalize_legacy_required_text(
             row.event_type,
@@ -1162,6 +1747,11 @@ def _require_schema_version(value: str | None) -> None:
         version = int(value)
     except ValueError as exc:
         raise RuntimeError(f"Invalid SocketClaw schema version {value!r}") from exc
+    if 1 <= version < SCHEMA_VERSION:
+        raise RuntimeError(
+            f"SocketClaw schema {version} needs migration to {SCHEMA_VERSION}; "
+            "run socketclaw db migrate or launch the TUI"
+        )
     if version != SCHEMA_VERSION:
         raise RuntimeError(f"Unsupported SocketClaw schema version {value}")
 
@@ -1394,3 +1984,12 @@ def _validate_proposal_target(
         raise ValueError("block proposal requires an IP event target") from exc
     if ipaddress.ip_address(proposal.target_ip) != observed_target:
         raise ValueError("block proposal target does not match the event target")
+
+
+def _rule_version(row: RuleVersionRow) -> RuleVersion:
+    return RuleVersion(
+        id=UUID(row.id),
+        applied_at=_parse_timestamp(row.applied_at),
+        snapshot_json=row.snapshot_json,
+        fingerprint=row.fingerprint,
+    )

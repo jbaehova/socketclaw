@@ -20,6 +20,7 @@ def ping_event(target: str = "1.1.1.1") -> SecurityEvent:
         summary="The ping probe received no replies.",
         target=target,
         evidence={"packet_loss": 100.0},
+        outcome="unreachable",
     )
 
 
@@ -183,6 +184,7 @@ async def test_slow_subscriber_keeps_newest_events_without_blocking_monitor(
     fourth = await monitor.process_event(ping_event("4.4.4.4"))
 
     queued = [await anext(stream), await anext(stream)]
+    assert monitor.status.dropped_notifications == 1
     await stream.aclose()
     assert [item.target for item in queued] == ["3.3.3.3", "4.4.4.4"]
     assert second.target not in {item.target for item in queued}
@@ -332,7 +334,7 @@ async def test_concurrent_processing_preserves_burst_history(
     repository: Repository,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_save = repository.save_event
+    original_save = repository.ingest_batch
     first_save_started = asyncio.Event()
     release_first_save = asyncio.Event()
     save_calls = 0
@@ -345,7 +347,7 @@ async def test_concurrent_processing_preserves_burst_history(
             await release_first_save.wait()
         return await original_save(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(repository, "save_event", delayed_save)
+    monkeypatch.setattr(repository, "ingest_batch", delayed_save)
     monitor = MonitorService(repository, Detector())
     tasks = [asyncio.create_task(monitor.process_event(ping_event("4.4.4.4"))) for _ in range(4)]
     await asyncio.wait_for(first_save_started.wait(), timeout=1.0)
@@ -461,3 +463,71 @@ async def test_healthy_job_does_not_clear_another_jobs_warning(
 
     assert monitor.status.last_error == "broken probe"
     await monitor.stop()
+
+
+@pytest.mark.parametrize("kind", ["ping", "auth", "auth-path"])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_correlation_survives_ten_thousand_unrelated_observations(
+    repository: Repository, restart: bool, kind: str
+) -> None:
+    from uuid import uuid4
+
+    from sqlalchemy import insert, select, update
+
+    from socketclaw.storage import EventRow, SchemaMetaRow
+
+    monitor = MonitorService(repository, Detector())
+
+    def observation() -> SecurityEvent:
+        if kind == "ping":
+            return ping_event("important.example")
+        return SecurityEvent(
+            source="log",
+            event_type="log.auth_failure",
+            title="Authentication failure",
+            summary="Failed password",
+            target="important.example" if kind == "auth" else None,
+            evidence={"message": "Failed password", "path": "/var/log/auth.log"},
+        )
+
+    for _ in range(3 if kind == "ping" else 5):
+        await monitor.process_event(observation())
+    seed = await monitor.process_event(ping_event("unrelated.example"))
+    # Populate real durable history without paying 10,000 separate commits in a fixture.
+    async with repository._engine.begin() as connection:
+        row = (
+            (
+                await connection.execute(
+                    select(EventRow.__table__).where(EventRow.id == str(seed.id))
+                )
+            )
+            .mappings()
+            .one()
+        )
+        await connection.execute(
+            insert(EventRow),
+            [
+                dict(row, id=str(uuid4()), ingest_seq=row["ingest_seq"] + index)
+                for index in range(1, 10_001)
+            ],
+        )
+        await connection.execute(
+            update(SchemaMetaRow)
+            .where(SchemaMetaRow.key == "ingest_sequence")
+            .values(value=str(row["ingest_seq"] + 10_000))
+        )
+    if restart:
+        monitor = MonitorService(repository, Detector())
+        await monitor.start()
+    else:
+        # Exercise live cache eviction as well as durable restart recovery.
+        for index in range(501):
+            await monitor.process_event(ping_event(f"live-{index}.example"))
+    try:
+        event = await monitor.process_event(observation())
+        assert event.score == (95 if kind == "ping" else 100)
+        assert ("ping.sustained_loss" if kind == "ping" else "log.auth_burst") in {
+            signal.code for signal in event.signals
+        }
+    finally:
+        await monitor.stop()

@@ -128,16 +128,18 @@ async def test_ping_probe_uses_windows_arguments_and_parses_summary() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ping_timeout_becomes_complete_loss_event() -> None:
+async def test_ping_deadline_is_unknown_not_measured_packet_loss() -> None:
     async def runner(_command: list[str], _timeout: float) -> CommandResult:
         raise TimeoutError("ping command exceeded deadline")
 
     result = await PingProbe(runner=runner).collect("1.1.1.1")
 
     assert result.event_type == "ping.result"
-    assert result.evidence["packet_loss"] == 100.0
+    assert result.evidence.get("packet_loss") is None
+    assert result.evidence["outcome"] == "unknown"
+    assert result.evidence["reason"] == "deadline_exceeded"
     assert result.evidence["error"] == "ping command exceeded deadline"
-    assert result.title == "1.1.1.1 is unreachable"
+    assert result.title == "Ping result unknown for 1.1.1.1"
 
 
 @pytest.mark.asyncio
@@ -163,9 +165,10 @@ async def test_ping_success_with_localized_statistics_is_not_false_total_loss() 
 
     result = await PingProbe(runner=runner).collect("example.com")
 
-    assert result.evidence["packet_loss"] == 0.0
+    assert result.evidence.get("packet_loss") is None
     assert result.evidence["statistics_parsed"] is False
-    assert result.title == "example.com is reachable"
+    assert result.evidence["outcome"] == "unknown"
+    assert result.title == "Ping result unknown for example.com"
 
 
 @pytest.mark.asyncio
@@ -331,7 +334,8 @@ async def test_indeterminate_port_result_does_not_report_false_closure() -> None
     result = await probe.collect("127.0.0.1", [22])
 
     assert baseline.evidence["open_ports"] == [22]
-    assert result.evidence["open_ports"] == [22]
+    assert result.evidence["open_ports"] == []
+    assert result.evidence["last_known_open_ports"] == [22]
     assert result.evidence["newly_closed"] == []
     assert result.evidence["unresolved_ports"] == [22]
     assert result.title == "Port scan incomplete on 127.0.0.1"
@@ -346,7 +350,9 @@ async def test_log_probe_reads_only_appended_matching_lines(tmp_path: Path) -> N
     assert await probe.poll() == []
     with log_path.open("a") as stream:
         stream.write("normal service message\n")
-        stream.write("Jul 27 sshd[42]: Failed password for root from 10.0.0.8 port 50122\n")
+        stream.write(
+            "Jul 27 12:00:00 server sshd[42]: Failed password for root from 10.0.0.8 port 50122\n"
+        )
 
     events = await probe.poll()
 
@@ -547,7 +553,7 @@ async def test_one_unreadable_log_does_not_block_other_paths(
     probe = LogProbe([unreadable, readable])
     first = await probe.poll()
     with readable.open("a") as stream:
-        stream.write("Failed password from 10.0.0.22\n")
+        stream.write("Failed password for root from 10.0.0.22\n")
 
     second = await probe.poll()
 

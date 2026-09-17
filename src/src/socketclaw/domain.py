@@ -27,6 +27,14 @@ class Severity(StrEnum):
     CRITICAL = "critical"
 
 
+class ObservationOutcome(StrEnum):
+    OK = "ok"
+    PARTIAL = "partial"
+    UNREACHABLE = "unreachable"
+    UNKNOWN = "unknown"
+    ERROR = "error"
+
+
 class EventSource(StrEnum):
     PING = "ping"
     PORT_SCAN = "port_scan"
@@ -89,6 +97,12 @@ class SecurityEvent(BaseModel):
 
     id: UUID = Field(default_factory=uuid4)
     observed_at: datetime = Field(default_factory=utc_now)
+    ingested_at: datetime | None = None
+    source_at: datetime | None = None
+    rule_version: UUID | None = None
+    source_key: str | None = Field(default=None, min_length=1, max_length=200)
+    outcome: ObservationOutcome = ObservationOutcome.UNKNOWN
+    observed_quality: Literal["recorded", "legacy_unknown"] = "recorded"
     source: EventSource
     event_type: str = Field(min_length=1, max_length=100)
     title: str = Field(min_length=1, max_length=200)
@@ -99,6 +113,15 @@ class SecurityEvent(BaseModel):
     severity: Severity = Severity.INFO
     investigation_state: InvestigationState = InvestigationState.NOT_REQUESTED
     created_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("ingested_at", "source_at")
+    @classmethod
+    def require_optional_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError("timestamps must include a timezone")
+        return value.astimezone(UTC)
 
     @field_validator("observed_at", "created_at")
     @classmethod

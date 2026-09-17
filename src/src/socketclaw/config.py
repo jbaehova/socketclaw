@@ -18,6 +18,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from .rules import RuleConfig
+
 ModelKey = Literal["luna"]
 ReasoningEffort = Literal["medium", "high"]
 Port = Annotated[int, Field(strict=True, ge=1, le=65535)]
@@ -66,10 +68,12 @@ class AppConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
+    rules: RuleConfig = Field(default_factory=RuleConfig)
     model: ModelKey = "luna"
     targets: list[str] = Field(default_factory=lambda: ["1.1.1.1"], max_length=256)
     ping_interval: float = Field(default=5.0, ge=1.0, le=3600.0)
     scan_interval: float = Field(default=60.0, ge=5.0, le=86400.0)
+    port_baseline_ttl: float = Field(default=86400.0, ge=1.0, le=2592000.0)
     ports: list[Port] = Field(
         default_factory=lambda: [22, 53, 80, 443, 3389, 5432, 6379, 8080],
         max_length=1024,
@@ -131,7 +135,7 @@ class AppConfig(BaseModel):
             raise ValueError("theme cannot contain control characters")
         return normalized
 
-    @field_validator("ping_interval", "scan_interval", mode="before")
+    @field_validator("ping_interval", "scan_interval", "port_baseline_ttl", mode="before")
     @classmethod
     def reject_boolean_intervals(cls, value: object) -> object:
         if isinstance(value, bool):
@@ -414,10 +418,17 @@ def _config_as_toml(config: AppConfig) -> str:
         f"targets = {_toml_value(values['targets'])}",
         f"ping_interval = {values['ping_interval']}",
         f"scan_interval = {values['scan_interval']}",
+        f"port_baseline_ttl = {values['port_baseline_ttl']}",
         f"ports = {_toml_value(values['ports'])}",
         f"log_paths = {_toml_value(values['log_paths'])}",
         f"theme = {_toml_value(values['theme'])}",
     ]
+    lines.extend(["", "[rules]"])
+    lines.extend(
+        f"{key} = {_toml_value(value)}" for key, value in values["rules"].items() if key != "points"
+    )
+    lines.extend(["", "[rules.points]"])
+    lines.extend(f"{key} = {value}" for key, value in values["rules"]["points"].items())
     return "\n".join(lines) + "\n"
 
 

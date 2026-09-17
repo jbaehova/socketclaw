@@ -9,6 +9,7 @@ from datetime import timedelta
 from typing import cast
 
 from .domain import DetectionResult, DetectionSignal, SecurityEvent, severity_for_score
+from .rules import RuleConfig
 
 _SENSITIVE_PORTS = {
     21,
@@ -44,7 +45,9 @@ _FIREWALL_DENIAL = re.compile(r"(?:firewall.*den(?:y|ied)|\bDROP\b|\bREJECT\b)",
 class Detector:
     """Score normalized events without requiring an AI or network connection."""
 
-    window = timedelta(minutes=5)
+    def __init__(self, config: RuleConfig | None = None) -> None:
+        self.config = config or RuleConfig()
+        self.window = timedelta(seconds=self.config.window_seconds)
 
     def score(
         self,
@@ -60,6 +63,10 @@ class Detector:
         elif event.source == "log":
             self._score_log(event, recent, signals)
 
+        signals = [
+            signal.model_copy(update={"points": self.config.points.for_code(signal.code)})
+            for signal in signals
+        ]
         score = min(100, sum(signal.points for signal in signals))
         return DetectionResult(
             score=score,
@@ -73,17 +80,19 @@ class Detector:
         recent: Sequence[SecurityEvent],
         signals: list[DetectionSignal],
     ) -> None:
+        if event.evidence.get("outcome") in {"error", "unknown"}:
+            return
         loss = _number(event.evidence.get("packet_loss"))
         if loss >= 100:
             signals.append(
                 _signal(
                     "ping.total_loss",
-                    "Target stopped responding",
+                    "No ICMP replies",
                     70,
-                    "Packet loss reached 100%.",
+                    "ICMP packet loss reached 100%; service availability is not established.",
                 )
             )
-        elif loss >= 50:
+        elif loss >= self.config.ping_high_loss_percent:
             signals.append(
                 _signal(
                     "ping.high_loss",
@@ -92,7 +101,7 @@ class Detector:
                     f"Packet loss reached {loss:g}%.",
                 )
             )
-        elif loss >= 20:
+        elif loss >= self.config.ping_degraded_percent:
             signals.append(
                 _signal(
                     "ping.degraded",
@@ -102,13 +111,18 @@ class Detector:
                 )
             )
 
-        if loss >= 50 and len(self._related(event, recent, minimum_loss=50)) >= 3:
+        if (
+            loss >= self.config.ping_high_loss_percent
+            and len(self._related(event, recent, minimum_loss=self.config.ping_high_loss_percent))
+            >= self.config.ping_sustained_count - 1
+        ):
             signals.append(
                 _signal(
                     "ping.sustained_loss",
                     "Packet loss is sustained",
                     25,
-                    "At least four high-loss observations occurred within five minutes.",
+                    f"At least {self.config.ping_sustained_count} high-loss observations occurred "
+                    f"within {self.config.window_seconds} seconds.",
                 )
             )
 
@@ -117,6 +131,19 @@ class Detector:
         event: SecurityEvent,
         signals: list[DetectionSignal],
     ) -> None:
+        initial_sensitive = sorted(
+            set(_ports(event.evidence.get("initial_open_ports"))) & _SENSITIVE_PORTS
+        )
+        if initial_sensitive:
+            signals.append(
+                _signal(
+                    "port.sensitive_exposure",
+                    "Sensitive service observed",
+                    35,
+                    f"First confirmed exposure of TCP ports: {_port_list(initial_sensitive)}. "
+                    "No prior closed state was established.",
+                )
+            )
         opened = _ports(event.evidence.get("newly_opened"))
         closed = _ports(event.evidence.get("newly_closed"))
         if opened:
@@ -138,7 +165,7 @@ class Detector:
                         f"Sensitive TCP ports opened: {_port_list(sensitive)}.",
                     )
                 )
-            if len(opened) >= 5:
+            if len(opened) >= self.config.port_open_count:
                 signals.append(
                     _signal(
                         "port.open_burst",
@@ -196,14 +223,14 @@ class Detector:
                     for term in _AUTH_FAILURE_TERMS
                 )
             ]
-            if len(matching) >= 5:
+            if len(matching) >= self.config.auth_failure_count - 1:
                 signals.append(
                     _signal(
                         "log.auth_burst",
                         "Authentication failure burst",
                         75,
-                        "At least six failures from the same target or log source occurred "
-                        "within five minutes.",
+                        f"At least {self.config.auth_failure_count} failures from the same target "
+                        f"or log source occurred within {self.config.window_seconds} seconds.",
                     )
                 )
         if event.event_type == "log.privilege_escalation" or (
@@ -232,7 +259,7 @@ class Detector:
             denial_count += sum(
                 _firewall_denial_count(candidate) for candidate in self._related(event, recent)
             )
-        if denial_count >= 10:
+        if denial_count >= self.config.firewall_denial_count:
             signals.append(
                 _signal(
                     "log.firewall_denial_burst",
@@ -249,7 +276,8 @@ class Detector:
         *,
         minimum_loss: float | None = None,
     ) -> list[SecurityEvent]:
-        earliest = event.observed_at - self.window
+        at = event.ingested_at or event.observed_at
+        earliest = at - self.window
         correlation_key = _correlation_key(event)
         if correlation_key is None:
             return []
@@ -259,13 +287,16 @@ class Detector:
             if candidate.id != event.id
             and candidate.source == event.source
             and _correlation_key(candidate) == correlation_key
-            and earliest <= candidate.observed_at <= event.observed_at
+            and candidate.rule_version == event.rule_version
+            and (event.ingested_at is None or candidate.ingested_at is not None)
+            and earliest <= (candidate.ingested_at or candidate.observed_at) <= at
         ]
         if minimum_loss is not None:
             related = [
                 candidate
                 for candidate in related
-                if _number(candidate.evidence.get("packet_loss")) >= minimum_loss
+                if candidate.evidence.get("outcome") not in {"error", "unknown"}
+                and _number(candidate.evidence.get("packet_loss")) >= minimum_loss
             ]
         return related
 
