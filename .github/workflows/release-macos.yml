@@ -32,6 +32,7 @@ jobs:
           uv sync --project src --frozen --no-dev
           uv run --project src --frozen --no-dev --with pyinstaller==6.22.3 \
             pyinstaller --clean --onefile --collect-data socketclaw \
+            --collect-submodules textual.widgets \
             --name socketclaw src/scripts/frozen_main.py
           ./dist/socketclaw version
           SOCKETCLAW_HOME="$(mktemp -d)" ./dist/socketclaw doctor
