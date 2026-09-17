@@ -23,7 +23,8 @@ Platform when deeper incident analysis is requested.
 
 ## Requirements
 
-- Python 3.11 or newer
+- Python 3.11 or newer for source installs and development. The macOS
+  standalone executable includes its own Python runtime.
 - A terminal with color support
 - The optional system `ping` command for reachability checks. Other probes keep
   working when it is unavailable.
@@ -32,7 +33,28 @@ Platform when deeper incident analysis is requested.
 
 ## Install
 
-From a checkout, the recommended isolated installation is:
+### macOS standalone executable
+
+After a versioned [GitHub Release](https://github.com/jbaehova/SocketClaw/releases)
+is published, install the executable without Python or uv:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jbaehova/SocketClaw/main/scripts/install.sh -o socketclaw-install.sh
+sh socketclaw-install.sh
+rm socketclaw-install.sh
+socketclaw doctor
+socketclaw
+```
+
+The installer selects Apple Silicon or Intel, verifies the release archive's
+SHA-256 checksum, and installs `socketclaw` to `~/.local/bin`. If that directory
+is not on your `PATH`, add it to your shell profile or run
+`~/.local/bin/socketclaw` directly. Set `SOCKETCLAW_INSTALL_DIR` to select a
+different destination. Release binaries are ad-hoc signed, not Apple notarized.
+
+### Install from source
+
+From a checkout, use an isolated Python environment:
 
 ```bash
 uv tool install ./src
