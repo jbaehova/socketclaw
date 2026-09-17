@@ -33,7 +33,7 @@ dependencies = [
 ]
 
 [project.urls]
-Changelog = "https://github.com/jbaehova/SocketClaw/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/jbaehova/SocketClaw/blob/main/src/CHANGELOG.md"
 Issues = "https://github.com/jbaehova/SocketClaw/issues"
 Repository = "https://github.com/jbaehova/SocketClaw"
 

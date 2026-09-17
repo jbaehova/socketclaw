@@ -20,6 +20,7 @@ wheels/
 
 .agents/
 AGENTS.md
+AGNETS.md
 .env
 .worktrees/
 
@@ -34,3 +35,8 @@ snapshot_report.html
 snapshot_report/
 .audit-requirements.txt
 artifacts/live-openai/
+
+# Regenerable TUI captures; retain only the README image
+/src/artifacts/tui/*.svg
+!/src/artifacts/tui/overview-120x36.svg
+/src/artifacts/live-openai/
