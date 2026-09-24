@@ -7,6 +7,8 @@ Platform when deeper incident analysis is requested.
 
 ![SocketClaw overview](src/artifacts/tui/overview-120x36.svg)
 
+The screenshots below use the light theme and sample local data.
+
 ## What it does
 
 - Runs cross-platform ping checks, bounded TCP port scans, and rotation-aware
@@ -20,6 +22,28 @@ Platform when deeper incident analysis is requested.
 - Exports redacted Markdown or JSON incident records.
 - Connects only to `https://api.openai.com/v1` for AI investigation. No
   alternate model-provider route or fallback exists.
+
+## Screenshots
+
+### Observation timeline and evidence
+
+![Observation timeline](src/artifacts/tui/events-120x36.svg)
+
+![Observation detail with detection signals and evidence](src/artifacts/tui/events-detail-120x36.svg)
+
+### AI investigation and incident desk
+
+![Investigation detail with rationale and response proposal](src/artifacts/tui/investigations-detail-120x36.svg)
+
+![Incident detail with timeline and occurrences](src/artifacts/tui/incidents-detail-120x36.svg)
+
+### Sources, health, and detection rules
+
+![Watched log sources](src/artifacts/tui/logs-120x36.svg)
+
+![Collection health](src/artifacts/tui/health-120x36.svg)
+
+![Detection rule settings](src/artifacts/tui/rules-120x36.svg)
 
 ## Requirements
 
@@ -409,10 +433,10 @@ changes:
 uv run python scripts/capture_tui.py
 ```
 
-Only `src/artifacts/tui/overview-120x36.svg`, used above, is tracked. Other
-captures are generated on demand and ignored by Git. Visual regression
-baselines remain in `src/tests/tui/snapshots/`. Generated live OpenAI evidence
-is also local-only and ignored by Git.
+The light-theme screenshots used in this README are tracked. Other captures
+are generated on demand and ignored by Git. Visual regression baselines remain
+in `src/tests/tui/snapshots/`. Generated live OpenAI evidence is also local-only
+and ignored by Git.
 
 Paid live OpenAI tests are opt-in. They use `OPENAI_API_KEY` when it is already
 present in the environment, or they can read an explicit env-file path. The
@@ -431,7 +455,7 @@ repository root and is ignored by Git.
 ## Repository layout
 
 The root contains `README.md` and `.gitignore`, plus the private `.env`,
-`AGNETS.md`, and `.agents/` entries. Git stores its internal data in `.git/`.
+`AGENTS.md`, and `.agents/` entries. Git stores its internal data in `.git/`.
 All development files live in `src/`, including the package source under
 `src/src/socketclaw/`, tests, scripts, dependency metadata, and changelog.
 See [the changelog](src/CHANGELOG.md) for release history.

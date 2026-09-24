@@ -234,9 +234,9 @@ async def _capture(capture: Capture, home: Path, destination: Path) -> None:
                 repository=repository,
             )
         )
-        # SVG cannot resolve the user's ANSI terminal background.
-        app.theme = "socketclaw-dark"
         async with app.run_test(size=capture.size) as pilot:
+            # on_mount restores the saved terminal theme; SVG needs a fixed background.
+            app.theme = "socketclaw-light"
             await pilot.pause(0.25)
             if capture.key is not None:
                 await pilot.press(capture.key)
@@ -403,6 +403,7 @@ def _normalize_and_verify(directory: Path, temporary_root: Path) -> None:
         content = path.read_text(encoding="utf-8")
         stable_id = f"terminal-socketclaw-{capture.name}"
         content = _RICH_TERMINAL_ID.sub(stable_id, content)
+        content = "\n".join(line.rstrip() for line in content.splitlines()) + "\n"
         path.write_text(content, encoding="utf-8")
         ET.parse(path)
 
