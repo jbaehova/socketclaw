@@ -41,11 +41,6 @@ artifacts/live-openai/
 /src/artifacts/tui/*.svg
 !/src/artifacts/tui/overview-120x36.svg
 !/src/artifacts/tui/events-120x36.svg
-!/src/artifacts/tui/events-detail-120x36.svg
 !/src/artifacts/tui/investigations-detail-120x36.svg
 !/src/artifacts/tui/incidents-detail-120x36.svg
-!/src/artifacts/tui/hosts-120x36.svg
-!/src/artifacts/tui/logs-120x36.svg
-!/src/artifacts/tui/health-120x36.svg
-!/src/artifacts/tui/rules-120x36.svg
 /src/artifacts/live-openai/
