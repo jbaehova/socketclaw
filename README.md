@@ -1,15 +1,33 @@
-# SocketClaw
+<h1 align="center">SOCKETCLAW</h1>
 
-SocketClaw is a local-first terminal security operations cockpit. It watches
-configured hosts and logs, explains why each observation is important, stores
-the evidence in SQLite, and uses GPT-5.6 Luna directly through the OpenAI
-Platform when deeper incident analysis is requested.
+<p align="center">
+  <strong>Watch the signal. Keep the evidence.</strong>
+</p>
 
-![SocketClaw overview](src/artifacts/tui/overview-120x36.svg)
+<p align="center">
+  <em>A local-first security cockpit for hosts, ports, and logs.</em>
+</p>
 
-The screenshots below use the light theme and sample local data.
+<p align="center">
+  <a href="https://github.com/jbaehova/socketclaw/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/jbaehova/socketclaw?style=flat-square&color=805928"></a>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white">
+  <img alt="Local-first" src="https://img.shields.io/badge/Local-first-805928?style=flat-square">
+  <img alt="Terminal UI" src="https://img.shields.io/badge/Terminal-UI-334155?style=flat-square">
+</p>
 
-## What it does
+<p align="center">
+  <img src="assets/socketclaw-banner.webp" alt="Pixel-art security desk gathering host and log signals into a protective claw" width="88%">
+</p>
+
+SocketClaw watches configured hosts, TCP ports, and log files from one terminal.
+It scores observations locally, keeps the evidence in SQLite, and opens an
+optional GPT-5.6 Luna investigation when you ask for deeper analysis.
+
+```text
+hosts + logs  ->  local detection  ->  SQLite evidence  ->  optional AI investigation  ->  review + export
+```
+
+## What It Does
 
 - Runs cross-platform ping checks, bounded TCP port scans, and rotation-aware
   log watchers in one resilient process.
@@ -23,27 +41,40 @@ The screenshots below use the light theme and sample local data.
 - Connects only to `https://api.openai.com/v1` for AI investigation. No
   alternate model-provider route or fallback exists.
 
-## Screenshots
+## Quick Start
 
-### Observation timeline and evidence
+On macOS, install the standalone release and launch the cockpit:
 
-![Observation timeline](src/artifacts/tui/events-120x36.svg)
+```bash
+curl -fsSL https://raw.githubusercontent.com/jbaehova/SocketClaw/main/scripts/install.sh | sh
+socketclaw
+```
 
-![Observation detail with detection signals and evidence](src/artifacts/tui/events-detail-120x36.svg)
+The first run guides you through targets and intervals. You can continue
+offline and add an OpenAI key later if you want AI investigations. For Python
+source installs and installer options, see [Install](#install).
 
-### AI investigation and incident desk
+## In Action
 
-![Investigation detail with rationale and response proposal](src/artifacts/tui/investigations-detail-120x36.svg)
+Light-theme captures with sample local data. Open any image for the full-size view.
 
-![Incident detail with timeline and occurrences](src/artifacts/tui/incidents-detail-120x36.svg)
+[![SocketClaw overview](src/artifacts/tui/overview-120x36.svg)](src/artifacts/tui/overview-120x36.svg)
 
-### Sources, health, and detection rules
+| Observation timeline | Detection evidence |
+|:---:|:---:|
+| [![Observation timeline](src/artifacts/tui/events-120x36.svg)](src/artifacts/tui/events-120x36.svg) | [![Observation detail](src/artifacts/tui/events-detail-120x36.svg)](src/artifacts/tui/events-detail-120x36.svg) |
 
-![Watched log sources](src/artifacts/tui/logs-120x36.svg)
+| AI investigation | Incident desk |
+|:---:|:---:|
+| [![Investigation detail](src/artifacts/tui/investigations-detail-120x36.svg)](src/artifacts/tui/investigations-detail-120x36.svg) | [![Incident detail](src/artifacts/tui/incidents-detail-120x36.svg)](src/artifacts/tui/incidents-detail-120x36.svg) |
 
-![Collection health](src/artifacts/tui/health-120x36.svg)
+| Host targets | Log sources |
+|:---:|:---:|
+| [![Host targets](src/artifacts/tui/hosts-120x36.svg)](src/artifacts/tui/hosts-120x36.svg) | [![Watched log sources](src/artifacts/tui/logs-120x36.svg)](src/artifacts/tui/logs-120x36.svg) |
 
-![Detection rule settings](src/artifacts/tui/rules-120x36.svg)
+| Collection health | Detection rules |
+|:---:|:---:|
+| [![Collection health](src/artifacts/tui/health-120x36.svg)](src/artifacts/tui/health-120x36.svg) | [![Detection rule settings](src/artifacts/tui/rules-120x36.svg)](src/artifacts/tui/rules-120x36.svg) |
 
 ## Requirements
 
