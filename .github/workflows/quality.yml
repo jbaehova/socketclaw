@@ -20,11 +20,12 @@ jobs:
     defaults:
       run:
         working-directory: src
-    env:
-      PYTHONPYCACHEPREFIX: ${{ runner.temp }}/socketclaw-pycache
-      SOCKETCLAW_HOME: ${{ runner.temp }}/socketclaw-home
     steps:
       - uses: actions/checkout@v6
+      - name: Isolate runtime state
+        run: |
+          echo "PYTHONPYCACHEPREFIX=$RUNNER_TEMP/socketclaw-pycache" >> "$GITHUB_ENV"
+          echo "SOCKETCLAW_HOME=$RUNNER_TEMP/socketclaw-home" >> "$GITHUB_ENV"
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           python-version: ${{ matrix.python }}
