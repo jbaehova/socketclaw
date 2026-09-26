@@ -4,6 +4,31 @@ All notable SocketClaw changes are documented here.
 
 ## Unreleased
 
+## 0.6.0 - 2026-09-26
+
+- Add required TCP, HTTP and HTTPS services with persistent failure and recovery
+  confirmation. Link local listener bindings and process evidence to exposure
+  incidents, and discover readable log sources during offline onboarding.
+- Add headless monitoring, a read-only attached TUI, optional service templates
+  and durable opt-in notifications with retry status and stable delivery keys.
+- Parse authentication success, sudo, PAM and ClamAV records structurally. Keep
+  bounded neighboring log context, distinguish actors from assets, and correlate
+  delayed or reversed arrivals using explicit source and collection clocks.
+- Upgrade existing databases to schema 5 with verified backups. Preserve old
+  rule snapshots and scores, record operator actions separately from approvals,
+  and make notes idempotent without conflicting with incoming observations.
+- Ground AI facts in exact evidence references, preview bounded incident context,
+  redact credentials from outbound requests and reports, and export investigation
+  history with action outcomes, recovery evidence and collection gaps.
+- Add stable history pagination and full-history search, read-only rule replay,
+  protected retention cleanup and disk-capacity diagnostics. Quarantine invalid
+  batches without losing their original data or advancing checkpoints.
+- Repair compact-terminal controls, preserve editor drafts, suppress duplicate
+  incident investigations and resynchronize views after missed notifications.
+- Update vulnerable dependencies and require Linux/macOS quality checks before
+  building both macOS release architectures. Validate source and standalone
+  onboarding, real loopback observations, resizing and exit through actual PTYs.
+
 ## 0.5.0 - 2026-09-17
 
 - Replace the framed dashboard with an inline terminal workspace, a plain
