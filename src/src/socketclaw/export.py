@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
+from .context import build_incident_context
 from .incidents import SuppressionDecision
-from .openai import redact_secrets
+from .redaction import redact_secrets, sensitive_field
 from .storage import IncidentReport, StoredEvent, StoredInvestigation, StoredResponseProposal
 
 
@@ -168,6 +169,12 @@ def export_markdown(
         "",
         f"**Event ID:** {code(str(event.id))}  ",
         f"**Observed:** {text(event.observed_at.isoformat())}  ",
+        f"**Source time:** {event.source_at.isoformat() if event.source_at else 'unknown'}  ",
+        f"**Collected:** {event.collected_at.isoformat() if event.collected_at else 'unknown'}  ",
+        f"**Committed:** {event.committed_at.isoformat() if event.committed_at else 'unknown'}  ",
+        "**Correlation clock:** "
+        + (event.correlation_at.isoformat() if event.correlation_at else "legacy")
+        + f" ({text(event.time_basis)})  ",
         f"**Severity:** {event.severity.value.upper()} ({event.score}/100)  ",
         f"**Source:** {code(event.source.value)}  ",
         "**Rule version:** "
@@ -335,7 +342,11 @@ def _redact_data(value: object, secrets: Sequence[str]) -> object:
                 while candidate in redacted:
                     candidate = f"{base} #{suffix}"
                     suffix += 1
-            redacted[candidate] = _redact_data(nested, secrets)
+            redacted[candidate] = (
+                "[REDACTED]"
+                if isinstance(key, str) and sensitive_field(key)
+                else _redact_data(nested, secrets)
+            )
         return redacted
     if isinstance(value, list | tuple):
         items = cast(Sequence[object], value)
@@ -519,4 +530,45 @@ def export_incident_markdown(report: IncidentReport, *, secrets: Sequence[str] =
             ),
             "",
         ]
+    context = build_incident_context(report)
+    sections += ["## Local evidence summary", ""]
+    sections += [f"- {text(line)}" for line in context.local_summary]
+    sections += ["", "## Verification runbook", ""]
+    sections += [f"- {text(line)}" for line in context.runbook]
+    sections += [
+        "",
+        "Approval records do not prove execution. Action outcomes are operator-reported.",
+        "",
+    ]
+    for name, heading in (
+        ("investigations", "AI investigations"),
+        ("response_proposals", "Response reviews"),
+        ("suppressions", "Maintenance decisions"),
+        ("maintenance_rules", "Matching maintenance scope (application is recorded separately)"),
+        ("collection_gaps", "Source collection gaps"),
+        ("action_records", "Action outcomes and verification"),
+        ("rule_versions", "Detection rule snapshots"),
+    ):
+        values = getattr(report, name, ())
+        sections += [f"## {heading}", ""]
+        if not values:
+            sections += ["No records available.", ""]
+        for value in values:
+            sections += [
+                *_fenced_block(
+                    json.dumps(
+                        _redact_data(value.model_dump(mode="json"), secrets),
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                    "json",
+                ),
+                "",
+            ]
+    sections += ["## Report scope", ""]
+    sections += [text(str(item)) for item in getattr(report, "omissions", ())]
+    omitted = getattr(report, "omitted_observations", 0)
+    if omitted:
+        sections += [f"{omitted} observations omitted by the report size limit.", ""]
     return "\n".join(sections).rstrip() + "\n"

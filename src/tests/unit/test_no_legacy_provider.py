@@ -30,6 +30,7 @@ FORBIDDEN_TOP_LEVEL_PACKAGES = {
 }
 DIRECT_RUNTIME_DEPENDENCIES = {
     "aiosqlite",
+    "anyio",
     "click",
     "httpx",
     "pydantic",

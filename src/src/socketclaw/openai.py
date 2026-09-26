@@ -19,7 +19,16 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from .config import OPENAI_MODEL
-from .domain import Assessment, InvestigationResult, ModelUsage, SecurityEvent
+from .context import ContextAssessment, IncidentContext, grounded_assessment
+from .domain import (
+    Assessment,
+    InvestigationResult,
+    ModelUsage,
+    SecurityEvent,
+    response_actor_target,
+)
+from .redaction import redact_data
+from .redaction import redact_secrets as redact_secrets
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
@@ -31,8 +40,6 @@ required JSON assessment. A block action is only a proposal for operator
 review, never a claim that a firewall was changed. Every response proposal
 must set requires_approval to true."""
 
-_OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
-_BEARER_TOKEN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
 _ERROR_MESSAGE_MAX_LENGTH = 4000
 _MAX_EVENT_INPUT_BYTES = 64 * 1024
 
@@ -134,11 +141,13 @@ class OpenAIClient:
     async def investigate(
         self,
         event: SecurityEvent,
+        *,
+        context: IncidentContext | None = None,
     ) -> InvestigationResult:
         """Request and validate a structured incident assessment."""
         preset = OPENAI_MODEL
         effort = preset.effort_for(event.severity)
-        event_payload = cast(JsonValue, event.model_dump(mode="json"))
+        event_payload = cast(JsonValue, (context or event).model_dump(mode="json"))
         safe_event_payload = _redact_json_value(event_payload, (self._api_key,))
         event_json = json.dumps(
             safe_event_payload,
@@ -153,15 +162,35 @@ class OpenAIClient:
             )
         request_body = {
             "model": preset.model_id,
-            "instructions": INCIDENT_SYSTEM_PROMPT,
-            "input": f"Assess this SocketClaw security event:\n{event_json}",
+            "instructions": INCIDENT_SYSTEM_PROMPT
+            + (
+                "\nThis is bounded incident context. Return observed_facts as "
+                "exact scalar quotations: "
+                "evidence_id must match an evidence item id, field is a "
+                "dot-separated JSON path within "
+                "that evidence item, value is its exact string value (JSON "
+                "representation for booleans "
+                "and numbers). Never invent a fact or cite omitted evidence. "
+                "Separate possible_explanations "
+                "as unverified hypotheses, missing_evidence and next_checks. "
+                "Approval is not execution. "
+                "Actor address is distinct from the victim asset. Do not infer "
+                "successful entry or a "
+                "running process without a corresponding observation."
+                if context
+                else ""
+            ),
+            "input": (
+                f"Assess this SocketClaw security {'incident context' if context else 'event'}:\n"
+                f"{event_json}"
+            ),
             "reasoning": {"effort": effort},
             "text": {
                 "format": {
                     "type": "json_schema",
                     "name": "socketclaw_incident_assessment",
                     "strict": True,
-                    "schema": _strict_response_schema(),
+                    "schema": _strict_response_schema(context=context is not None),
                 },
                 "verbosity": "low",
             },
@@ -188,7 +217,13 @@ class OpenAIClient:
         try:
             content = _output_text(payload)
             assessment_data = _extract_json_object(content)
-            assessment = Assessment.model_validate(assessment_data)
+            assessment = (
+                grounded_assessment(
+                    assessment_data, IncidentContext.model_validate(safe_event_payload)
+                )
+                if context is not None
+                else Assessment.model_validate(assessment_data)
+            )
             _validate_assessment_target(assessment, event)
         except ValidationError as exc:
             detail = _validation_detail(exc)
@@ -377,33 +412,8 @@ class OpenAIClient:
         )
 
 
-def redact_secrets(text: str, secrets: Sequence[str] = ()) -> str:
-    """Remove explicit credentials and recognizable OpenAI keys."""
-    redacted = text
-    for secret in sorted((value for value in secrets if value), key=len, reverse=True):
-        redacted = redacted.replace(secret, "[REDACTED]")
-    redacted = _OPENAI_KEY.sub("[REDACTED]", redacted)
-    return _BEARER_TOKEN.sub("Bearer [REDACTED]", redacted)
-
-
 def _redact_json_value(value: JsonValue, secrets: Sequence[str]) -> JsonValue:
-    if isinstance(value, str):
-        return redact_secrets(value, secrets)
-    if isinstance(value, list):
-        return [_redact_json_value(item, secrets) for item in value]
-    if isinstance(value, dict):
-        redacted: dict[str, JsonValue] = {}
-        for key, item in value.items():
-            candidate = redact_secrets(key, secrets)
-            if candidate in redacted:
-                base = candidate
-                suffix = 2
-                while candidate in redacted:
-                    candidate = f"{base} #{suffix}"
-                    suffix += 1
-            redacted[candidate] = _redact_json_value(item, secrets)
-        return redacted
-    return value
+    return cast(JsonValue, redact_data(value, secrets))
 
 
 def _output_text(payload: dict[str, object]) -> str:
@@ -465,9 +475,9 @@ def _extract_json_object(content: str) -> dict[str, object]:
     return cast(dict[str, object], decoded_value)
 
 
-def _strict_response_schema() -> dict[str, Any]:
+def _strict_response_schema(*, context: bool = False) -> dict[str, Any]:
     """Build the subset required by strict structured outputs."""
-    schema = Assessment.model_json_schema()
+    schema = (ContextAssessment if context else Assessment).model_json_schema()
     _require_all_object_properties(schema)
     return schema
 
@@ -671,10 +681,11 @@ def _validate_assessment_target(assessment: Assessment, event: SecurityEvent) ->
     proposal = assessment.response_proposal
     if proposal is None or proposal.action != "block" or proposal.target_ip is None:
         return
-    if event.target is None:
+    target = response_actor_target(event)
+    if target is None:
         raise ValueError("block proposal has no corresponding event target")
     try:
-        event_target = ipaddress.ip_address(event.target)
+        event_target = ipaddress.ip_address(target)
     except ValueError as exc:
         raise ValueError("block proposal requires an IP event target") from exc
     if ipaddress.ip_address(proposal.target_ip) != event_target:
