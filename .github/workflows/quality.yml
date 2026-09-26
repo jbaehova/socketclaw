@@ -1,0 +1,56 @@
+name: Quality gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+        python: ['3.11', '3.14']
+    defaults:
+      run:
+        working-directory: src
+    env:
+      PYTHONPYCACHEPREFIX: ${{ runner.temp }}/socketclaw-pycache
+      SOCKETCLAW_HOME: ${{ runner.temp }}/socketclaw-home
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install locked development environment
+        run: uv sync --dev --locked
+      - name: Static checks
+        run: |
+          uv run --locked python -m ruff check .
+          uv run --locked python -m ruff format --check .
+          uv run --locked python -m pyright
+      - name: Tests
+        run: uv run --locked python -m pytest
+      - name: Audit locked dependencies
+        run: |
+          uv export --locked --no-emit-project --format requirements-txt --output-file "$RUNNER_TEMP/requirements.txt" > /dev/null
+          uv run --locked python -m pip_audit --disable-pip --require-hashes -r "$RUNNER_TEMP/requirements.txt"
+      - name: Wheel and source build
+        run: uv build
+      - name: Install and smoke test wheel
+        run: |
+          uv venv "$RUNNER_TEMP/wheel-smoke"
+          uv export --locked --no-dev --no-emit-project --format requirements-txt --output-file "$RUNNER_TEMP/runtime.txt" > /dev/null
+          uv pip sync --python "$RUNNER_TEMP/wheel-smoke/bin/python" --require-hashes "$RUNNER_TEMP/runtime.txt"
+          uv pip install --python "$RUNNER_TEMP/wheel-smoke/bin/python" --no-deps dist/*.whl
+          "$RUNNER_TEMP/wheel-smoke/bin/socketclaw" version
+          "$RUNNER_TEMP/wheel-smoke/bin/socketclaw" db migrate
+          "$RUNNER_TEMP/wheel-smoke/bin/socketclaw" doctor
+          "$RUNNER_TEMP/wheel-smoke/bin/python" scripts/platform_smoke.py
+          "$RUNNER_TEMP/wheel-smoke/bin/python" scripts/pty_smoke.py
