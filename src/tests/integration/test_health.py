@@ -349,38 +349,56 @@ async def test_manual_and_scheduled_operations_share_lock_and_report_manual_acti
         await monitor.stop()
 
 
-@pytest.mark.parametrize("kind", ["observation", "health"])
-async def test_cancellation_joins_database_write_before_shutdown(repository, monkeypatch, kind):
+async def test_shutdown_joins_inflight_observation_write(repository, monkeypatch):
     monitor = MonitorService(repository, Detector())
+    await monitor.start()
     started = asyncio.Event()
     release = asyncio.Event()
-    name = "ingest_batch" if kind == "observation" else "save_probe_health"
-    original = getattr(repository, name)
+    original = repository.ingest_batch
 
     async def gated_write(*args, **kwargs):
         started.set()
         await release.wait()
         return await original(*args, **kwargs)
 
-    monkeypatch.setattr(repository, name, gated_write)
+    monkeypatch.setattr(repository, "ingest_batch", gated_write)
+    event = SecurityEvent(source="system", event_type="test", title="Committed", summary="Test")
+    writing = asyncio.create_task(monitor.process_event(event))
+    await asyncio.wait_for(started.wait(), 5)
+    stopping = asyncio.create_task(monitor.stop())
+    try:
+        await asyncio.sleep(0)
+        assert not stopping.done()
+    finally:
+        release.set()
+        await asyncio.gather(writing, stopping)
+    assert await repository.get_event(event.id) is not None
+    await repository.save_probe_health(ProbeHealth(probe_id="logs", interval_seconds=1))
+
+
+async def test_cancellation_joins_health_write_before_shutdown(repository, monkeypatch):
+    monitor = MonitorService(repository, Detector())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original = repository.save_probe_health
+
+    async def gated_write(health):
+        started.set()
+        await release.wait()
+        await original(health)
+
+    monkeypatch.setattr(repository, "save_probe_health", gated_write)
     health = ProbeHealth(probe_id="logs", interval_seconds=1, state="healthy")
     monitor._health["logs"] = health
-    event = SecurityEvent(source="system", event_type="test", title="Committed", summary="Test")
-    task = asyncio.create_task(
-        monitor.process_event(event) if kind == "observation" else monitor._persist_health("logs")
-    )
+    writing = asyncio.create_task(monitor._persist_health("logs"))
     try:
         await asyncio.wait_for(started.wait(), 5)
-        task.cancel()
+        writing.cancel()
         await asyncio.sleep(0)
-        assert not task.done()
+        assert not writing.done()
     finally:
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await task
-    if kind == "observation":
-        assert await repository.get_event(event.id) is not None
-    else:
-        assert (await repository.list_probe_health(["logs"]))[0].state == "healthy"
-    # A subsequent write must obtain the same database without a leaked lock.
+            await writing
+    assert (await repository.list_probe_health(["logs"]))[0].state == "healthy"
     await repository.save_probe_health(health.model_copy(update={"state": "degraded"}))

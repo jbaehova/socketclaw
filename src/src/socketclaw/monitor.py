@@ -341,15 +341,7 @@ class MonitorService:
 
     async def process_batch(self, batch: ProbeBatch) -> list[StoredEvent]:
         async with self._process_lock:
-            write = asyncio.create_task(self.repository.ingest_batch(batch, self.detector))
-            try:
-                stored = await asyncio.shield(write)
-            except asyncio.CancelledError:
-                # SQLite runs on a worker thread. Join the transaction before
-                # releasing the writer lock or persisting shutdown health.
-                with suppress(Exception):
-                    await write
-                raise
+            stored = await self.repository.ingest_batch(batch, self.detector)
         for observation in stored:
             self._broadcast(observation)
         return stored
@@ -582,7 +574,10 @@ class MonitorService:
         self._runner = None
         if runner is None:
             return
-        runner.cancel()
+        # Shutdown drains a write already in progress before canceling probes.
+        # Direct cancellation of process_batch still rolls back before commit.
+        async with self._process_lock:
+            runner.cancel()
         try:
             await runner
         except asyncio.CancelledError:
