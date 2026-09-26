@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,6 +14,20 @@ from socketclaw.config import AppConfig
 from socketclaw.health import ProbeHealth
 
 from .conftest import event_fixture, investigation_fixture
+
+
+@pytest.fixture(autouse=True)
+def stable_visual_environment(monkeypatch: pytest.MonkeyPatch):
+    # Layout baselines use the original fixture version and timezone. Version
+    # correctness is covered independently by the CLI test.
+    with monkeypatch.context() as scoped:
+        scoped.setattr("socketclaw.ui.dashboard.__version__", "0.5.0")
+        scoped.setenv("TZ", "Asia/Seoul")
+        if hasattr(time, "tzset"):
+            time.tzset()
+        yield
+    if hasattr(time, "tzset"):
+        time.tzset()
 
 
 @dataclass(frozen=True, slots=True)

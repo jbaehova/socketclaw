@@ -332,7 +332,9 @@ async def test_different_observations_in_one_incident_share_running_analysis(tmp
     )
     try:
         tasks = [asyncio.create_task(app.investigate_event(event.id)) for event in observations]
-        await asyncio.sleep(0.1)
+        async with asyncio.timeout(5):
+            while not all(app.investigation_running(event.id) for event in observations):
+                await asyncio.sleep(0.01)
         assert started == 1
         release.set()
         first, second = await asyncio.gather(*tasks)

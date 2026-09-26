@@ -78,6 +78,9 @@ def test_no_argument_command_launches_tui(
 
 
 def test_launch_error_redacts_credentials_and_terminal_controls(monkeypatch) -> None:
+    # Typer forces its own ANSI decoration on GitHub Actions. This test checks
+    # untrusted error controls, independently of the renderer's color policy.
+    monkeypatch.setattr("typer.rich_utils.FORCE_TERMINAL", False)
     secret = "sk-proj-THIS_SHOULD_NOT_LEAK_123456"
     separated = secret.replace("LEAK", "LE\x1bAK")
 
