@@ -20,6 +20,7 @@ wheels/
 *.db-wal
 
 .agents/
+.hov/
 AGENTS.md
 AGNETS.md
 .env
