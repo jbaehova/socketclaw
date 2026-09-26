@@ -97,6 +97,9 @@ async def test_repeated_exception_updates_count_without_event_flood_and_audits_r
     async def collect():
         if failures:
             raise OSError("probe permission denied")
+        # Stop scheduling after recovery so shutdown cannot cancel the next
+        # 15 ms probe and legitimately record a new interrupted transition.
+        monitor.pause()
         return []
 
     monitor = MonitorService(repository, Detector(), jobs=[ProbeJob("broken", 0.015, collect)])
