@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import math
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
@@ -12,6 +13,8 @@ from typing import cast
 from pydantic import JsonValue
 
 from ..collection import PortBaselineState, ProbeBatch
+from ..config import ServiceConfig
+from ..discovery import discover_sources
 from ..domain import EventSource, ObservationOutcome, SecurityEvent, utc_now
 from ..storage import Repository
 
@@ -25,6 +28,8 @@ class PortProbe:
         connector: Connector | None = None,
         concurrency: int = 100,
         timeout: float = 0.75,
+        local_context: bool = False,
+        services: Iterable[ServiceConfig] = (),
     ) -> None:
         if type(concurrency) is not int or concurrency < 1:
             raise ValueError("port scan concurrency must be positive")
@@ -33,19 +38,25 @@ class PortProbe:
         self.connector = connector or _tcp_connect
         self.concurrency = concurrency
         self.timeout = timeout
+        self.local_context = local_context
+        self.services = tuple(services)
         self._connection_slots = asyncio.Semaphore(concurrency)
         self._previous: dict[str, set[int]] = {}
         self._scopes: dict[str, set[int]] = {}
         self._known: dict[str, set[int]] = {}
         self._target_locks: dict[str, asyncio.Lock] = {}
 
-    def retained_for_targets(self, targets: Iterable[str]) -> PortProbe:
+    def retained_for_targets(
+        self, targets: Iterable[str], *, services: Iterable[ServiceConfig] | None = None
+    ) -> PortProbe:
         """Clone retained baselines for one new active target set."""
         active = set(targets)
         replacement = PortProbe(
             connector=self.connector,
             concurrency=self.concurrency,
             timeout=self.timeout,
+            local_context=self.local_context,
+            services=self.services if services is None else services,
         )
         replacement._previous = {
             target: set(ports) for target, ports in self._previous.items() if target in active
@@ -221,10 +232,12 @@ class PortProbe:
             if unresolved
             else "ok",
         }
+        if self.local_context and is_local_target(target):
+            evidence.update(await _local_evidence(candidates, self.services))
         return SecurityEvent(
             source=EventSource.PORT_SCAN,
             event_type="port_scan.result",
-            title=title,
+            title=title if len(title) <= 200 else title[:197] + "...",
             summary=(f"{target}: {len(current)} open of {len(candidates)} scanned TCP ports"),
             target=target,
             evidence=evidence,
@@ -267,3 +280,91 @@ def _port_state(value: object) -> bool | None:
 
 def port_probe_id(target: str) -> str:
     return "ports:" + hashlib.sha256(target.casefold().encode()).hexdigest()
+
+
+async def tcp_connect(host: str, port: int, timeout: float) -> bool | None:
+    """Expose the bounded three-state TCP measurement for service probes."""
+    return await _tcp_connect(host, port, timeout)
+
+
+def is_local_target(target: str) -> bool:
+    if target.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(target).is_loopback
+    except ValueError:
+        return False
+
+
+async def _local_evidence(
+    ports: list[int], services: tuple[ServiceConfig, ...]
+) -> dict[str, JsonValue]:
+    try:
+        report = await discover_sources()
+    except OSError as exc:
+        return {"local_context_status": "unavailable", "local_context_error": type(exc).__name__}
+    listeners: list[JsonValue] = []
+    violations: list[JsonValue] = []
+    expectations = [service for service in services if is_local_target(service.host)]
+    for listener in report.listeners:
+        if listener.port not in ports:
+            continue
+        item: dict[str, JsonValue] = {
+            "binding_address": listener.host,
+            "port": listener.port,
+            "pid": listener.pid,
+            "process": listener.process[:80] if listener.process else None,
+            "path": listener.executable[:256] if listener.executable else None,
+            "exposure": listener.exposure,
+        }
+        listeners.append(item)
+        for service in expectations:
+            if service.port != listener.port or service.allowed_exposure == "any":
+                continue
+            try:
+                address = ipaddress.ip_address(listener.host)
+                allowed = (
+                    address.is_loopback
+                    if service.allowed_exposure == "loopback"
+                    else (
+                        not address.is_unspecified and (address.is_loopback or address.is_private)
+                    )
+                )
+            except ValueError:
+                if listener.host != "*":
+                    continue
+                allowed = False
+            if not allowed:
+                violations.append(
+                    {**item, "service_id": service.id, "allowed_exposure": service.allowed_exposure}
+                )
+    return {
+        "local_context_status": "partial"
+        if any(
+            any(term in item for term in ("unavailable", "partial", "timed out"))
+            for item in report.limitations
+        )
+        else "observed",
+        "exposure_checked_ports": cast(
+            list[JsonValue],
+            sorted({service.port for service in expectations if service.port in ports}),
+        ),
+        "exposure_violation_ports": cast(
+            list[JsonValue],
+            sorted({int(str(item["port"])) for item in violations if isinstance(item, dict)}),
+        ),
+        "local_listeners": listeners[:8],
+        "local_listeners_omitted": max(0, len(listeners) - 8),
+        "exposure_violations": violations[:8],
+        "exposure_violations_omitted": max(0, len(violations) - 8),
+        "service_expectations": [
+            {
+                "service_id": service.id,
+                "port": service.port,
+                "allowed_exposure": service.allowed_exposure,
+            }
+            for service in expectations[:8]
+        ],
+        "service_expectations_omitted": max(0, len(expectations) - 8),
+        "local_context_limitations": list(report.limitations),
+    }

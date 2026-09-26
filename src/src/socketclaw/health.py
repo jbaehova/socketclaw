@@ -72,3 +72,38 @@ def next_tick(due: float, interval: float, finished: float) -> tuple[float, int]
     following = due + interval
     skipped = max(0, math.floor((finished - following) / interval) + 1)
     return following + skipped * interval, skipped
+
+
+def coverage_summary(config: object, health: tuple[ProbeHealth, ...]) -> str:
+    """Describe configured coverage separately from recent collector success."""
+    targets = getattr(config, "targets", ())
+    logs = getattr(config, "log_paths", ())
+    services = getattr(config, "services", ())
+    fresh = sum(not item.is_stale(utc_now()) for item in health)
+    base = (
+        f"{len(targets)} ICMP/TCP targets, {len(services)} explicit services, "
+        f"{len(logs)} file log sources. "
+        f"{fresh}/{len(health)} collectors have recent successful reads."
+    )
+    if not logs:
+        base += " Authentication and security logs are not monitored."
+    if not services:
+        base += " No required-service availability policy is configured."
+    return base
+
+
+def source_coverage(health: ProbeHealth, *, configured: bool = True) -> dict[str, object]:
+    """Keep source access, parser coverage and freshness as independent dimensions."""
+    kind = health.error_kind
+    supported = kind not in {"unsupported", "unsupported_format"}
+    readable = kind not in {"missing_source", "permission", "permission_denied", "read_error"}
+    return {
+        "configured": configured,
+        "supported": supported,
+        "readable": readable if health.last_attempt_at is not None else None,
+        "collecting": health.activity in {"scheduled", "manual"},
+        "fresh": not health.is_stale(utc_now()),
+        "partial": kind in {"partial", "partial_format", "unparsed_lines"},
+        "last_success_at": health.last_success_at.isoformat() if health.last_success_at else None,
+        "reason": health.error,
+    }

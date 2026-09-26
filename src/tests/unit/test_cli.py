@@ -402,6 +402,9 @@ async def test_probe_plan_collectors_bind_each_target_and_port_snapshot(monkeypa
             )
 
     class FakePorts:
+        def __init__(self, **kwargs) -> None:
+            pass
+
         async def collect(self, target: str, ports) -> SecurityEvent:
             selected_ports = tuple(ports)
             port_calls.append((target, selected_ports))

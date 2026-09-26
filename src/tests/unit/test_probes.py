@@ -356,10 +356,12 @@ async def test_log_probe_reads_only_appended_matching_lines(tmp_path: Path) -> N
 
     events = await probe.poll()
 
-    assert len(events) == 1
-    assert events[0].event_type == "log.auth_failure"
-    assert events[0].target == "10.0.0.8"
-    assert "Failed password" in events[0].summary
+    assert len(events) == 2
+    assert events[0].event_type == "log.context"
+    assert events[0].evidence["context_for"] == str(events[1].id)
+    assert events[1].event_type == "log.auth_failure"
+    assert events[1].evidence["actor_ip"] == "10.0.0.8"
+    assert "Failed password" in events[1].summary
 
 
 @pytest.mark.asyncio
@@ -377,7 +379,7 @@ async def test_log_probe_detects_rotation_and_reads_new_file(tmp_path: Path) -> 
     events = await probe.poll()
 
     assert len(events) == 1
-    assert events[0].event_type == "log.malware_indicator"
+    assert events[0].event_type == "log.unverified_indicator"
     assert events[0].evidence["rotated"] is True
 
 
@@ -392,7 +394,7 @@ async def test_log_probe_detects_in_place_truncation(tmp_path: Path) -> None:
     events = await probe.poll()
 
     assert len(events) == 1
-    assert events[0].target == "10.0.0.11"
+    assert events[0].evidence["actor_ip"] == "10.0.0.11"
     assert events[0].evidence["rotated"] is True
 
 
@@ -428,7 +430,7 @@ async def test_log_probe_keeps_partial_line_until_it_is_complete(tmp_path: Path)
 
     assert len(events) == 1
     assert events[0].event_type == "log.auth_failure"
-    assert events[0].target == "2001:db8::7"
+    assert events[0].evidence["actor_ip"] == "2001:db8::7"
 
 
 @pytest.mark.asyncio
@@ -464,7 +466,7 @@ async def test_cancelled_log_poll_replays_events_on_the_next_poll(
     events = await probe.poll()
 
     assert len(events) == 1
-    assert events[0].target == "10.0.0.42"
+    assert events[0].evidence["actor_ip"] == "10.0.0.42"
 
 
 @pytest.mark.asyncio
@@ -483,7 +485,7 @@ async def test_log_reconfigure_preserves_intersecting_path_cursor(tmp_path: Path
     events = await probe.poll()
 
     assert len(events) == 1
-    assert events[0].target == "10.0.0.43"
+    assert events[0].evidence["actor_ip"] == "10.0.0.43"
     assert probe.paths == [retained, added]
 
 
@@ -512,7 +514,7 @@ async def test_log_probe_detects_copytruncate_regrowth_past_old_size(tmp_path: P
     events = await probe.poll()
 
     assert len(events) == 1
-    assert events[0].target == "10.0.0.20"
+    assert events[0].evidence["actor_ip"] == "10.0.0.20"
     assert events[0].evidence["rotated"] is True
 
 
@@ -529,7 +531,7 @@ async def test_log_probe_reads_recreated_path_after_it_was_missing(tmp_path: Pat
     events = await probe.poll()
 
     assert len(events) == 1
-    assert events[0].target == "10.0.0.21"
+    assert events[0].evidence["actor_ip"] == "10.0.0.21"
     assert events[0].evidence["rotated"] is True
 
 
@@ -559,7 +561,7 @@ async def test_one_unreadable_log_does_not_block_other_paths(
 
     assert [event.event_type for event in first] == ["system.log_probe_error"]
     assert [event.event_type for event in second] == ["log.auth_failure"]
-    assert second[0].target == "10.0.0.22"
+    assert second[0].evidence["actor_ip"] == "10.0.0.22"
 
 
 @pytest.mark.asyncio
@@ -577,12 +579,13 @@ async def test_oversized_log_line_is_bounded_and_following_line_is_processed(
     events = await probe.poll()
 
     assert [event.event_type for event in events] == [
-        "log.malware_indicator",
+        "log.unverified_indicator",
         "log.auth_failure",
     ]
     assert events[0].evidence["truncated"] is True
     assert len(str(events[0].evidence["message"])) == 4000
-    assert events[1].target is None
+    assert events[1].evidence["actor_ip"] is None
+    assert events[1].target.startswith("log:")
 
 
 @pytest.mark.asyncio
@@ -602,8 +605,8 @@ async def test_log_probe_caps_lines_and_continues_from_cursor(
     first = await probe.poll()
     second = await probe.poll()
 
-    assert [event.target for event in first] == ["10.0.0.1", "10.0.0.2"]
-    assert [event.target for event in second] == ["10.0.0.3"]
+    assert [event.evidence["actor_ip"] for event in first] == ["10.0.0.1", "10.0.0.2"]
+    assert [event.evidence["actor_ip"] for event in second] == ["10.0.0.3"]
 
 
 @pytest.mark.asyncio

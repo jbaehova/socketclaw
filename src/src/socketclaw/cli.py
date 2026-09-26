@@ -5,9 +5,14 @@ from __future__ import annotations
 # pyright: reportUnknownMemberType=false
 import asyncio
 import errno
+import json
 import os
+import platform
 import shutil
+import signal
+import sqlite3
 import stat
+import sys
 import tempfile
 import unicodedata
 from collections.abc import Callable, Sequence
@@ -22,8 +27,9 @@ from click import ClickException
 
 from . import __version__
 from .collection import ProbeBatch
-from .config import AppConfig, ConfigStore
+from .config import AppConfig, ConfigStore, ServiceConfig
 from .detection import Detector
+from .discovery import discover_sources
 from .doctor import inspect_environment
 from .domain import SecurityEvent
 from .export import (
@@ -34,10 +40,12 @@ from .export import (
     write_managed_export,
 )
 from .monitor import Diagnostic, MonitorService, ProbeJob
+from .notifications import NotificationOutbox
 from .openai import redact_secrets
 from .probes.logs import LogProbe
 from .probes.ping import PingProbe
-from .probes.ports import PortProbe
+from .probes.ports import PortProbe, is_local_target
+from .probes.services import ServiceProbe
 from .rules import RuleConfig
 from .storage import EventQuery, Repository
 from .ui.app import AppServices, SocketClawApp
@@ -229,6 +237,257 @@ def database_status() -> None:
         raise ClickException(f"Cannot inspect storage: {_error_detail(exc)}") from exc
 
 
+@app.command("replay")
+def replay_command(
+    candidate: Annotated[Path, typer.Option("--candidate", help="Candidate rules JSON file.")],
+    source: Annotated[str | None, typer.Option("--source")] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=100000)] = 10000,
+) -> None:
+    """Compare candidate rules over a stable bounded snapshot without writing history."""
+    from .replay import replay_events
+
+    async def run() -> None:
+        rules = RuleConfig.model_validate_json(candidate.read_text())
+        repository = Repository(ConfigStore().database_path, read_only=True)
+        try:
+            observations: list[SecurityEvent] = []
+            before_seq = None
+            while len(observations) < limit:
+                page = await repository.list_events(
+                    EventQuery(
+                        limit=min(500, limit - len(observations)),
+                        before_seq=before_seq,
+                    )
+                )
+                if not page:
+                    break
+                observations.extend(page)
+                before_seq = page[-1].ingest_seq
+                if before_seq is None:
+                    break
+            report = replay_events(observations, rules, sources=[source] if source else None)
+            result = report.to_dict()
+            result["requested_limit"] = limit
+            result["bounded_input"] = len(observations) >= limit
+            typer.echo(json.dumps(result, indent=2))
+        finally:
+            await repository.close()
+
+    try:
+        asyncio.run(run())
+    except Exception as exc:
+        raise ClickException(f"Cannot replay rules: {_error_detail(exc)}") from exc
+
+
+@app.command("history-retention")
+def retention_command(
+    days: Annotated[int, typer.Option("--days", min=1)] = 30,
+    apply: Annotated[
+        bool, typer.Option("--apply", help="Create backup and delete eligible normal observations.")
+    ] = False,
+) -> None:
+    """Preview retention of normal history; incident evidence remains protected."""
+    store = ConfigStore()
+    store.ensure_home()
+    lock = _ApplicationLock(store.home / ".instance.lock")
+
+    async def run() -> None:
+        repository = Repository(store.database_path)
+        try:
+            await repository.initialize()
+            result = await repository.retain_history(normal_days=days, dry_run=not apply)
+            typer.echo(result.model_dump_json(indent=2))
+        finally:
+            await repository.close()
+
+    try:
+        lock.acquire()
+        asyncio.run(run())
+    except Exception as exc:
+        raise ClickException(f"Cannot apply retention: {_error_detail(exc)}") from exc
+    finally:
+        lock.release()
+
+
+@app.command("discover")
+def discover_command() -> None:
+    """List factual local listener and readable file candidates without enabling them."""
+    from dataclasses import asdict
+
+    typer.echo(json.dumps(asdict(asyncio.run(discover_sources())), indent=2))
+
+
+@app.command("monitor")
+def monitor_command() -> None:
+    """Collect without a TUI until SIGINT/SIGTERM. Holds the single-writer home lock."""
+    store = ConfigStore()
+    store.ensure_home()
+    lock = _ApplicationLock(store.home / ".instance.lock")
+    try:
+        lock.acquire()
+        asyncio.run(_run_monitor(store))
+    except Exception as exc:
+        raise ClickException(f"Cannot run monitor: {_error_detail(exc)}") from exc
+    finally:
+        lock.release()
+
+
+async def _run_monitor(store: ConfigStore, stop: asyncio.Event | None = None) -> None:
+    config = store.load()
+    repository = Repository(store.database_path)
+    monitor = None
+    run_id = None
+    notifications = None
+    clean_shutdown = False
+    stop = stop or asyncio.Event()
+    loop = asyncio.get_running_loop()
+    registered: list[signal.Signals] = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+            registered.append(sig)
+        except (NotImplementedError, RuntimeError):
+            pass
+    try:
+        await repository.initialize()
+        run_id = (await repository.start_run(__version__)).id
+        monitor = _build_monitor(config, repository)
+        await monitor.start()
+        if config.notifications.local or config.notifications.webhook:
+            notifications = asyncio.create_task(
+                NotificationOutbox(store.database_path, config.notifications).run()
+            )
+        typer.echo("Headless monitor running. Read-only status: socketclaw attach")
+        await stop.wait()
+        clean_shutdown = True
+    finally:
+        if notifications is not None:
+            notifications.cancel()
+            with suppress(asyncio.CancelledError):
+                await notifications
+        if monitor is not None:
+            await monitor.stop()
+        if run_id is not None:
+            await repository.stop_run(run_id, clean_shutdown=clean_shutdown)
+        await repository.close()
+        for sig in registered:
+            loop.remove_signal_handler(sig)
+
+
+@app.command("attach")
+def attach_command(
+    tui: Annotated[bool, typer.Option("--tui", help="Open an independent read-only TUI.")] = False,
+) -> None:
+    """Read the active collector's stored health without owning or starting a writer."""
+
+    async def inspect() -> None:
+        store = ConfigStore()
+        repository = Repository(store.database_path, read_only=True)
+        try:
+            plan = _ProbePlanner(repository=repository).prepare(store.load())
+            if tui:
+                from .ui.attached import AttachedApp
+
+                await AttachedApp(repository, [job.name for job in plan.jobs]).run_async(
+                    inline=True, inline_no_clear=True
+                )
+                return
+            health = await repository.list_probe_health([job.name for job in plan.jobs])
+            typer.echo(json.dumps([item.model_dump(mode="json") for item in health], indent=2))
+        finally:
+            await repository.close()
+
+    try:
+        asyncio.run(inspect())
+    except Exception as exc:
+        raise ClickException(f"Cannot attach read-only: {_error_detail(exc)}") from exc
+
+
+@app.command("notification-status")
+def notification_status_command() -> None:
+    """Inspect delivery failures separately from detector and collector health."""
+    store = ConfigStore()
+    outbox = NotificationOutbox(store.database_path, store.load().notifications)
+    try:
+        typer.echo(json.dumps(outbox.status(), indent=2))
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        raise ClickException(f"Cannot inspect notification delivery: {_error_detail(exc)}") from exc
+
+
+@app.command("service-template")
+def service_template_command() -> None:
+    """Print an opt-in user service definition; never install or start services."""
+    executable = shutil.which("socketclaw")
+    arguments = (
+        [executable, "monitor"]
+        if executable
+        else [sys.executable, "-c", "from socketclaw.entrypoint import main; main()", "monitor"]
+    )
+    if platform.system() == "Darwin":
+        import plistlib
+
+        rendered = plistlib.dumps(
+            {
+                "Label": "local.socketclaw.monitor",
+                "ProgramArguments": arguments,
+                "RunAtLoad": True,
+                "KeepAlive": True,
+                "EnvironmentVariables": {"SOCKETCLAW_HOME": str(ConfigStore().home)},
+            }
+        ).decode()
+    else:
+        import shlex
+
+        rendered = (
+            "[Unit]\nDescription=SocketClaw monitor\n[Service]\nExecStart="
+            + " ".join(shlex.quote(argument) for argument in arguments)
+            + "\nRestart=on-failure\nEnvironment=SOCKETCLAW_HOME="
+            + shlex.quote(str(ConfigStore().home))
+            + "\n[Install]\nWantedBy=default.target\n"
+        )
+    typer.echo(rendered)
+
+
+@app.command("quarantine")
+def quarantine_command(
+    retry: Annotated[
+        str | None,
+        typer.Option("--retry", help="Retry a preserved batch UUID after fixing its cause."),
+    ] = None,
+) -> None:
+    """Inspect preserved invalid batches, or explicitly retry with current rules."""
+    store = ConfigStore()
+    if retry is None:
+        for path in sorted((store.home / "quarantine").glob("*.json")):
+            data = json.loads(path.read_text())
+            typer.echo(f"{path.stem} {data['job']} {_terminal_text(data['error'])}")
+        return
+    try:
+        identifier = UUID(retry)
+    except ValueError as exc:
+        raise typer.BadParameter("retry must be a batch UUID") from exc
+    path = store.home / "quarantine" / f"{identifier}.json"
+    lock = _ApplicationLock(store.home / ".instance.lock")
+
+    async def replay() -> None:
+        batch = ProbeBatch.model_validate(json.loads(path.read_text())["batch"])
+        repository = Repository(store.database_path)
+        try:
+            await repository.initialize()
+            await repository.ingest_batch(batch, Detector(store.load().rules))
+            path.unlink()
+        finally:
+            await repository.close()
+
+    try:
+        lock.acquire()
+        asyncio.run(replay())
+    except Exception as exc:
+        raise ClickException(f"Batch remains quarantined: {_error_detail(exc)}") from exc
+    finally:
+        lock.release()
+
+
 def _launch_tui(store: ConfigStore) -> None:
     """Build all local services, run Textual, and close SQLite on exit."""
     store.ensure_home()
@@ -247,6 +506,7 @@ async def _run_tui(store: ConfigStore) -> None:
     run_id: UUID | None = None
     monitor: MonitorService | None = None
     clean_shutdown = False
+    notifications: asyncio.Task[None] | None = None
     failure: BaseException | None = None
     try:
         active_config = store.load()
@@ -256,14 +516,28 @@ async def _run_tui(store: ConfigStore) -> None:
         monitor = _build_monitor(active_config, repository, planner=planner)
 
         async def reconfigure(config: AppConfig) -> None:
-            nonlocal active_config
-            if _monitoring_settings(config) == _monitoring_settings(active_config):
-                active_config = config
-                return
-            candidate = planner.prepare(config)
-            await planner.activate(monitor, candidate)
+            nonlocal active_config, notifications
+            if _monitoring_settings(config) != _monitoring_settings(active_config):
+                candidate = planner.prepare(config)
+                await planner.activate(monitor, candidate)
+            if config.notifications != active_config.notifications:
+                if notifications is not None:
+                    notifications.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await notifications
+                notifications = (
+                    asyncio.create_task(
+                        NotificationOutbox(store.database_path, config.notifications).run()
+                    )
+                    if config.notifications.local or config.notifications.webhook
+                    else None
+                )
             active_config = config
 
+        if active_config.notifications.local or active_config.notifications.webhook:
+            notifications = asyncio.create_task(
+                NotificationOutbox(store.database_path, active_config.notifications).run()
+            )
         socketclaw = SocketClawApp(
             AppServices(
                 config_store=store,
@@ -278,6 +552,10 @@ async def _run_tui(store: ConfigStore) -> None:
         failure = exc
 
     cleanup_error: BaseException | None = None
+    if notifications is not None:
+        notifications.cancel()
+        with suppress(asyncio.CancelledError):
+            await notifications
     if monitor is not None:
         try:
             await monitor.stop()
@@ -354,15 +632,16 @@ class _ProbePlanner:
     def prepare(self, config: AppConfig) -> _PreparedProbePlan:
         previous = self._committed
         port_numbers = tuple(config.ports)
-        targets = tuple(config.targets)
+        targets = _scan_targets(config)
         if previous is not None:
             port_probe = (
                 previous.port_probe
                 if previous.targets == targets
-                else previous.port_probe.retained_for_targets(targets)
+                and previous.port_probe.services == tuple(config.services)
+                else previous.port_probe.retained_for_targets(targets, services=config.services)
             )
         else:
-            port_probe = PortProbe()
+            port_probe = PortProbe(local_context=True, services=config.services)
         log_paths = tuple(dict.fromkeys(_expand_log_paths(config.log_paths)))
         previous_log_paths: set[Path] = set(previous.log_paths) if previous is not None else set()
         retain_log_probe = (
@@ -457,9 +736,8 @@ def _compose_probe_plan(
     repository: Repository | None = None,
 ) -> tuple[tuple[ProbeJob, ...], dict[str, Diagnostic]]:
     jobs: list[ProbeJob] = []
-    selected_ports = tuple(config.ports)
-    for target in config.targets:
-        if ping is not None:
+    for target in _scan_targets(config):
+        if ping is not None and target in config.targets:
 
             async def collect_ping(
                 selected: str = target,
@@ -471,7 +749,7 @@ def _compose_probe_plan(
 
         async def collect_ports(
             selected: str = target,
-            scan_ports: tuple[int, ...] = selected_ports,
+            scan_ports: tuple[int, ...] = _scan_ports(config, target),
         ) -> Sequence[SecurityEvent] | ProbeBatch:
             if repository is not None:
                 return await ports.collect_batch(
@@ -481,17 +759,39 @@ def _compose_probe_plan(
 
         jobs.append(ProbeJob(f"ports:{target}", config.scan_interval, collect_ports))
 
+    if repository is not None:
+        service_probe = ServiceProbe(repository)
+        for service in config.services:
+
+            async def collect_service(selected: ServiceConfig = service) -> ProbeBatch:
+                return await service_probe.collect(selected)
+
+            jobs.append(ProbeJob(f"service:{service.id}", service.interval, collect_service))
+
     if logs is not None:
         jobs.append(ProbeJob("logs", 1.0, logs.collect))
 
     async def diagnose_ports(target: str) -> SecurityEvent | ProbeBatch:
         if repository is not None:
             return await ports.collect_batch(
-                target, selected_ports, repository, baseline_ttl=config.port_baseline_ttl
+                target,
+                _scan_ports(config, target),
+                repository,
+                baseline_ttl=config.port_baseline_ttl,
             )
-        return await ports.collect(target, selected_ports)
+        return await ports.collect(target, _scan_ports(config, target))
 
     diagnostics: dict[str, Diagnostic] = {"ports": diagnose_ports}
+    if repository is not None:
+        diagnostic_service_probe = ServiceProbe(repository)
+
+        async def diagnose_service(identifier: str) -> ProbeBatch:
+            selected = next((item for item in config.services if item.id == identifier), None)
+            if selected is None:
+                raise ValueError("Service is no longer configured")
+            return await diagnostic_service_probe.collect(selected)
+
+        diagnostics["service"] = diagnose_service
     if ping is not None:
         available_ping = ping
 
@@ -501,6 +801,30 @@ def _compose_probe_plan(
         diagnostics["ping"] = diagnose_ping
 
     return tuple(jobs), diagnostics
+
+
+def _scan_targets(config: AppConfig) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            [
+                *config.targets,
+                *(service.host for service in config.services if is_local_target(service.host)),
+            ]
+        )
+    )
+
+
+def _scan_ports(config: AppConfig, target: str) -> tuple[int, ...]:
+    return tuple(
+        sorted(
+            set(
+                [
+                    *(config.ports if target in config.targets else []),
+                    *(service.port for service in config.services if service.host == target),
+                ]
+            )
+        )
+    )
 
 
 def _resolve_command(command: str, which: CommandFinder) -> str | None:
@@ -522,6 +846,7 @@ def _monitoring_settings(config: AppConfig) -> tuple[object, ...]:
         tuple(config.ports),
         tuple(config.log_paths),
         config.rules,
+        tuple(config.services),
     )
 
 

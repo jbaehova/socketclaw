@@ -17,6 +17,7 @@ from .collection import ProbeBatch
 from .detection import Detector
 from .domain import EventSource, ObservationOutcome, SecurityEvent, utc_now
 from .health import ProbeHealth, initial_jitter, next_tick
+from .quarantine import quarantine_batch
 from .storage import Repository, StoredEvent
 
 Collector = Callable[[], Awaitable[Sequence[SecurityEvent] | ProbeBatch]]
@@ -52,6 +53,7 @@ class MonitorStatus(BaseModel):
     probe_health: tuple[ProbeHealth, ...] = ()
     dropped_notifications: int = 0
     pending_batches: int = 0
+    quarantined_batches: int = 0
 
 
 class MonitorService:
@@ -91,6 +93,7 @@ class MonitorService:
         self._started_at: datetime | None = None
         self._job_errors: dict[str, str] = {}
         self._pending_batches: dict[str, ProbeBatch] = {}
+        self._quarantined_jobs: set[str] = set()
         self._collection_locks: dict[str, asyncio.Lock] = {}
         self._runner_error: str | None = None
         self._health_write_error: str | None = None
@@ -121,6 +124,7 @@ class MonitorService:
             ),
             dropped_notifications=self._dropped_notifications,
             pending_batches=len(self._pending_batches),
+            quarantined_batches=len(self._quarantined_jobs),
         )
 
     async def start(self) -> None:
@@ -229,7 +233,10 @@ class MonitorService:
                         async with self._collection_locks.setdefault(name, asyncio.Lock()):
                             pending = self._pending_batches.get(name)
                             if pending is not None:
-                                await self.process_batch(pending)
+                                try:
+                                    await self.process_batch(pending)
+                                except ValueError as exc:
+                                    await self._quarantine(name, pending, exc)
                                 self._pending_batches.pop(name, None)
             except BaseException:
                 if was_running:
@@ -259,6 +266,7 @@ class MonitorService:
             if detector is not None:
                 async with self._process_lock:
                     self.detector = detector
+            self._quarantined_jobs.clear()
             self.jobs = replacement_jobs
             self.diagnostics = replacement_diagnostics
             self._job_errors.clear()
@@ -397,6 +405,8 @@ class MonitorService:
     async def _execute_job(
         self, job: ProbeJob, *, due: float, manual: bool = False
     ) -> list[StoredEvent]:
+        if job.name in self._quarantined_jobs:
+            return []
         started = time.monotonic()
         previous = self._health.get(
             job.name, ProbeHealth(probe_id=job.name, interval_seconds=job.interval)
@@ -411,6 +421,7 @@ class MonitorService:
         )
         await self._persist_health(job.name)
         stage = "collection"
+        batch: ProbeBatch | None = None
         try:
             batch = self._pending_batches.get(job.name)
             if batch is None:
@@ -439,6 +450,12 @@ class MonitorService:
             raise
         except Exception as exc:
             error = _error_message(exc)
+            if stage == "storage" and isinstance(exc, ValueError) and batch is not None:
+                await self._quarantine(job.name, batch, exc)
+                stage = "quarantined"
+                error = f"Batch quarantined; edit configuration or retry after repair. {error}"[
+                    :2000
+                ]
             self._job_errors[job.name] = error
             self._health[job.name] = self._health[job.name].model_copy(
                 update={
@@ -493,8 +510,41 @@ class MonitorService:
             }
         )
         self._job_errors.pop(job.name, None)
-        self._reported_errors.pop(job.name, None)
+        if error_kind and self._reported_errors.get(job.name) != error:
+            await self.process_event(
+                SecurityEvent(
+                    source=EventSource.SYSTEM,
+                    event_type="system.probe_error",
+                    title=f"{job.name[:170]} coverage gap",
+                    summary=error or "Collector degraded",
+                    evidence={"probe": job.name, "error_kind": error_kind, "error": error},
+                )
+            )
+            self._reported_errors[job.name] = error or "Collector degraded"
+        elif not error_kind:
+            if previous.state == "degraded":
+                await self.process_event(
+                    SecurityEvent(
+                        source=EventSource.SYSTEM,
+                        event_type="system.probe_recovered",
+                        title=f"{job.name[:170]} collection recovered",
+                        summary="Collector completed a successful read after degradation.",
+                        evidence={"probe": job.name},
+                    )
+                )
+            self._reported_errors.pop(job.name, None)
         return stored
+
+    async def _quarantine(self, name: str, batch: ProbeBatch, error: Exception) -> None:
+        await asyncio.to_thread(
+            quarantine_batch,
+            self.repository.database_path.parent,
+            name,
+            batch,
+            _error_message(error),
+        )
+        self._pending_batches.pop(name, None)
+        self._quarantined_jobs.add(name)
 
     async def _persist_health(self, probe_id: str) -> None:
         try:
@@ -584,7 +634,10 @@ def _batch_problem(batch: ProbeBatch) -> tuple[str | None, str | None]:
             return signal.error_kind or "collector", signal.detail or "Collector is degraded"
     for observation in batch.observations:
         if observation.outcome in {ObservationOutcome.ERROR, ObservationOutcome.UNKNOWN}:
-            return observation.outcome.value, observation.summary[:2000]
+            reason = observation.evidence.get("reason")
+            return (
+                "unsupported" if reason == "unsupported" else observation.outcome.value
+            ), observation.summary[:2000]
         if (
             observation.source == EventSource.PORT_SCAN
             and observation.outcome == ObservationOutcome.PARTIAL

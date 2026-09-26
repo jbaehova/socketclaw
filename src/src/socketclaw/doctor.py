@@ -99,6 +99,8 @@ async def inspect_environment(
             )
         )
 
+    checks.append(_disk_space_check(store))
+
     try:
         config = store.load()
     except ConfigError as exc:
@@ -224,6 +226,38 @@ async def _probe_database(store: ConfigStore) -> DiagnosticCheck:
     )
 
 
+def _disk_space_check(store: ConfigStore) -> DiagnosticCheck:
+    """Estimate reserve for SQLite growth and a recoverable backup without writes."""
+    try:
+        usage = shutil.disk_usage(store.home)
+        database_bytes = 0
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(str(store.database_path) + suffix)
+            with suppress(FileNotFoundError):
+                database_bytes += path.stat().st_size
+        reserve = max(100 * 1024 * 1024, 2 * database_bytes + 1024 * 1024)
+        headroom = usage.free - reserve
+        return DiagnosticCheck(
+            name="Disk space",
+            status="warn" if headroom < 0 else "pass",
+            detail=(
+                f"{usage.free:,} free bytes; database plus sidecars {database_bytes:,} bytes; "
+                f"reserve {reserve:,} bytes; estimated headroom {headroom:,} bytes. "
+                + (
+                    "Low disk space: free space before backups or continued collection."
+                    if headroom < 0
+                    else "Reserve covers at least 100 MiB or two database copies plus 1 MiB."
+                )
+            ),
+        )
+    except OSError as exc:
+        return DiagnosticCheck(
+            name="Disk space",
+            status="fail",
+            detail=f"Cannot inspect disk capacity: {_error_detail(exc)}",
+        )
+
+
 def _command_check(command: str, path: str | None) -> DiagnosticCheck:
     return DiagnosticCheck(
         name=f"{command} command",
@@ -247,8 +281,8 @@ def _log_paths_check(configured_paths: list[str]) -> DiagnosticCheck:
     if not configured_paths:
         return DiagnosticCheck(
             name="Log paths",
-            status="pass",
-            detail="not configured; log monitoring is disabled",
+            status="warn",
+            detail="not configured; no authentication or security logs are monitored",
         )
 
     problems: list[str] = []

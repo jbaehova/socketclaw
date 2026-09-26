@@ -122,7 +122,7 @@ async def test_repeated_exception_updates_count_without_event_flood_and_audits_r
     assert restored.next_due_at is None
 
 
-async def test_missing_log_signal_stays_degraded_without_new_error_event(
+async def test_missing_log_signal_persists_one_gap_and_recovery(
     repository: Repository, tmp_path: Path
 ) -> None:
     path = tmp_path / "missing.log"
@@ -139,8 +139,10 @@ async def test_missing_log_signal_stays_degraded_without_new_error_event(
         health = monitor.status.probe_health[0]
         assert health.error_kind == "missing_source"
         assert "Missing log" in str(monitor.status.last_error)
-        assert await repository.list_events() == []
-        path.write_text("ordinary line\n")
+        failures = await repository.list_events()
+        assert len(failures) == 1
+        assert failures[0].event_type == "system.probe_error"
+        path.write_text("sshd[123]: Accepted publickey for alice from 192.0.2.9 port 54321 ssh2\n")
         await until(lambda: monitor.status.probe_health[0].state == "healthy")
         assert monitor.status.last_error is None
     finally:

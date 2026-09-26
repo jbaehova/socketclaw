@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import math
 import platform
 import re
+import shutil
+import socket
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -33,6 +36,7 @@ class PingProbe:
         platform_name: str | None = None,
         executable: str = "ping",
         concurrency: int = 16,
+        ipv6_executable: str | None = None,
     ) -> None:
         if not executable or executable != executable.strip() or "\x00" in executable:
             raise ValueError("ping executable must be a non-empty path")
@@ -41,6 +45,7 @@ class PingProbe:
         self._runner = runner or _run_command
         self._platform = platform_name or platform.system()
         self._executable = executable
+        self._ipv6_executable = ipv6_executable
         self._slots = asyncio.Semaphore(concurrency)
 
     async def collect(
@@ -51,7 +56,29 @@ class PingProbe:
         timeout: float = 2.0,
     ) -> SecurityEvent:
         _validate_request(target, count, timeout)
-        command = _ping_command(self._executable, self._platform, target, count, timeout)
+        selected = target
+        is_v6 = ":" in target
+        if self._platform == "Darwin" and not is_v6:
+            try:
+                ipaddress.ip_address(target)
+            except ValueError:
+                try:
+                    addresses = await asyncio.wait_for(
+                        asyncio.get_running_loop().getaddrinfo(
+                            target, None, type=socket.SOCK_DGRAM
+                        ),
+                        timeout=timeout,
+                    )
+                    # Prefer IPv4 on dual-stack names, use ping6 for IPv6-only names.
+                    if addresses and not any(item[0] == socket.AF_INET for item in addresses):
+                        selected = str(addresses[0][4][0])
+                        is_v6 = True
+                except (OSError, TimeoutError):
+                    pass
+        executable = self._executable
+        if self._platform == "Darwin" and is_v6:
+            executable = self._ipv6_executable or shutil.which("ping6") or "ping6"
+        command = _ping_command(executable, self._platform, selected, count, timeout)
         deadline = count * timeout + 2.0
         evidence: dict[str, JsonValue]
         try:
@@ -63,12 +90,19 @@ class PingProbe:
             evidence = {
                 "requested_count": count,
                 "outcome": "unknown" if is_timeout else "error",
-                "reason": "deadline_exceeded" if is_timeout else "execution_failed",
+                "reason": "deadline_exceeded"
+                if is_timeout
+                else "unsupported"
+                if isinstance(exc, FileNotFoundError)
+                else "execution_failed",
                 "statistics_parsed": False,
                 "returncode": None,
                 "error": (str(exc).strip() or type(exc).__name__)[:2000],
             }
 
+        evidence["target"] = target
+        evidence["address_family"] = "ipv6" if is_v6 else "ipv4_or_dns"
+        evidence["resolved_target"] = selected
         outcome = evidence["outcome"]
         if outcome == "unreachable":
             title = f"{target}: no ICMP replies"
@@ -83,7 +117,7 @@ class PingProbe:
         return SecurityEvent(
             source=EventSource.PING,
             event_type="ping.result",
-            title=title,
+            title=title if len(title) <= 200 else title[:197] + "...",
             summary=_ping_summary(target, evidence),
             target=target,
             evidence=evidence,
@@ -152,6 +186,10 @@ def _ping_command(
             str(max(1, round(timeout * 1000))),
             target,
         ]
+    if platform_name == "Darwin" and ":" in target:
+        # macOS ping6 -W is a flag, not the millisecond timeout accepted by ping.
+        # The async subprocess deadline bounds the entire measurement.
+        return [executable, "-c", str(count), target]
     if platform_name == "Darwin":
         return [
             executable,
@@ -164,6 +202,7 @@ def _ping_command(
     if platform_name == "Linux":
         return [
             executable,
+            *(["-6"] if ":" in target else []),
             "-c",
             str(count),
             "-W",
