@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from typing import cast
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -82,10 +83,10 @@ class SettingsView(Vertical):
                         value=", ".join(str(port) for port in config.ports),
                         id="settings-ports",
                     )
-                    yield Static("Log files", classes="field-label")
+                    yield Static("Log files (JSON list)", classes="field-label")
                     yield Input(
-                        value=", ".join(config.log_paths),
-                        placeholder="/var/log/auth.log, /var/log/system.log",
+                        value=json.dumps(config.log_paths, ensure_ascii=False),
+                        placeholder='["/var/log/auth.log"]',
                         id="settings-log-paths",
                     )
                 with Vertical():
@@ -167,14 +168,9 @@ class SettingsView(Vertical):
                     "ping_interval": float(self.query_one("#settings-ping", Input).value),
                     "scan_interval": float(self.query_one("#settings-scan", Input).value),
                     "ports": _parse_ports(self.query_one("#settings-ports", Input).value),
-                    "log_paths": [
-                        path.strip()
-                        for path in self.query_one(
-                            "#settings-log-paths",
-                            Input,
-                        ).value.split(",")
-                        if path.strip()
-                    ],
+                    "log_paths": _parse_log_paths(
+                        self.query_one("#settings-log-paths", Input).value
+                    ),
                     "theme": _select_value(
                         cast(
                             Select[object],
@@ -277,7 +273,9 @@ class SettingsView(Vertical):
             self.query_one(selector, Input).value = value
 
     def _config_value(self, config: AppConfig, field: str) -> str:
-        if field in {"targets", "log_paths", "ports"}:
+        if field == "log_paths":
+            return json.dumps(config.log_paths, ensure_ascii=False)
+        if field in {"targets", "ports"}:
             return ", ".join(str(value) for value in getattr(config, field))
         if field in {"ping_interval", "scan_interval"}:
             return f"{getattr(config, field):g}"
@@ -335,3 +333,12 @@ def _parse_ports(value: str) -> list[int]:
         return [int(port.strip()) for port in value.split(",") if port.strip()]
     except ValueError as exc:
         raise ValueError("TCP ports must be comma-separated numbers") from exc
+
+
+def _parse_log_paths(value: str) -> list[str]:
+    if not value.strip():
+        return []
+    if value.lstrip().startswith("["):
+        return TypeAdapter(list[str]).validate_json(value, strict=True)
+    # A single path is convenient to enter and never split on path punctuation.
+    return [value]

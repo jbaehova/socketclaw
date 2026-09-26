@@ -11,7 +11,7 @@ from textual.binding import Binding, BindingType
 from textual.widgets import Button, DataTable, Static
 
 from ..domain import utc_now
-from ..health import ProbeHealth
+from ..health import ProbeHealth, source_coverage
 from ..monitor import MonitorStatus
 from .context import escape_markdown, safe_text, socketclaw_app
 from .detail import DetailScreen
@@ -104,6 +104,11 @@ class HealthScreen(ModalScreen[None]):
 
 
 def health_markdown(health: ProbeHealth) -> str:
+    coverage = source_coverage(health)
+    dimensions = " / ".join(
+        f"{name}: {'unknown' if coverage[name] is None else 'yes' if coverage[name] else 'no'}"
+        for name in ("configured", "supported", "readable", "collecting", "fresh", "partial")
+    )
     return (
         f"## {escape_markdown(health.probe_id)}\n\n"
         f"**{health.state.upper()}** / {health.activity} / "
@@ -119,7 +124,12 @@ def health_markdown(health: ProbeHealth) -> str:
         f"consecutive errors: {health.consecutive_errors}  \n"
         f"Pending observations: {health.pending_observations}\n\n"
         f"{escape_markdown(health.error or 'No current error.')}\n\n"
-        f"Updated: {_time(health.updated_at)}"
+        f"Updated: {_time(health.updated_at)}\n\n"
+        f"### Source coverage\n\n{dimensions}\n\n"
+        "If access failed, check the configured source path and read permissions. "
+        "Unsupported or partial parsing requires a supported source format. "
+        "No events does not establish safety. Use /logs to test read access, "
+        "/hosts to edit service endpoints, or /incidents to inspect collection failures."
     )
 
 

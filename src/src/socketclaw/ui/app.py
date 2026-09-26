@@ -7,22 +7,26 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, Protocol
 from uuid import UUID
 
 from textual.app import App, SystemCommand
 from textual.binding import Binding, BindingType
+from textual.events import Resize
 from textual.screen import Screen
 from textual.theme import BUILTIN_THEMES, Theme
 
 from ..collection import CheckpointChange
 from ..config import AppConfig, ConfigStore
+from ..context import IncidentContext, build_incident_context
 from ..domain import InvestigationResult, SecurityEvent
 from ..export import export_incident_markdown, export_markdown, write_managed_export
 from ..incident_store import IncidentStore
 from ..monitor import MonitorStatus
 from ..openai import ModelAccess, OpenAIClient, redact_secrets
+from ..response_actions import ActionRecord
 from ..storage import (
     EventQuery,
     IncidentReport,
@@ -72,6 +76,10 @@ class DataRepository(Protocol):
 
     async def incident_report(self, identifier: UUID) -> IncidentReport | None: ...
 
+    async def incident_report_for_event(self, event_id: UUID) -> IncidentReport | None: ...
+
+    async def record_action(self, record: ActionRecord) -> ActionRecord: ...
+
     async def incident_observations(
         self,
         identifier: UUID,
@@ -86,6 +94,9 @@ class DataRepository(Protocol):
         *,
         limit: int = 100,
         event_id: UUID | None = None,
+        text: str | None = None,
+        before_cursor: tuple[datetime, UUID] | None = None,
+        through: datetime | None = None,
     ) -> list[StoredInvestigation]: ...
 
     async def queue_investigation(
@@ -159,6 +170,7 @@ class SocketClawApp(App[None]):
     CSS_PATH = "styles.tcss"
     ENABLE_COMMAND_PALETTE = True
     BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("ctrl+k", "commands", "Commands", show=False, priority=True),
         Binding("ctrl+t", "toggle_appearance", "Theme", show=False),
         Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
         Binding("1", "show_view('overview-view')", "Overview", show=False),
@@ -231,6 +243,27 @@ class SocketClawApp(App[None]):
         self._monitor_stopped = False
         self._product_screen_mounted = False
         self._config_lock = asyncio.Lock()
+        self.drafts: dict[str, dict[str, str]] = {}
+        self._investigation_tasks: dict[UUID, asyncio.Task[StoredInvestigation]] = {}
+        self._investigation_scopes: dict[UUID, UUID] = {}
+        self._investigation_lock = asyncio.Lock()
+
+    def on_resize(self, event: Resize) -> None:
+        too_small = event.size.width < 64 or event.size.height < 16
+        if too_small and not getattr(self, "_size_warning", False):
+            self.notify(
+                "Use at least 64 columns and 16 rows; 80 x 24 is recommended.",
+                title="Terminal size",
+                severity="warning",
+                timeout=5,
+            )
+        self._size_warning = too_small
+
+    def action_commands(self) -> None:
+        if isinstance(self.screen, DashboardScreen):
+            self.screen.action_command_prompt()
+        else:
+            self.action_command_palette()
 
     @property
     def config_store(self) -> ConfigStore:
@@ -328,7 +361,37 @@ class SocketClawApp(App[None]):
         if isinstance(self.screen, DashboardScreen):
             self.screen.apply_config(config)
 
+    async def investigation_context(self, event_id: UUID) -> IncidentContext:
+        repository = self.services.repository
+        if repository is None:
+            raise RuntimeError("Investigation storage is unavailable")
+        event = await repository.get_event(event_id)
+        if event is None:
+            raise KeyError(str(event_id))
+        report = await repository.incident_report_for_event(event_id)
+        return build_incident_context(report, focus_event=event)
+
     async def investigate_event(self, event_id: UUID) -> StoredInvestigation:
+        repository = self.services.repository
+        report = await repository.incident_report_for_event(event_id) if repository else None
+        scope = report.history.incident.id if report else event_id
+        async with self._investigation_lock:
+            self._investigation_scopes[event_id] = scope
+            task = self._investigation_tasks.get(scope)
+            if task is None or task.done():
+                task = asyncio.create_task(self._investigate_event(event_id))
+                self._investigation_tasks[scope] = task
+        try:
+            return await task
+        finally:
+            if task.done() and self._investigation_tasks.get(scope) is task:
+                self._investigation_tasks.pop(scope, None)
+
+    def investigation_running(self, event_id: UUID) -> bool:
+        task = self._investigation_tasks.get(self._investigation_scopes.get(event_id, event_id))
+        return task is not None and not task.done()
+
+    async def _investigate_event(self, event_id: UUID) -> StoredInvestigation:
         if self.services.investigate is not None:
             result = await self.services.investigate(event_id)
             self._refresh_investigations()
@@ -367,7 +430,8 @@ class SocketClawApp(App[None]):
         try:
             await repository.start_investigation(queued.id)
             self._refresh_investigations()
-            result = await OpenAIClient(key).investigate(event)
+            context = await self.investigation_context(event_id)
+            result = await OpenAIClient(key).investigate(event, context=context)
         except asyncio.CancelledError:
             with suppress(Exception):
                 await repository.fail_investigation(
@@ -502,7 +566,7 @@ class SocketClawApp(App[None]):
         )
 
     def _refresh_investigations(self) -> None:
-        if isinstance(self.screen, DashboardScreen):
+        if self.screen_stack and isinstance(self.screen, DashboardScreen):
             self.screen.refresh_investigations()
 
     def _show_product_screen(
@@ -595,6 +659,11 @@ class SocketClawApp(App[None]):
         self.exit()
 
     async def on_unmount(self) -> None:
+        tasks = list(self._investigation_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         with suppress(BaseException):
             await self._stop_monitor()
 

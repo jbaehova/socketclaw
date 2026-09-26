@@ -207,7 +207,7 @@ async def test_cancelled_investigation_becomes_durable_failed_work(
         def __init__(self, _key: str) -> None:
             pass
 
-        async def investigate(self, _event: object) -> None:
+        async def investigate(self, _event: object, *, context: object = None) -> None:
             started.set()
             await asyncio.Future()
 
@@ -294,7 +294,9 @@ async def test_completion_failure_marks_running_work_failed(
         def __init__(self, _key: str) -> None:
             pass
 
-        async def investigate(self, _event: object) -> InvestigationResult:
+        async def investigate(
+            self, _event: object, *, context: object = None
+        ) -> InvestigationResult:
             return result
 
     monkeypatch.setattr("socketclaw.ui.app.OpenAIClient", InstantClient)
@@ -323,7 +325,9 @@ async def test_post_commit_error_preserves_and_returns_completed_result(
         def __init__(self, _key: str) -> None:
             pass
 
-        async def investigate(self, _event: object) -> InvestigationResult:
+        async def investigate(
+            self, _event: object, *, context: object = None
+        ) -> InvestigationResult:
             return result
 
     monkeypatch.setattr("socketclaw.ui.app.OpenAIClient", InstantClient)
@@ -351,7 +355,9 @@ async def test_cancellation_during_completion_waits_for_durable_outcome(
         def __init__(self, _key: str) -> None:
             pass
 
-        async def investigate(self, _event: object) -> InvestigationResult:
+        async def investigate(
+            self, _event: object, *, context: object = None
+        ) -> InvestigationResult:
             return result
 
     monkeypatch.setattr("socketclaw.ui.app.OpenAIClient", InstantClient)
@@ -390,5 +396,5 @@ async def test_inactive_event_workspace_waits_to_query_until_reentered(
         assert calls == 0
         await pilot.press("2")
         await pilot.pause(0.3)
-        assert fixture.app.screen.query_one("#events-table", DataTable).row_count == 101
+        assert fixture.app.screen.query_one("#events-table", DataTable).row_count == 100
         assert calls <= 2

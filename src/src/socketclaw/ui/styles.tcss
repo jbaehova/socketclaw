@@ -194,7 +194,9 @@ DetailScreen > Button, HealthScreen > Button { height: 1; margin-top: 1; }
 .narrow .view-hint { display: none; }
 .narrow .settings-grid { layout: vertical; }
 .narrow .settings-grid > Vertical { width: 100%; padding: 0; margin-bottom: 1; }
-.narrow #event-source { display: none; }
+.narrow .filter-row { height: 2; layout: grid; grid-size: 2; grid-columns: 1fr 1fr; }
+.narrow #event-search { column-span: 2; width: 1fr; }
+.narrow #event-source, .narrow #event-severity { width: 1fr; }
 .short #command-hint { margin-top: 0; }
 .short #watch-summary { margin-bottom: 0; }
 .short .section-label { margin: 0; }
@@ -232,3 +234,11 @@ SettingsConflictScreen { padding: 0; }
 #conflict-actions { height: 1; margin: 0; padding: 0; }
 SettingsConflictScreen Button { width: 1fr; min-width: 0; margin: 0; padding: 0; }
 SettingsConflictScreen.tiny #conflict-actions { layout: grid; grid-size: 2; grid-rows: 1; height: 2; }
+
+.pagination-row { height: 1; margin-top: 1; }
+.pagination-row Button { margin-right: 1; }
+
+#onboarding-candidates { height: 5; margin-top: 1; border: solid $border; }
+#onboarding-discovery { height: auto; color: $text-muted; margin-top: 1; }
+
+#watch-coverage { height: auto; color: $text-muted; margin-bottom: 1; }

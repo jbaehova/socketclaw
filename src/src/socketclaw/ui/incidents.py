@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from typing import ClassVar, Literal, cast
+from uuid import UUID, uuid4
 
 from rich.text import Text
 from textual import on, work
@@ -11,10 +13,13 @@ from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Resize
-from textual.widgets import Button, DataTable, Input, Markdown, Static, Tab, Tabs, TextArea
+from textual.widgets import Button, DataTable, Input, Markdown, Select, Static, Tab, Tabs, TextArea
 
+from ..context import build_incident_context
+from ..domain import utc_now
 from ..incident_store import IncidentStore
 from ..incidents import Incident, IncidentNote, Occurrence, Transition
+from ..response_actions import ActionRecord
 from .context import escape_markdown, safe_text, socketclaw_app
 from .layout import ResponsiveModalScreen as ModalScreen
 from .related import RelatedObservations
@@ -84,6 +89,8 @@ class IncidentDesk(ModalScreen[None]):
         self.store = store
         self.items: dict[str, Incident] = {}
         self.page = 0
+        self.cursors: list[tuple[datetime, UUID] | None] = [None]
+        self.through = utc_now()
         self.has_more = False
 
     def compose(self) -> ComposeResult:
@@ -93,12 +100,12 @@ class IncidentDesk(ModalScreen[None]):
         yield Static("Loading local incident history…", id="desk-status", markup=False)
         with Horizontal(id="desk-toolbar"):
             yield Tabs(
-                Tab("Needs attention", id="needs-attention"),
+                Tab("Unresolved", id="needs-attention"),
                 Tab("Resolved", id="resolved"),
                 Tab("All", id="all-cases"),
                 id="desk-tabs",
             )
-            yield Input(placeholder="Filter this page", id="desk-search")
+            yield Input(placeholder="Search all incidents", id="desk-search")
         with Horizontal(id="desk-body"):
             yield DataTable(id="incident-table", cursor_type="row", zebra_stripes=False)
             with VerticalScroll(id="desk-inspector"):
@@ -126,6 +133,21 @@ class IncidentDesk(ModalScreen[None]):
             table.add_column(label, width=width)
         table.focus()
         self.refresh_data()
+        self.set_interval(3, self.check_updates)
+
+    @work(exclusive=True, group="incident-desk-watermark")
+    async def check_updates(self) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            counts = await self.store.counts()
+        except Exception:
+            return  # Explicit Refresh reports a persistent read failure.
+        if self.is_mounted and counts != getattr(self, "_counts", None):
+            self.query_one("#desk-status", Static).update(
+                f"{max(0, sum(counts.values()) - sum(getattr(self, '_counts', {}).values()))} "
+                "new incident(s); counts changed. R Refresh keeps your selection."
+            )
 
     def on_resize(self, event: Resize) -> None:
         self.set_class(event.size.width < 120, "compact")
@@ -134,6 +156,7 @@ class IncidentDesk(ModalScreen[None]):
         self.dismiss(None)
 
     def action_refresh(self) -> None:
+        self.through = utc_now()
         self.refresh_data()
 
     @on(Button.Pressed, "#desk-exceptions")
@@ -144,30 +167,41 @@ class IncidentDesk(ModalScreen[None]):
 
     @on(Button.Pressed, "#desk-refresh")
     def refresh_button(self) -> None:
-        self.refresh_data()
+        self.action_refresh()
 
     @on(Tabs.TabActivated, "#desk-tabs")
     def change_tab(self) -> None:
         self.page = 0
+        self.cursors = [None]
+        self.through = utc_now()
         self.refresh_data()
 
     @on(Input.Changed, "#desk-search")
     def search_changed(self) -> None:
-        self._render_rows()
+        self.page = 0
+        self.cursors = [None]
+        self.through = utc_now()
+        self.refresh_data()
 
     @on(Button.Pressed, "#desk-prev")
     def previous_page(self) -> None:
-        self.page = max(0, self.page - 1)
-        self.refresh_data()
+        if self.page:
+            self.page -= 1
+            self.cursors.pop()
+            self.refresh_data()
 
     @on(Button.Pressed, "#desk-next")
     def next_page(self) -> None:
-        if self.has_more:
+        if self.has_more and self.items:
+            last = list(self.items.values())[-1]
+            self.cursors.append((last.first_seen_at, last.id))
             self.page += 1
             self.refresh_data()
 
     @work(exclusive=True, group="incident-desk-load")
     async def refresh_data(self) -> None:
+        if not self.is_mounted:
+            return
         active = self.query_one("#desk-tabs", Tabs).active
         try:
             rows, counts = await asyncio.gather(
@@ -175,7 +209,9 @@ class IncidentDesk(ModalScreen[None]):
                     status="resolved" if active == "resolved" else None,
                     active_only=active == "needs-attention",
                     limit=101,
-                    offset=self.page * 100,
+                    before_cursor=self.cursors[-1],
+                    through=self.through,
+                    text=self.query_one("#desk-search", Input).value.strip() or None,
                 ),
                 self.store.counts(),
             )
@@ -184,12 +220,16 @@ class IncidentDesk(ModalScreen[None]):
                 safe_text(f"Cannot load incidents: {exc}")
             )
             return
+        if not self.is_mounted:
+            return
+        self._counts = counts
         self.has_more = len(rows) > 100
         self.items = {str(item.id): item for item in rows[:100]}
         self.query_one("#desk-status", Static).update(
             f"{counts.get('open', 0)} open   /   "
             f"{counts.get('acknowledged', 0)} acknowledged   /   "
-            f"{counts.get('resolved', 0)} resolved     Page {self.page + 1}"
+            f"{counts.get('resolved', 0)} resolved / Page {self.page + 1} / "
+            f"Refreshed {utc_now().astimezone():%H:%M:%S} (R to update)"
         )
         self.query_one("#desk-prev", Button).disabled = self.page == 0
         self.query_one("#desk-next", Button).disabled = not self.has_more
@@ -269,7 +309,10 @@ class IncidentDesk(ModalScreen[None]):
 
 
 class IncidentReader(ModalScreen[None]):
-    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "close", "Back to incidents")]
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "close", "Back to incidents"),
+        Binding("r", "refresh", "Refresh"),
+    ]
     DEFAULT_CSS = """
     IncidentReader { background: $background; layout: vertical; padding: 1 2; }
     #case-heading { height: 3; margin-bottom: 1; }
@@ -288,16 +331,20 @@ class IncidentReader(ModalScreen[None]):
         super().__init__()
         self.store = store
         self.incident = incident
+        self._note_ids: dict[str, UUID] = {}
+        self._applying = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="case-heading"):
             yield Static("INCIDENT / Esc Back", id="case-title")
+            yield Button("Refresh", id="case-refresh")
             yield Button("Observations", id="case-evidence")
             yield Button("Export .md", id="case-export")
         with VerticalScroll(id="case-scroll", can_focus=True):
             yield Markdown(_overview(self.incident), id="case-content", open_links=False)
         yield Static("", id="case-feedback", markup=False)
         with Horizontal(id="case-actions"):
+            yield Button("Record action", id="case-action")
             yield Button("Add note", id="case-note")
             yield Button("Acknowledge", id="case-ack", variant="primary")
             yield Button("Resolve", id="case-resolve")
@@ -306,6 +353,22 @@ class IncidentReader(ModalScreen[None]):
     def on_mount(self) -> None:
         self.query_one("#case-scroll").focus()
         self.reload_detail()
+        self.set_interval(2, self.check_updates)
+
+    @on(Button.Pressed, "#case-refresh")
+    def action_refresh(self) -> None:
+        self.reload_detail()
+
+    @work(exclusive=True, group="incident-reader-watermark")
+    async def check_updates(self) -> None:
+        try:
+            current = await self.store.get(self.incident.id)
+        except Exception:
+            return  # Explicit Refresh reports a persistent read failure.
+        if self.is_mounted and current and current.revision != self.incident.revision:
+            self.query_one("#case-feedback", Static).update(
+                "New evidence or operator changes available. R Refresh keeps your place."
+            )
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -331,10 +394,36 @@ class IncidentReader(ModalScreen[None]):
         if current is None:
             self.query_one("#case-feedback", Static).update("This incident is no longer available.")
             return
+        if not self.is_mounted:
+            return
         self.incident = current
-        self.query_one("#case-content", Markdown).update(
-            _detail(current, occurrences, timeline, notes)
-        )
+        scroll = self.query_one("#case-scroll", VerticalScroll)
+        old_y = scroll.scroll_y
+        content = _detail(current, occurrences, timeline, notes)
+        repository = socketclaw_app(self).services.repository
+        if repository is not None:
+            report = await repository.incident_report(current.id)
+            if report is not None:
+                context = build_incident_context(report)
+                content += "\n\n### Local evidence assessment\n\n" + "\n".join(
+                    "- " + escape_markdown(line) for line in context.local_summary
+                )
+                content += "\n\n### Next checks / runbook\n\n" + "\n".join(
+                    "- " + escape_markdown(line) for line in context.runbook
+                )
+                content += "\n\n### Action records\n\n" + (
+                    "\n\n".join(
+                        f"**{record.status}** / {escape_markdown(record.summary)}\n\n"
+                        + "Evidence: "
+                        + ", ".join(str(identifier) for identifier in record.evidence_ids)
+                        for record in report.action_records
+                    )
+                    or "No action has been recorded as performed or verified."
+                )
+        if not self.is_mounted:
+            return
+        self.query_one("#case-content", Markdown).update(content)
+        scroll.call_after_refresh(scroll.scroll_to, y=old_y, animate=False)
         self.query_one("#case-ack", Button).disabled = current.status != "open"
         resolve = self.query_one("#case-resolve", Button)
         resolve.label = "Reopen" if current.status == "resolved" else "Resolve"
@@ -368,11 +457,20 @@ class IncidentReader(ModalScreen[None]):
     def resolve(self) -> None:
         self._prompt("open" if self.incident.status == "resolved" else "resolved")
 
+    @on(Button.Pressed, "#case-action")
+    def record_action(self) -> None:
+        def reload_after_action(_: bool | None) -> None:
+            self.reload_detail()
+
+        socketclaw_app(self).push_screen(ActionEditor(self.incident), reload_after_action)
+
     @on(Button.Pressed, "#case-note")
     def add_note(self) -> None:
         self._prompt("note")
 
     def _prompt(self, action: Literal["acknowledged", "resolved", "open", "note"]) -> None:
+        if self._applying:
+            return
         labels = {
             "acknowledged": "Acknowledge incident",
             "resolved": "Resolve incident",
@@ -382,9 +480,13 @@ class IncidentReader(ModalScreen[None]):
 
         def apply_comment(body: str | None) -> None:
             if body:
+                self._applying = True
                 self._apply(action, body)
 
-        socketclaw_app(self).push_screen(IncidentComment(labels[action]), apply_comment)
+        socketclaw_app(self).push_screen(
+            IncidentComment(labels[action], draft_key=f"incident:{self.incident.id}:{action}"),
+            apply_comment,
+        )
 
     @work(exclusive=True, group="incident-reader-action")
     async def _apply(
@@ -393,15 +495,27 @@ class IncidentReader(ModalScreen[None]):
         try:
             if action == "note":
                 await self.store.add_note(
-                    self.incident.id, body, expected_revision=self.incident.revision
+                    self.incident.id,
+                    body,
+                    expected_revision=self.incident.revision,
+                    note_id=self._note_ids.setdefault(body, uuid4()),
                 )
             else:
                 await self.store.change_status(
                     self.incident.id, action, reason=body, expected_revision=self.incident.revision
                 )
         except Exception as exc:
-            self.query_one("#case-feedback", Static).update(safe_text(str(exc)))
+            await self.reload_detail().wait()
+            self.query_one("#case-feedback", Static).update(
+                safe_text(
+                    f"{exc} Draft kept. Review current state, then reopen the reason to retry."
+                )
+            )
+            self._applying = False
             return
+        self._applying = False
+        socketclaw_app(self).drafts.pop(f"incident:{self.incident.id}:{action}", None)
+        self._note_ids.pop(body, None)
         self.reload_detail()
 
 
@@ -419,9 +533,10 @@ class IncidentComment(ModalScreen[str | None]):
     #case-comment-buttons { height: 3; align-horizontal: right; }
     """
 
-    def __init__(self, title: str) -> None:
+    def __init__(self, title: str, *, draft_key: str | None = None) -> None:
         super().__init__()
         self.heading = title
+        self.draft_key = draft_key or f"comment:{title}"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="case-comment-dialog"):
@@ -430,20 +545,33 @@ class IncidentComment(ModalScreen[str | None]):
                 "Leave a reason for the next person reviewing this incident.",
                 id="case-comment-copy",
             )
-            yield TextArea(id="case-comment-body")
+            yield TextArea(
+                socketclaw_app(self).drafts.get(self.draft_key, {}).get("body", ""),
+                id="case-comment-body",
+            )
             with Horizontal(id="case-comment-buttons"):
-                yield Button("Cancel", id="case-comment-cancel")
+                yield Button("Discard", id="case-comment-discard")
+                yield Button("Back (keep draft)", id="case-comment-cancel")
                 yield Button("Save", id="case-comment-save", variant="primary", disabled=True)
 
     def on_mount(self) -> None:
         self.query_one(TextArea).focus()
 
     def action_cancel(self) -> None:
+        self._keep_draft()
+        self.dismiss(None)
+
+    def _keep_draft(self) -> None:
+        socketclaw_app(self).drafts[self.draft_key] = {"body": self.query_one(TextArea).text}
+
+    @on(Button.Pressed, "#case-comment-discard")
+    def discard(self) -> None:
+        socketclaw_app(self).drafts.pop(self.draft_key, None)
         self.dismiss(None)
 
     @on(Button.Pressed, "#case-comment-cancel")
     def cancel_button(self) -> None:
-        self.dismiss(None)
+        self.action_cancel()
 
     @on(TextArea.Changed)
     def comment_changed(self) -> None:
@@ -455,6 +583,7 @@ class IncidentComment(ModalScreen[str | None]):
     def save_comment(self) -> None:
         body = self.query_one(TextArea).text.strip()
         if body:
+            self._keep_draft()
             self.dismiss(body)
 
 
@@ -494,3 +623,103 @@ def _detail(
         or "No notes yet. Add context for the next review."
     )
     return content
+
+
+class ActionEditor(ModalScreen[bool]):
+    """Record operator work without executing commands or implying automatic verification."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "close", "Back")]
+    DEFAULT_CSS = """
+    ActionEditor { background: $background; layout: vertical; padding: 0 2; }
+    ActionEditor VerticalScroll { height: 1fr; }
+    ActionEditor Static { height: auto; margin-bottom: 1; }
+    ActionEditor TextArea { height: 5; margin: 1 0; }
+    ActionEditor Input, ActionEditor Select { margin-bottom: 1; }
+    """
+
+    def __init__(self, incident: Incident) -> None:
+        super().__init__()
+        self.incident = incident
+        self.draft_key = f"action:{incident.id}"
+        self.record_id = uuid4()
+
+    def compose(self) -> ComposeResult:
+        yield Static("RECORD MANUAL ACTION / no commands are executed")
+        with VerticalScroll():
+            yield Static(
+                "Choose the outcome you actually observed. Approval alone is not execution."
+            )
+            yield Select(
+                [
+                    ("User performed", "user_performed"),
+                    ("Failed", "failed"),
+                    ("Rolled back", "rolled_back"),
+                    ("Verified against evidence", "verified"),
+                ],
+                value="user_performed",
+                allow_blank=False,
+                id="action-status",
+            )
+            yield Static("What did you do, and what happened?")
+            yield TextArea(id="action-summary")
+            yield Static(
+                "Observation IDs (comma separated). Verification requires related evidence."
+            )
+            yield Input(id="action-evidence")
+            yield Static("", id="action-feedback", markup=False)
+        with Horizontal(classes="action-row"):
+            yield Button("Save record", id="action-save", variant="primary")
+            yield Button("Back (keep draft)", id="action-back")
+            yield Button("Discard", id="action-discard")
+
+    def on_mount(self) -> None:
+        draft = socketclaw_app(self).drafts.get(self.draft_key, {})
+        self.query_one("#action-summary", TextArea).load_text(draft.get("summary", ""))
+        self.query_one("#action-evidence", Input).value = draft.get("evidence", "")
+        self.query_one("#action-status", Select).value = draft.get("status", "user_performed")
+        self.query_one(TextArea).focus()
+
+    @on(Button.Pressed, "#action-back")
+    def action_close(self) -> None:
+        socketclaw_app(self).drafts[self.draft_key] = {
+            "summary": self.query_one(TextArea).text,
+            "evidence": self.query_one(Input).value,
+            "status": str(cast(Select[str], self.query_one(Select)).value),
+        }
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#action-discard")
+    def discard(self) -> None:
+        socketclaw_app(self).drafts.pop(self.draft_key, None)
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#action-save")
+    @work(exclusive=True, group="manual-action-save")
+    async def save_record(self) -> None:
+        button = self.query_one("#action-save", Button)
+        button.disabled = True
+        try:
+            repository = socketclaw_app(self).services.repository
+            if repository is None:
+                raise RuntimeError("Action storage is unavailable")
+            record = ActionRecord(
+                id=self.record_id,
+                incident_id=self.incident.id,
+                status=cast(
+                    Literal["user_performed", "failed", "rolled_back", "verified"],
+                    cast(Select[str], self.query_one(Select)).value,
+                ),
+                summary=self.query_one(TextArea).text.strip(),
+                evidence_ids=tuple(
+                    UUID(value.strip())
+                    for value in self.query_one(Input).value.split(",")
+                    if value.strip()
+                ),
+            )
+            await repository.record_action(record)
+        except Exception as exc:
+            self.query_one("#action-feedback", Static).update(safe_text(str(exc)))
+            button.disabled = False
+            return
+        socketclaw_app(self).drafts.pop(self.draft_key, None)
+        self.dismiss(True)

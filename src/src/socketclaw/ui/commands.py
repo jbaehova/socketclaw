@@ -17,6 +17,7 @@ COMMANDS = (
     ("/hosts", "Manage watched hosts"),
     ("/logs", "Manage log sources"),
     ("/incidents", "Review incidents"),
+    ("/maintenance", "Manage maintenance exceptions"),
     ("/investigations", "Read AI investigations"),
     ("/settings", "Edit configuration"),
     ("/health", "Check collection health"),

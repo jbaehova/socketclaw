@@ -144,15 +144,29 @@ class FakeRepository:
     async def get_event(self, event_id: UUID) -> StoredEvent | None:
         return next((row for row in self.events_data if row.id == event_id), None)
 
+    async def incident_report_for_event(self, event_id: UUID):
+        return None
+
     async def list_investigations(
         self,
         *,
         limit: int = 100,
         event_id: UUID | None = None,
+        text: str | None = None,
+        before_cursor: tuple[datetime, UUID] | None = None,
+        through: datetime | None = None,
     ) -> list[StoredInvestigation]:
         rows = self.investigations_data
         if event_id is not None:
             rows = [row for row in rows if row.event_id == event_id]
+        if text:
+            rows = [row for row in rows if text.casefold() in row.model_dump_json().casefold()]
+        if before_cursor:
+            rows = [
+                row
+                for row in rows
+                if (row.created_at, str(row.id)) < (before_cursor[0], str(before_cursor[1]))
+            ]
         return rows[:limit]
 
     async def list_response_proposals(

@@ -48,7 +48,7 @@ async def test_enter_opens_full_detail_and_escape_restores_selection(
         assert fixture.app.focused is table
 
 
-async def test_overview_queries_critical_event_behind_recent_ordinary_events(
+async def test_overview_keeps_recent_activity_visible_despite_old_high_scores(
     app_factory: Callable[..., Any],
 ) -> None:
     critical = event_fixture(title="Older critical event", severity="critical")
@@ -59,13 +59,13 @@ async def test_overview_queries_critical_event_behind_recent_ordinary_events(
     async with fixture.app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         table = fixture.app.screen.query_one("#overview-events", OptionList)
-        assert table.option_count == 1
-        assert "Older critical event" in str(table.get_option_at_index(0).prompt)
+        assert table.option_count == 30
+        assert "Older critical event" not in str(table.get_option_at_index(0).prompt)
         table.focus()
         await pilot.press("enter")
         assert isinstance(fixture.app.screen, DetailScreen)
         assert (
-            "Older critical event"
+            "Repeated SSH authentication failures"
             in fixture.app.screen.query_one("#full-detail-body", Markdown).source
         )
         await pilot.press("escape")

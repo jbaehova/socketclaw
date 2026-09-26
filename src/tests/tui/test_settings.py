@@ -31,7 +31,7 @@ async def test_settings_preserves_luna_and_atomically_saves(
         fixture.app.screen.query_one("#settings-ports", Input).value = "22, 443, 8443"
         fixture.app.screen.query_one(
             "#settings-log-paths", Input
-        ).value = "/var/log/auth.log, /var/log/system.log"
+        ).value = '["/var/log/auth.log", "/var/log/system.log"]'
         fixture.app.screen.query_one("#settings-theme", Select).value = "textual-light"
         await pilot.click("#save-settings")
         await pilot.pause(0.2)

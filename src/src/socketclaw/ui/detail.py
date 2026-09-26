@@ -62,6 +62,23 @@ def event_detail_markdown(
         or "- No deterministic signals were recorded."
     )
     evidence = indented_code(event.model_dump_json(indent=2))
+    clocks = "\n\n### Evidence timing\n\n" + "  \n".join(
+        f"{label}: {value.isoformat(timespec='seconds') if value else 'not recorded'}"
+        for label, value in (
+            ("Source time", event.source_at),
+            ("Collected", event.collected_at),
+            ("Committed", event.committed_at),
+            ("Correlation time", event.correlation_at),
+        )
+    )
+    clocks += f"\n\nTime basis: {escape_markdown(event.time_basis)}."
+    if (
+        event.time_basis == "delayed_source"
+        or event.evidence.get("late_arrival")
+        or event.evidence.get("historical")
+    ):
+        clocks += " Historical or delayed arrival; collection time is not attack occurrence time."
+
     return (
         f"## {escape_markdown(event.title)}\n\n"
         f"**{event.severity.value.upper()} / {event.score}/100**  \n"
@@ -69,7 +86,9 @@ def event_detail_markdown(
         f"{escape_markdown(event.target or 'no target')}  \n"
         f"{event.observed_at.astimezone().isoformat(timespec='seconds')}\n\n"
         f"{escape_markdown(event.summary)}\n\n### Detection signals\n\n{signals}\n\n"
-        f"### Evidence\n\n{evidence}" + suppression_markdown(suppressions)
+        + clocks
+        + f"\n\n### Local original evidence\n\n{evidence}"
+        + suppression_markdown(suppressions)
     )
 
 

@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import json
+from typing import TYPE_CHECKING, cast
 
-from pydantic import ValidationError
-from textual import on
+from pydantic import TypeAdapter, ValidationError
+from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Resize
-from textual.widgets import Button, ContentSwitcher, Input, Static
+from textual.widgets import Button, ContentSwitcher, Input, Select, SelectionList, Static
 
-from ..config import AppConfig
+from ..config import AppConfig, ServiceConfig
+from ..discovery import DiscoveryReport, discover_sources
 from ..openai import OpenAIError
 from .context import safe_text, socketclaw_app
 from .layout import ResponsiveScreen as Screen
@@ -36,6 +38,7 @@ class OnboardingScreen(Screen[None]):
         self._existing_api_key = existing_api_key
         self._pending_key = existing_api_key
         self._pending_config = initial_config.model_copy(deep=True)
+        self.discovery: DiscoveryReport | None = None
 
     def set_appearance(self, theme: str) -> None:
         self._pending_config = self._pending_config.model_copy(update={"theme": theme})
@@ -44,6 +47,7 @@ class OnboardingScreen(Screen[None]):
         self.set_class(self.size.height < 27 or self.size.width < 82, "compact")
         self.query_one("#onboarding-skip", Button).display = False
         self.query_one("#onboarding-next", Button).focus()
+        self.discover()
 
     def on_resize(self, event: Resize) -> None:
         self.set_class(event.size.height < 27 or event.size.width < 82, "compact")
@@ -88,15 +92,32 @@ class OnboardingScreen(Screen[None]):
                         id="api-key",
                     )
                 with VerticalScroll(id="onboarding-target-step", classes="onboarding-step"):
-                    yield Static("Set the first watch targets", classes="step-title")
+                    yield Static("Choose what this watch can observe", classes="step-title")
+                    yield Select(
+                        [
+                            ("Local development services", "local"),
+                            ("Specified server health", "server"),
+                            ("Security log investigation", "logs"),
+                        ],
+                        value=self._pending_config.profile,
+                        allow_blank=False,
+                        id="onboarding-profile",
+                    )
                     yield Static(
-                        "Use hostnames or IP addresses separated by commas.",
+                        "Targets use ICMP and TCP only. Blank is allowed for log-only monitoring.",
                         classes="step-copy",
                     )
                     yield Input(
                         value=", ".join(self._pending_config.targets),
                         placeholder="1.1.1.1, gateway.local",
                         id="onboarding-targets",
+                    )
+                    yield Static("Readable log files / JSON list", classes="field-label")
+                    yield Input(json.dumps(self._pending_config.log_paths), id="onboarding-logs")
+                    yield Static("Discovered local candidates: select intended sources only.")
+                    yield SelectionList[str](id="onboarding-candidates")
+                    yield Static(
+                        "Discovering readable sources…", id="onboarding-discovery", markup=False
                     )
                     with Horizontal(classes="interval-row"):
                         with Vertical():
@@ -114,7 +135,9 @@ class OnboardingScreen(Screen[None]):
                                 id="onboarding-scan-interval",
                             )
                 with VerticalScroll(id="onboarding-ready", classes="onboarding-step"):
-                    yield Static("Ready to watch.", classes="step-title")
+                    yield Static(
+                        "Configuration ready. First observation pending.", classes="step-title"
+                    )
                     yield Static(
                         "Use / to browse commands. Pause with Space. "
                         "Switch appearance with Ctrl+T.",
@@ -216,6 +239,11 @@ class OnboardingScreen(Screen[None]):
                 {
                     **self._pending_config.model_dump(),
                     "targets": targets,
+                    "profile": cast(
+                        Select[str], self.query_one("#onboarding-profile", Select)
+                    ).value,
+                    "log_paths": self._selected_logs(),
+                    "services": self._selected_services(),
                     "ping_interval": float(
                         self.query_one("#onboarding-ping-interval", Input).value
                     ),
@@ -229,6 +257,75 @@ class OnboardingScreen(Screen[None]):
             self.query_one("#onboarding-targets", Input).focus()
             return False
         return True
+
+    @work(exclusive=True, group="source-discovery")
+    async def discover(self) -> None:
+        try:
+            report = await discover_sources()
+            if not self.is_mounted or not self.query("#onboarding-candidates"):
+                return
+            self.discovery = report
+            choices = cast(
+                SelectionList[str], self.query_one("#onboarding-candidates", SelectionList)
+            )
+            for index, source in enumerate(report.sources):
+                if source.supported and source.readable:
+                    choices.add_option((f"Log file: {source.path}", f"source:{index}"))  # pyright: ignore[reportUnknownMemberType]
+            for index, listener in enumerate(report.listeners):
+                choices.add_option(  # pyright: ignore[reportUnknownMemberType]
+                    (
+                        f"Service: {listener.process or 'unknown process'} "
+                        f"{listener.host}:{listener.port} / {listener.exposure}",
+                        f"listener:{index}",
+                    )
+                )
+            unavailable = [
+                f"{source.path}: {source.detail}"
+                for source in report.sources
+                if not source.readable
+            ]
+            self.query_one("#onboarding-discovery", Static).update(
+                "\n".join((*report.limitations, *unavailable))
+            )
+        except Exception as exc:
+            if self.is_mounted and self.query("#onboarding-discovery"):
+                self.query_one("#onboarding-discovery", Static).update(
+                    f"Discovery unavailable: {exc}"
+                )
+
+    def _selected_logs(self) -> list[str]:
+        raw = self.query_one("#onboarding-logs", Input).value.strip()
+        paths = TypeAdapter(list[str]).validate_json(raw or "[]", strict=True)
+        if self.discovery:
+            for value in cast(SelectionList[str], self.query_one(SelectionList)).selected:
+                if value.startswith("source:"):
+                    paths.append(self.discovery.sources[int(value.split(":")[1])].path)
+        return list(dict.fromkeys(paths))
+
+    def _selected_services(self) -> list[ServiceConfig]:
+        services = list(self._pending_config.services)
+        if self.discovery:
+            for value in cast(SelectionList[str], self.query_one(SelectionList)).selected:
+                if not value.startswith("listener:"):
+                    continue
+                listener = self.discovery.listeners[int(value.split(":")[1])]
+                host = (
+                    "127.0.0.1"
+                    if listener.host in {"*", "0.0.0.0"}
+                    else "::1"
+                    if listener.host == "::"
+                    else listener.host
+                )
+                identifier = f"local-{listener.port}-{value.split(':')[1]}"
+                service = ServiceConfig(
+                    id=identifier,
+                    name=f"{listener.process or 'Local service'}:{listener.port}",
+                    host=host,
+                    port=listener.port,
+                )
+                if not any(item.id == service.id for item in services):
+                    services.append(service)
+        return services
 
     def _show_step(self, step: int) -> None:
         ids = (
@@ -261,10 +358,13 @@ class OnboardingScreen(Screen[None]):
         preset = self._pending_config.preset
         model_summary = preset.label if self._pending_key is not None else "Local monitoring only"
         self.query_one("#onboarding-summary", Static).update(
-            f"{len(self._pending_config.targets)} target(s) / "
+            f"{len(self._pending_config.targets)} network target(s) / "
+            f"{len(self._pending_config.log_paths)} log file(s) / "
+            f"{len(self._pending_config.services)} required service(s)\n"
             f"{model_summary} / "
             f"Ping {self._pending_config.ping_interval:g}s / "
-            f"Scan {self._pending_config.scan_interval:g}s"
+            f"Scan {self._pending_config.scan_interval:g}s\n"
+            "Collection is not yet verified. Overview will show actual first evidence and gaps."
         )
 
     def _set_error(self, message: str) -> None:

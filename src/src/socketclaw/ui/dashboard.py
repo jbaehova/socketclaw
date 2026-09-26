@@ -22,9 +22,8 @@ from textual.widgets.option_list import Option
 
 from .. import __version__
 from ..config import AppConfig
-from ..domain import Severity
+from ..health import coverage_summary
 from ..monitor import MonitorStatus
-from ..storage import EventQuery
 from .commands import CommandBar
 from .context import safe_text, socketclaw_app
 from .detail import DetailScreen, event_detail_markdown
@@ -59,6 +58,7 @@ class OverviewView(Vertical):
         yield Static("Your watch", classes="view-title")
         yield Static("", id="watch-targets", markup=False)
         yield Static("", id="watch-summary", markup=False)
+        yield Static("", id="watch-coverage", markup=False)
         yield Static("", id="overview-state", classes="inline-state", markup=False)
         yield Static("Recent activity", id="activity-label", classes="section-label")
         yield OptionList(id="overview-events")
@@ -112,26 +112,23 @@ class OverviewView(Vertical):
         try:
             stats = await repository.session_stats()
             events = await repository.list_events()
-            high_signal = await repository.list_events(
-                EventQuery(severities=(Severity.HIGH, Severity.CRITICAL), limit=8)
-            )
         except Exception as exc:
             state = self.query_one("#overview-state", Static)
             state.update(f"Could not load posture: {exc}")
             state.add_class("error")
             return
         self.query_one("#watch-targets", Static).update(
-            "Watching " + ", ".join(self.config.targets)
+            "Watching "
+            + (", ".join(self.config.targets) or "configured local sources")
+            + f" / {len(self.config.log_paths)} log file(s)"
         )
-        attention = stats.by_severity.get("high", 0) + stats.by_severity.get("critical", 0)
+        attention = stats.attention_incidents
         self.query_one("#watch-summary", Static).update(
             f"{stats.total_events} observations   {attention} need attention   "
             f"{stats.completed_investigations} investigations   ${stats.cost_usd:.4f}"
         )
-        selected_events = high_signal or events[:30]
-        self.query_one("#activity-label", Static).update(
-            "Needs attention" if high_signal else "Recent activity"
-        )
+        selected_events = events[:30]
+        self.query_one("#activity-label", Static).update("Recent activity / original observations")
         activity = self.query_one("#overview-events", OptionList)
         self.query_one("#activity-empty").display = not selected_events
         activity.display = bool(selected_events)
@@ -153,6 +150,9 @@ class OverviewView(Vertical):
             elif selected_events:
                 activity.highlighted = 0
             self._activity_signature = signature
+        self.query_one("#watch-coverage", Static).update(
+            coverage_summary(self.config, app.services.monitor.status.probe_health)
+        )
         state = self.query_one("#overview-state", Static)
         if self.startup_warning is not None:
             state.update(safe_text(self.startup_warning))
@@ -211,6 +211,7 @@ class DashboardScreen(ResponsiveScreen[None]):
             self.show_monitor_error(self._monitor_error)
         self.set_interval(1.0, self.refresh_run_state)
         self.set_interval(0.25, self._refresh_dirty_views)
+        self.set_interval(5, self._resync_evidence)
         self._consume_events()
         self.call_after_refresh(self._focus_view, "overview-view")
 
@@ -275,12 +276,13 @@ class DashboardScreen(ResponsiveScreen[None]):
             selected = value.removeprefix("/theme ")
             if selected in {"light", "dark", "terminal"}:
                 await app.set_appearance(selected)
-        elif value in {"/help", "/health", "/rules", "/incidents"}:
+        elif value in {"/help", "/health", "/rules", "/incidents", "/maintenance"}:
             {
                 "/help": app.action_help,
                 "/health": app.action_health,
                 "/rules": app.action_rules,
                 "/incidents": app.action_incidents,
+                "/maintenance": app.action_maintenance,
             }[value]()
         else:
             self.query_one("#command-hint", Static).update("Unknown command. Type / to browse.")
@@ -357,6 +359,15 @@ class DashboardScreen(ResponsiveScreen[None]):
     def _current_view(self) -> str:
         current = self.query_one("#workspace", ContentSwitcher).current
         return str(current or "")
+
+    def _resync_evidence(self) -> None:
+        # Queue delivery is only a hint. Periodic DB reads recover dropped notifications.
+        if not self.is_mounted or socketclaw_app(self).screen is not self:
+            return
+        if self._current_view == "overview-view":
+            self.query_one(OverviewView).refresh_data()
+        elif self._current_view == "events-view":
+            self.query_one(EventsView).resync_live()
 
     def _refresh_dirty_views(self) -> None:
         if socketclaw_app(self).screen is not self:

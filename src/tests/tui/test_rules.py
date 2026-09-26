@@ -79,10 +79,17 @@ async def test_compact_editor_keyboard_reaches_last_score_and_apply(app_factory)
     async with fixture.app.run_test(size=(80, 24)) as pilot:
         fixture.app.action_rules()
         await pilot.pause()
-        # Seven thresholds and fifteen score fields are reachable in form order.
-        await pilot.press(*(["tab"] * 21))
+        # Additional policy fields and replay scope remain keyboard reachable.
+        for _ in range(80):
+            if fixture.app.focused.id == "points-log_firewall_denial_burst":
+                break
+            await pilot.press("tab")
         assert fixture.app.focused.id == "points-log_firewall_denial_burst"
-        await pilot.press("ctrl+shift+a", "4", "2", "tab")
+        await pilot.press("ctrl+shift+a", "4", "2")
+        for _ in range(20):
+            await pilot.press("tab")
+            if fixture.app.focused.id == "apply-rules":
+                break
         assert fixture.app.focused.id == "apply-rules"
         await pilot.press("enter")
         await pilot.pause()

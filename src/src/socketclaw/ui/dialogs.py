@@ -43,12 +43,14 @@ class HelpScreen(ModalScreen[None]):
                 "[b]1-5[/b]  Switch workspace\n"
                 "[b]Space[/b] Pause or resume monitoring\n"
                 "[b]/[/b] Commands  [b]Ctrl+T[/b] Light / dark\n"
-                "[b]Ctrl+P[/b] Search all actions\n"
+                "[b]Ctrl+K[/b] Commands from inputs  [b]Ctrl+P[/b] All actions\n"
                 "[b]Enter[/b] Open detail  [b]Esc[/b] Return to your list\n"
                 "[b]L[/b] Log source progress and read errors\n"
                 "[b]H[/b] Collection health and scheduling\n"
                 "[b]R[/b] Run diagnostic  [b]I[/b] Investigate event\n"
-                "[b]E[/b] Export incident  [b]?[/b] Help  [b]Q[/b] Quit",
+                "[b]E[/b] Export selected observation (Events)\n"
+                "Incident reader: Export .md exports the full case\n"
+                "[b]/maintenance[/b] Exceptions  [b]?[/b] Help  [b]Q[/b] Quit",
                 id="help-copy",
             )
             yield Button("Close", id="help-close", variant="primary")

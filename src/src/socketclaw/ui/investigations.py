@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from typing import cast
 from uuid import UUID
 
 from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, DataTable, Markdown, Static
+from textual.widgets import Button, DataTable, Input, Markdown, Static
 
 from ..config import OPENAI_MODEL
+from ..domain import utc_now
 from ..storage import (
     ResponseStatus,
     StoredInvestigation,
@@ -32,12 +34,17 @@ class InvestigationsView(Vertical):
         self.proposals: list[StoredResponseProposal] = []
         self._selected_id: UUID | None = None
         self._transitioning = False
+        self._retrying = False
+        self._cursors: list[tuple[datetime, UUID] | None] = [None]
+        self._through = utc_now()
+        self._has_more = False
 
     def compose(self) -> ComposeResult:
         yield Static("INVESTIGATIONS / OPENAI", classes="view-kicker")
         with Horizontal(classes="view-heading"):
             yield Static("Analysis queue", classes="view-title")
             yield Static("", id="investigation-totals", classes="view-hint")
+        yield Input(placeholder="Search all investigation history", id="investigation-search")
         yield Static(
             "Loading investigation history…",
             id="investigations-state",
@@ -64,6 +71,9 @@ class InvestigationsView(Vertical):
             )
             yield Button("Approve response", id="approve-response", disabled=True)
             yield Button("Reject response", id="reject-response", disabled=True)
+        with Horizontal(classes="pagination-row"):
+            yield Button("Previous", id="investigations-prev", disabled=True)
+            yield Button("Older", id="investigations-next", disabled=True)
 
     def on_mount(self) -> None:
         self.query_one("#investigations-table", DataTable).add_columns(
@@ -73,6 +83,8 @@ class InvestigationsView(Vertical):
 
     @work(exclusive=True, group="investigations-load")
     async def refresh_data(self) -> None:
+        if not self.is_mounted:
+            return
         app = socketclaw_app(self)
         repository = app.services.repository
         if repository is None:
@@ -80,17 +92,47 @@ class InvestigationsView(Vertical):
             return
         try:
             self.investigations, self.proposals, stats = await asyncio.gather(
-                repository.list_investigations(limit=500),
+                repository.list_investigations(
+                    limit=101,
+                    text=self.query_one("#investigation-search", Input).value.strip() or None,
+                    before_cursor=self._cursors[-1],
+                    through=self._through if len(self._cursors) > 1 else None,
+                ),
                 repository.list_response_proposals(limit=500),
                 repository.session_stats(),
             )
         except Exception as exc:
             self._show_state(f"Could not load investigations: {exc}", error=True)
             return
+        if not self.is_mounted:
+            return
+        self._has_more = len(self.investigations) > 100
+        self.investigations = self.investigations[:100]
+        self.query_one("#investigations-prev", Button).disabled = len(self._cursors) == 1
+        self.query_one("#investigations-next", Button).disabled = not self._has_more
         self.query_one("#investigation-totals", Static).update(
             f"{stats.total_tokens:,} tokens / ${stats.cost_usd:.6f} lifetime cost"
         )
         self._render_rows()
+
+    @on(Input.Changed, "#investigation-search")
+    def search_changed(self) -> None:
+        self._cursors = [None]
+        self._through = utc_now()
+        self.refresh_data()
+
+    @on(Button.Pressed, "#investigations-next")
+    def older_page(self) -> None:
+        if self._has_more and self.investigations:
+            last = self.investigations[-1]
+            self._cursors.append((last.created_at, last.id))
+            self.refresh_data()
+
+    @on(Button.Pressed, "#investigations-prev")
+    def newer_page(self) -> None:
+        if len(self._cursors) > 1:
+            self._cursors.pop()
+            self.refresh_data()
 
     def selected_investigation(self) -> StoredInvestigation | None:
         if self._selected_id is not None:
@@ -118,14 +160,33 @@ class InvestigationsView(Vertical):
             self._selected_id = None
         self._render_detail()
         self.refresh_actions()
+        self.load_selected_proposals()
+
+    @work(exclusive=True, group="selected-proposals")
+    async def load_selected_proposals(self) -> None:
+        selected = self.selected_investigation()
+        repository = socketclaw_app(self).services.repository
+        if selected is None or repository is None:
+            return
+        proposals = await repository.list_response_proposals(event_id=selected.event_id, limit=500)
+        if not self.is_mounted or self.selected_investigation() != selected:
+            return
+        self.proposals = [
+            item for item in self.proposals if item.event_id != selected.event_id
+        ] + proposals
+        self._render_detail()
+        self.refresh_actions()
 
     @on(Button.Pressed, "#retry-investigation")
     def retry(self) -> None:
+        if self._retrying:
+            return
         selected = self.selected_investigation()
         if selected is None or selected.status != "failed":
             self._show_state("Select a failed investigation to retry.")
             return
         self._selected_id = None
+        self._retrying = True
         self._retry(selected.event_id)
 
     @work(exclusive=True, group="investigation-retry")
@@ -142,7 +203,9 @@ class InvestigationsView(Vertical):
             self._show_state("Investigation completed.")
             self.refresh_data()
         finally:
-            button.disabled = False
+            self._retrying = False
+            if self.is_mounted:
+                self.refresh_actions()
 
     @on(Button.Pressed, "#approve-response")
     def approve_response(self) -> None:
@@ -190,7 +253,7 @@ class InvestigationsView(Vertical):
                 ),
             )
             return
-        self._update_response(proposal.id, status)
+        self._update_response(proposal.id, status, proposal.status)
 
     def _confirmed_transition(
         self,
@@ -322,7 +385,9 @@ class InvestigationsView(Vertical):
         proposal = self._selected_proposal()
         if proposal is not None:
             content += (
-                f"\n\n### Response proposal / {proposal.status.upper()}\n\n"
+                f"\n\n### Response review / {proposal.status.upper()}\n\n"
+                "Review does not execute an action. "
+                "Record performed actions and verification in the incident.\n\n"
                 f"`{proposal.proposal.action}` "
                 f"`{escape_markdown(proposal.proposal.target_ip or 'no target')}` - "
                 f"{escape_markdown(proposal.proposal.reason)}"
@@ -335,7 +400,7 @@ class InvestigationsView(Vertical):
         pending = proposal is not None and proposal.status == "pending"
         rejectable = proposal is not None and proposal.status in {"pending", "approved"}
         self.query_one("#retry-investigation", Button).disabled = (
-            selected is None or selected.status != "failed"
+            selected is None or selected.status != "failed" or self._retrying
         )
         self.query_one("#approve-response", Button).disabled = not pending or self._transitioning
         self.query_one("#reject-response", Button).disabled = not rejectable or self._transitioning

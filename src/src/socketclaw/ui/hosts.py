@@ -22,6 +22,7 @@ from ..config import AppConfig
 from .context import safe_text, socketclaw_app
 from .dialogs import ConfirmTargetRemovalScreen
 from .logs import LogSourcesView
+from .services import ServicesView
 
 
 class HostsView(Vertical):
@@ -29,6 +30,7 @@ class HostsView(Vertical):
 
     def __init__(self) -> None:
         super().__init__(id="hosts-view", classes="workspace-view")
+        self._diagnosing = False
 
     def compose(self) -> ComposeResult:
         yield Static("HOSTS / WATCH TARGETS", classes="view-kicker")
@@ -46,6 +48,8 @@ class HostsView(Vertical):
                     yield Button("Ping now", id="ping-host", variant="primary")
                     yield Button("Scan ports", id="scan-host")
                     yield Button("Remove", id="remove-host", variant="error")
+            with TabPane("Services", id="host-services"):
+                yield ServicesView()
             with TabPane("Logs", id="host-logs"):
                 yield LogSourcesView()
 
@@ -64,11 +68,16 @@ class HostsView(Vertical):
         if self.screen.query_one("#workspace", ContentSwitcher).current != "hosts-view":
             return
         logs = self.query_one("#hosts-tabs", TabbedContent).active == "host-logs"
-        self.query_one("#logs-table" if logs else "#hosts-table").focus()
+        services = self.query_one("#hosts-tabs", TabbedContent).active == "host-services"
+        self.query_one(
+            "#logs-table" if logs else "#services-table" if services else "#hosts-table"
+        ).focus()
 
     def run_context_action(self) -> None:
         if self.query_one("#hosts-tabs", TabbedContent).active == "host-logs":
             self.query_one(LogSourcesView).test_source()
+        elif self.query_one("#hosts-tabs", TabbedContent).active == "host-services":
+            self.query_one(ServicesView).check_service()
         else:
             self.run_diagnostic("ping")
 
@@ -83,6 +92,10 @@ class HostsView(Vertical):
         )
         if logs:
             self.query_one(LogSourcesView).refresh_data()
+        elif self.query_one("#hosts-tabs", TabbedContent).active == "host-services":
+            self.query_one(".view-kicker", Static).update("HOSTS / SERVICES")
+            self.query_one(".view-title", Static).update("Service expectations and measurements")
+            self.query_one(ServicesView).refresh_data()
         self.call_after_refresh(self.focus_workspace)
 
     def refresh_targets(self) -> None:
@@ -158,9 +171,6 @@ class HostsView(Vertical):
         if selected is None:
             self._show_state("Select a target to remove.")
             return
-        if len(app.config.targets) == 1:
-            self._show_state("At least one monitoring target is required.", error=True)
-            return
         app.push_screen(
             ConfirmTargetRemovalScreen(selected),
             lambda accepted: self._confirmed_removal(accepted, selected),
@@ -182,8 +192,6 @@ class HostsView(Vertical):
                 nonlocal removed
                 if selected not in current.targets:
                     return current
-                if len(current.targets) == 1:
-                    raise ValueError("At least one monitoring target is required.")
                 removed = True
                 return current.model_copy(
                     update={"targets": [target for target in current.targets if target != selected]}
@@ -208,19 +216,26 @@ class HostsView(Vertical):
     def scan_target(self) -> None:
         self.run_diagnostic("ports")
 
-    @work(exclusive=True, group="host-diagnostic")
-    async def run_diagnostic(self, kind: str) -> None:
+    def run_diagnostic(self, kind: str) -> None:
+        if not self._diagnosing:
+            self._diagnosing = True
+            self._run_diagnostic(kind)
+
+    @work(group="host-diagnostic")
+    async def _run_diagnostic(self, kind: str) -> None:
         app = socketclaw_app(self)
         if kind not in app.services.monitor.status.diagnostics:
             self._show_state(
                 f"{kind.title()} diagnostic is unavailable on this system.",
                 error=True,
             )
+            self._diagnosing = False
             self._refresh_diagnostic_buttons()
             return
         selected = self.selected_target()
         if selected is None:
             self._show_state("Select a target before running a diagnostic.")
+            self._diagnosing = False
             return
         buttons = (
             self.query_one("#ping-host", Button),
@@ -236,6 +251,7 @@ class HostsView(Vertical):
         else:
             self._show_state(f"{kind.title()} diagnostic completed for {selected}.")
         finally:
+            self._diagnosing = False
             self._refresh_diagnostic_buttons()
 
     def _refresh_diagnostic_buttons(self) -> None:
@@ -243,8 +259,8 @@ class HostsView(Vertical):
         ping = self.query_one("#ping-host", Button)
         ports = self.query_one("#scan-host", Button)
         ping.label = "Ping now" if "ping" in diagnostics else "Ping unavailable"
-        ping.disabled = "ping" not in diagnostics
-        ports.disabled = "ports" not in diagnostics
+        ping.disabled = self._diagnosing or "ping" not in diagnostics
+        ports.disabled = self._diagnosing or "ports" not in diagnostics
 
     def selected_target(self) -> str | None:
         table = cast(DataTable[str], self.query_one("#hosts-table", DataTable))

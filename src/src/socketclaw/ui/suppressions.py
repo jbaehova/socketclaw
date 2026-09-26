@@ -47,7 +47,10 @@ def _scope(item: SuppressionRule) -> str:
 
 
 class MaintenanceScreen(ModalScreen[None]):
-    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "close", "Back")]
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "close", "Back"),
+        Binding("r", "refresh", "Refresh"),
+    ]
     DEFAULT_CSS = """
     MaintenanceScreen { background: $background; padding: 1 2; }
     #maintenance-heading { height: 2; text-style: bold; }
@@ -78,6 +81,7 @@ class MaintenanceScreen(ModalScreen[None]):
         with Horizontal(id="maintenance-actions"):
             yield Button("Previous", id="maintenance-prev", disabled=True)
             yield Button("Next", id="maintenance-next", disabled=True)
+            yield Button("Refresh", id="maintenance-refresh")
             yield Button("New exception", id="maintenance-new", variant="primary")
             yield Button("End early", id="maintenance-end", disabled=True)
             yield Button("Back", id="maintenance-back")
@@ -88,6 +92,18 @@ class MaintenanceScreen(ModalScreen[None]):
             table.add_column(label, width=width)
         table.focus()
         self.reload()
+        self.set_interval(1, self.refresh_expiry)
+
+    def action_refresh(self) -> None:
+        self.reload()
+
+    def refresh_expiry(self) -> None:
+        if not self.is_mounted:
+            return
+        table = cast(DataTable[str], self.query_one(DataTable))
+        for key, item in self.items.items():
+            table.update_cell(key, table.ordered_columns[0].key, _status(item))
+        self.preview()
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -99,9 +115,13 @@ class MaintenanceScreen(ModalScreen[None]):
         except Exception as exc:
             self.query_one("#maintenance-selection", Static).update(safe_text(str(exc)))
             return
+        if not self.is_mounted:
+            return
+        selected = self.selected()
         self.has_more = len(items) > 100
         self.items = {str(item.id): item for item in items[:100]}
         table = cast(DataTable[str], self.query_one(DataTable))
+        scroll_y = table.scroll_y
         table.clear()
         for item in self.items.values():
             table.add_row(
@@ -110,6 +130,12 @@ class MaintenanceScreen(ModalScreen[None]):
                 item.expires_at.astimezone().strftime("%d %b %H:%M %Z"),
                 key=str(item.id),
             )
+        if selected and str(selected.id) in table.rows:
+            table.move_cursor(row=table.get_row_index(str(selected.id)), scroll=False)
+            table.call_after_refresh(table.scroll_to, y=scroll_y, animate=False)
+        self.query_one("#maintenance-copy", Static).update(
+            f"Refreshed {utc_now().astimezone():%H:%M:%S}. Expiry updates live. R reloads changes."
+        )
         self.query_one("#maintenance-prev", Button).disabled = self.page == 0
         self.query_one("#maintenance-next", Button).disabled = not self.has_more
         self.preview()
@@ -160,6 +186,8 @@ class MaintenanceScreen(ModalScreen[None]):
     @on(Button.Pressed)
     def button(self, event: Button.Pressed) -> None:
         match event.button.id:
+            case "maintenance-refresh":
+                self.reload()
             case "maintenance-prev":
                 self.page = max(0, self.page - 1)
                 self.reload()
@@ -179,7 +207,12 @@ class MaintenanceScreen(ModalScreen[None]):
                         if reason:
                             self.end_exception(item, reason)
 
-                    socketclaw_app(self).push_screen(IncidentComment("End exception early"), end)
+                    socketclaw_app(self).push_screen(
+                        IncidentComment(
+                            "End exception early", draft_key=f"maintenance-end:{item.id}"
+                        ),
+                        end,
+                    )
             case "maintenance-back":
                 self.action_close()
             case _:
@@ -197,6 +230,7 @@ class MaintenanceScreen(ModalScreen[None]):
         except Exception as exc:
             self.query_one("#maintenance-selection", Static).update(safe_text(str(exc)))
             return
+        socketclaw_app(self).drafts.pop(f"maintenance-end:{item.id}", None)
         self.reload()
 
 
@@ -219,6 +253,7 @@ class MaintenanceEditor(ModalScreen[bool]):
         super().__init__()
         self.store = store
         self.context = context
+        self.draft_key = f"maintenance:{context.id if context else 'new'}"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="exception-dialog"):
@@ -272,13 +307,36 @@ class MaintenanceEditor(ModalScreen[bool]):
                 markup=False,
             )
             with Horizontal(id="exception-actions"):
-                yield Button("Cancel", id="exception-cancel")
+                yield Button("Discard", id="exception-discard")
+                yield Button("Back (keep draft)", id="exception-cancel")
                 yield Button("Create exception", id="exception-save", variant="primary")
 
     def on_mount(self) -> None:
+        draft = socketclaw_app(self).drafts.get(self.draft_key, {})
+        for field in self.query(Input):
+            if field.id in draft:
+                field.value = draft[field.id]
+        for selector in ("exception-family", "exception-rule", "exception-duration"):
+            field = cast(Select[object], self.query_one(f"#{selector}", Select))
+            if field.id in draft:
+                field.value = (
+                    int(draft[field.id]) if field.id == "exception-duration" else draft[field.id]
+                )
+        self.query_one(TextArea).load_text(draft.get("reason", ""))
         self.query_one("#exception-target", Input).focus()
 
     def action_cancel(self) -> None:
+        draft = {str(field.id): field.value for field in self.query(Input)}
+        for selector in ("exception-family", "exception-rule", "exception-duration"):
+            select = cast(Select[object], self.query_one(f"#{selector}", Select))
+            draft[selector] = str(select.value)
+        draft["reason"] = self.query_one(TextArea).text
+        socketclaw_app(self).drafts[self.draft_key] = draft
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#exception-discard")
+    def discard(self) -> None:
+        socketclaw_app(self).drafts.pop(self.draft_key, None)
         self.dismiss(False)
 
     @on(Button.Pressed, "#exception-cancel")
@@ -314,4 +372,5 @@ class MaintenanceEditor(ModalScreen[bool]):
             self.query_one("#exception-feedback", Static).update(safe_text(str(exc)))
             button.disabled = False
             return
+        socketclaw_app(self).drafts.pop(self.draft_key, None)
         self.dismiss(True)
