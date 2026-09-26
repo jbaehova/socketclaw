@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from . import __version__
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,3 +210,24 @@ async def migrate_v3_to_v4(connection: AsyncConnection) -> None:
     )
     for statement in statements:
         await connection.exec_driver_sql(statement)
+
+
+async def migrate_v4_to_v5(connection: AsyncConnection) -> None:
+    """Add explicit clocks without relabeling historical ingestion timestamps."""
+    for column in (
+        "collected_at VARCHAR(40)",
+        "committed_at VARCHAR(40)",
+        "correlation_at VARCHAR(40)",
+        "time_basis VARCHAR(40) NOT NULL DEFAULT 'legacy_collection'",
+    ):
+        await connection.exec_driver_sql(f"ALTER TABLE events ADD COLUMN {column}")
+    await connection.exec_driver_sql(
+        "CREATE INDEX ix_events_event_clock ON events(rule_version, source, correlation_at)"
+    )
+    await connection.exec_driver_sql(
+        "CREATE TABLE action_records (id VARCHAR(36) PRIMARY KEY NOT NULL, "
+        "incident_id VARCHAR(36) NOT NULL REFERENCES incidents(id), data_json TEXT NOT NULL)"
+    )
+    await connection.exec_driver_sql(
+        "CREATE TABLE retained_source_keys (source_key VARCHAR(200) PRIMARY KEY NOT NULL)"
+    )

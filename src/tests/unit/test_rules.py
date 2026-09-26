@@ -58,3 +58,42 @@ def test_rule_thresholds_points_and_explanations_match_the_active_policy():
     assert detector.score(event, []).score == 7
     with pytest.raises(ValidationError):
         RulePoints(ping_total_loss=True)
+
+
+def test_legacy_snapshot_validates_without_rewriting_its_bytes():
+    import hashlib
+    import json
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from socketclaw.rules import RuleVersion
+
+    snapshot = json.loads(RuleConfig().snapshot())
+    snapshot["engine_version"] = 2
+    snapshot["parser_version"] = 2
+    for code in (
+        "service_failed",
+        "port_unexpected_exposure",
+        "service_unknown",
+        "log_unverified_indicator",
+        "log_sudo_execution",
+        "log_auth_after_failures",
+    ):
+        snapshot["config"]["points"].pop(code)
+    original = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    decoded = RuleVersion(
+        id=uuid4(),
+        applied_at=datetime(2026, 9, 1, tzinfo=UTC),
+        snapshot_json=original,
+        fingerprint=hashlib.sha256(original.encode()).hexdigest(),
+    )
+    assert decoded.snapshot_json == original
+    assert "service_failed" not in decoded.snapshot_json
+    unknown = original.replace('"engine_version":2', '"engine_version":999')
+    with pytest.raises(ValidationError, match="unsupported rule snapshot version"):
+        RuleVersion(
+            id=uuid4(),
+            applied_at=datetime(2026, 9, 1, tzinfo=UTC),
+            snapshot_json=unknown,
+            fingerprint=hashlib.sha256(unknown.encode()).hexdigest(),
+        )

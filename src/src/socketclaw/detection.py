@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import math
 import re
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Sequence
-from datetime import timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import cast
+from uuid import UUID
 
 from .domain import DetectionResult, DetectionSignal, SecurityEvent, severity_for_score
 from .rules import RuleConfig
@@ -52,7 +55,7 @@ class Detector:
     def score(
         self,
         event: SecurityEvent,
-        recent: Sequence[SecurityEvent],
+        recent: Sequence[SecurityEvent] | CorrelationIndex,
     ) -> DetectionResult:
         signals: list[DetectionSignal] = []
 
@@ -62,6 +65,30 @@ class Detector:
             self._score_ports(event, signals)
         elif event.source == "log":
             self._score_log(event, recent, signals)
+
+        elif (
+            event.source == "system"
+            and event.evidence.get("confirmed") is True
+            and event.evidence.get("required", True)
+        ):
+            if event.event_type == "service.failed":
+                signals.append(
+                    _signal(
+                        "service.failed",
+                        "Required service failed",
+                        70,
+                        "The required endpoint failed its configured consecutive checks.",
+                    )
+                )
+            elif event.event_type == "service.unknown":
+                signals.append(
+                    _signal(
+                        "service.unknown",
+                        "Service measurement unavailable",
+                        40,
+                        "The required endpoint could not be measured across consecutive checks.",
+                    )
+                )
 
         signals = [
             signal.model_copy(update={"points": self.config.points.for_code(signal.code)})
@@ -77,7 +104,7 @@ class Detector:
     def _score_ping(
         self,
         event: SecurityEvent,
-        recent: Sequence[SecurityEvent],
+        recent: Sequence[SecurityEvent] | CorrelationIndex,
         signals: list[DetectionSignal],
     ) -> None:
         if event.evidence.get("outcome") in {"error", "unknown"}:
@@ -113,7 +140,9 @@ class Detector:
 
         if (
             loss >= self.config.ping_high_loss_percent
-            and len(self._related(event, recent, minimum_loss=self.config.ping_high_loss_percent))
+            and self._related_count(
+                event, recent, "ping", limit=self.config.ping_sustained_count - 1
+            )
             >= self.config.ping_sustained_count - 1
         ):
             signals.append(
@@ -131,6 +160,18 @@ class Detector:
         event: SecurityEvent,
         signals: list[DetectionSignal],
     ) -> None:
+        violations = event.evidence.get("exposure_violations")
+        if isinstance(violations, list) and violations:
+            signals.append(
+                _signal(
+                    "port.unexpected_exposure",
+                    "Unexpected local binding",
+                    55,
+                    "A measured local listener exceeds its configured exposure scope. "
+                    "Binding and process evidence are retained; "
+                    "internet reachability is unknown.",
+                )
+            )
         initial_sensitive = sorted(
             set(_ports(event.evidence.get("initial_open_ports"))) & _SENSITIVE_PORTS
         )
@@ -174,7 +215,7 @@ class Detector:
                         f"{len(opened)} TCP ports appeared in one scan.",
                     )
                 )
-        elif closed:
+        if closed:
             signals.append(
                 _signal(
                     "port.closed",
@@ -187,21 +228,56 @@ class Detector:
     def _score_log(
         self,
         event: SecurityEvent,
-        recent: Sequence[SecurityEvent],
+        recent: Sequence[SecurityEvent] | CorrelationIndex,
         signals: list[DetectionSignal],
     ) -> None:
         message = str(event.evidence.get("message", "")).casefold()
-        if event.event_type == "log.malware_indicator" or any(
-            term in message for term in _MALWARE_TERMS
+        if (
+            event.evidence.get("action") == "malware_detected"
+            and event.evidence.get("parser") == "clamav"
         ):
             signals.append(
                 _signal(
                     "log.malware_indicator",
-                    "Malware indicator",
+                    "Security tool detection",
                     80,
-                    "The log entry contains a known malware indicator.",
+                    "ClamAV reported FOUND. Signature and affected path are retained in evidence.",
                 )
             )
+        elif event.event_type == "log.unverified_indicator" or any(
+            re.search(r"\b" + term + r"\b", message) for term in _MALWARE_TERMS
+        ):
+            signals.append(
+                _signal(
+                    "log.unverified_indicator",
+                    "Unverified security keyword",
+                    10,
+                    "A security-related term is present. This is not a confirmed malware finding.",
+                )
+            )
+        if event.event_type == "log.sudo_execution":
+            signals.append(
+                _signal(
+                    "log.sudo_execution",
+                    "Approved sudo execution",
+                    0,
+                    "A sudo command was recorded. This alone does not establish malicious intent.",
+                )
+            )
+        if event.event_type == "log.auth_success" and event.evidence.get("user"):
+            failures = self._related_count(
+                event, recent, "auth", before_only=True, limit=self.config.auth_failure_count
+            )
+            if failures >= self.config.auth_failure_count:
+                signals.append(
+                    _signal(
+                        "log.auth_after_failures",
+                        "Login after repeated failures",
+                        60,
+                        "This account and source authenticated after repeated failures "
+                        "on the same asset.",
+                    )
+                )
         is_auth_failure = event.event_type == "log.auth_failure" or any(
             term in message for term in _AUTH_FAILURE_TERMS
         )
@@ -214,16 +290,10 @@ class Detector:
                     "The log records a failed authentication attempt.",
                 )
             )
-            matching = [
-                candidate
-                for candidate in self._related(event, recent)
-                if candidate.event_type == "log.auth_failure"
-                or any(
-                    term in str(candidate.evidence.get("message", "")).casefold()
-                    for term in _AUTH_FAILURE_TERMS
-                )
-            ]
-            if len(matching) >= self.config.auth_failure_count - 1:
+            matching = self._related_count(
+                event, recent, "auth", limit=self.config.auth_failure_count - 1
+            )
+            if matching >= self.config.auth_failure_count - 1:
                 signals.append(
                     _signal(
                         "log.auth_burst",
@@ -233,15 +303,13 @@ class Detector:
                         f"or log source occurred within {self.config.window_seconds} seconds.",
                     )
                 )
-        if event.event_type == "log.privilege_escalation" or (
-            "privilege escalation" in message or "sudo:" in message
-        ):
+        if event.event_type == "log.privilege_escalation":
             signals.append(
                 _signal(
                     "log.privilege_escalation",
                     "Privilege escalation",
                     45,
-                    "The log records a privileged execution event.",
+                    "An explicitly classified privilege escalation event was recorded.",
                 )
             )
         denial_count = _firewall_denial_count(event)
@@ -256,8 +324,8 @@ class Detector:
                 )
             )
         if denial_count:
-            denial_count += sum(
-                _firewall_denial_count(candidate) for candidate in self._related(event, recent)
+            denial_count += self._related_count(
+                event, recent, "firewall", limit=self.config.firewall_denial_count
             )
         if denial_count >= self.config.firewall_denial_count:
             signals.append(
@@ -265,9 +333,32 @@ class Detector:
                     "log.firewall_denial_burst",
                     "Firewall denial burst",
                     40,
-                    f"{denial_count} firewall denials were grouped in this event.",
+                    f"At least {denial_count} firewall denials occurred "
+                    "within the correlation window.",
                 )
             )
+
+    def _related_count(
+        self,
+        event: SecurityEvent,
+        recent: Sequence[SecurityEvent] | CorrelationIndex,
+        kind: str,
+        *,
+        before_only: bool = False,
+        limit: int,
+    ) -> int:
+        if isinstance(recent, CorrelationIndex):
+            return recent.count(event, self.window, kind, before_only=before_only, limit=limit)
+        selected = [
+            candidate
+            for candidate in recent
+            if _sample_weight(candidate, kind, self.config) > 0
+            and (not before_only or correlation_time(candidate) <= correlation_time(event))
+        ]
+        return sum(
+            _sample_weight(candidate, kind, self.config)
+            for candidate in self._related(event, selected)
+        )
 
     def _related(
         self,
@@ -276,21 +367,40 @@ class Detector:
         *,
         minimum_loss: float | None = None,
     ) -> list[SecurityEvent]:
-        at = event.ingested_at or event.observed_at
+        at = correlation_time(event)
         earliest = at - self.window
-        correlation_key = _correlation_key(event)
-        if correlation_key is None:
+        latest = (
+            at + self.window
+            if event.source == "log" and correlation_basis(event) in {"source", "delayed_source"}
+            else at
+        )
+        key = correlation_key(event)
+        if key is None:
             return []
         related = [
             candidate
             for candidate in recent
             if candidate.id != event.id
             and candidate.source == event.source
-            and _correlation_key(candidate) == correlation_key
+            and correlation_key(candidate) == key
             and candidate.rule_version == event.rule_version
-            and (event.ingested_at is None or candidate.ingested_at is not None)
-            and earliest <= (candidate.ingested_at or candidate.observed_at) <= at
+            and earliest <= correlation_time(candidate) <= latest
         ]
+        if event.source == "log" and related:
+            # Pick one genuine window containing this event, not a 2-window union.
+            related.sort(key=lambda candidate: (correlation_time(candidate), str(candidate.id)))
+            best: list[SecurityEvent] = []
+            right = 0
+            for left, candidate in enumerate(related):
+                start = min(at, correlation_time(candidate))
+                end = start + self.window
+                while right < len(related) and correlation_time(related[right]) <= end:
+                    right += 1
+                if len(best) < right - left:
+                    best = related[left:right]
+                if correlation_time(candidate) >= at:
+                    break
+            related = best
         if minimum_loss is not None:
             related = [
                 candidate
@@ -345,10 +455,49 @@ def _ports(value: object) -> list[int]:
 
 
 def _port_list(ports: list[int]) -> str:
-    return ", ".join(str(port) for port in ports)
+    shown = ", ".join(str(port) for port in ports[:24])
+    return (
+        shown if len(ports) <= 24 else f"{shown} (+{len(ports) - 24} more; full list in evidence)"
+    )
 
 
-def _correlation_key(event: SecurityEvent) -> tuple[str, str] | None:
+def correlation_time(event: SecurityEvent) -> datetime:
+    """Use trusted event time while preserving the historical ingestion field."""
+    recorded = getattr(event, "correlation_at", None)
+    if recorded is not None:
+        return recorded
+    collected = getattr(event, "collected_at", None) or event.ingested_at or event.observed_at
+    if (
+        event.source == "log"
+        and event.source_at is not None
+        and event.evidence.get("source_time_quality") == "explicit_timezone"
+        and event.source_at <= collected
+    ):
+        return event.source_at
+    return collected
+
+
+def correlation_basis(event: SecurityEvent) -> str:
+    collected = getattr(event, "collected_at", None) or event.ingested_at or event.observed_at
+    if (
+        event.source == "log"
+        and event.source_at is not None
+        and event.evidence.get("source_time_quality") == "explicit_timezone"
+    ):
+        if event.source_at > collected:
+            return "future_source_fallback"
+        return "delayed_source" if collected - event.source_at > timedelta(minutes=5) else "source"
+    return "collected"
+
+
+def correlation_key(event: SecurityEvent) -> tuple[str, ...] | None:
+    if event.source == "log" and isinstance(event.evidence.get("asset"), str):
+        return (
+            "asset",
+            str(event.evidence["asset"]).casefold(),
+            str(event.evidence.get("user") or ""),
+            str(event.evidence.get("actor_ip") or event.evidence.get("source_ip") or ""),
+        )
     if event.target is not None:
         return ("target", event.target.casefold())
     path = event.evidence.get("path")
@@ -367,3 +516,116 @@ def _firewall_denial_count(event: SecurityEvent) -> int:
     ):
         return max(1, reported)
     return 0
+
+
+# Compatibility for integrations which used the former private helper.
+_correlation_key = correlation_key
+
+
+@dataclass
+class _Samples:
+    times: list[datetime] = field(default_factory=lambda: list[datetime]())
+    weights: list[int] = field(default_factory=lambda: list[int]())
+    cumulative: list[int] = field(default_factory=lambda: [0])
+    ids: dict[UUID, tuple[datetime, int]] = field(
+        default_factory=lambda: dict[UUID, tuple[datetime, int]]()
+    )
+
+    def append(self, event: SecurityEvent, weight: int) -> None:
+        if event.id in self.ids:
+            return
+        at = correlation_time(event)
+        index = bisect_right(self.times, at)
+        self.times.insert(index, at)
+        self.weights.insert(index, weight)
+        self.ids[event.id] = (at, weight)
+        self.cumulative.insert(index + 1, self.cumulative[index] + weight)
+        for position in range(index + 2, len(self.cumulative)):
+            self.cumulative[position] += weight
+
+    def total(self, start: datetime, end: datetime, event: SecurityEvent) -> int:
+        left, right = bisect_left(self.times, start), bisect_right(self.times, end)
+        value = self.cumulative[right] - self.cumulative[left]
+        own = self.ids.get(event.id)
+        return value - own[1] if own is not None and start <= own[0] <= end else value
+
+
+class CorrelationIndex:
+    """Prepared numeric history, isolated by rule activation and correlation identity.
+
+    Construct once per batch history and append each committed candidate. Ordinary
+    forward windows use two binary searches. Reordered source events examine exact
+    windows containing the candidate and stop once the configured threshold is met.
+    The index owns no database connection and never mutates evidence.
+    """
+
+    def __init__(self, config: RuleConfig, observations: Iterable[SecurityEvent] = ()) -> None:
+        self.config = config
+        self._groups: dict[tuple[object, ...], _Samples] = {}
+        for event in sorted(observations, key=correlation_time):
+            self.append(event)
+
+    def _key(self, event: SecurityEvent, kind: str) -> tuple[object, ...] | None:
+        identity = correlation_key(event)
+        if identity is None:
+            return None
+        return (event.source.value, event.rule_version, identity, kind)
+
+    def append(self, event: SecurityEvent) -> None:
+        for kind in ("auth", "firewall", "ping"):
+            weight = _sample_weight(event, kind, self.config)
+            key = self._key(event, kind)
+            if weight > 0 and key is not None:
+                self._groups.setdefault(key, _Samples()).append(event, weight)
+
+    def count(
+        self,
+        event: SecurityEvent,
+        window: timedelta,
+        kind: str,
+        *,
+        before_only: bool = False,
+        limit: int,
+    ) -> int:
+        key = self._key(event, kind)
+        samples = self._groups.get(key) if key is not None else None
+        if samples is None:
+            return 0
+        at = correlation_time(event)
+        earliest = at - window
+        best = samples.total(earliest, at, event)
+        symmetric = (
+            event.source == "log"
+            and not before_only
+            and correlation_basis(event) in {"source", "delayed_source"}
+        )
+        if not symmetric or best >= limit:
+            return best
+        index = bisect_left(samples.times, earliest)
+        while index < len(samples.times) and samples.times[index] <= at:
+            start = samples.times[index]
+            best = max(best, samples.total(start, start + window, event))
+            if best >= limit:
+                return best
+            index = bisect_right(samples.times, start)
+        return max(best, samples.total(at, at + window, event))
+
+
+def _sample_weight(event: SecurityEvent, kind: str, config: RuleConfig) -> int:
+    if kind == "ping":
+        return int(
+            event.source == "ping"
+            and event.evidence.get("outcome") not in {"error", "unknown"}
+            and _number(event.evidence.get("packet_loss")) >= config.ping_high_loss_percent
+        )
+    if event.source != "log":
+        return 0
+    if kind == "firewall":
+        return _firewall_denial_count(event)
+    return int(
+        event.event_type == "log.auth_failure"
+        or any(
+            term in str(event.evidence.get("message", "")).casefold()
+            for term in _AUTH_FAILURE_TERMS
+        )
+    )

@@ -17,7 +17,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    and_,
     func,
+    or_,
     select,
     text,
 )
@@ -25,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
-from .domain import DetectionResult, DetectionSignal, SecurityEvent, utc_now
+from .domain import DetectionResult, DetectionSignal, SecurityEvent, severity_for_score, utc_now
 from .incidents import (
     Fact,
     Family,
@@ -204,6 +206,23 @@ def _transition(
 
 
 def _identity(event: SecurityEvent) -> tuple[str, str]:
+    if event.event_type in {
+        "system.log_probe_error",
+        "system.log_source_missing",
+        "system.log_unsupported",
+    }:
+        # File failures and the aggregate logs job share one recoverable incident.
+        return ("probe", "logs")
+    service = event.evidence.get("service_id")
+    if isinstance(service, str):
+        return ("service", service)
+    if event.source == "log" and event.evidence.get("asset"):
+        return (
+            "log_identity",
+            json.dumps([event.evidence.get(key) for key in ("asset", "user", "actor_ip")]),
+        )
+    if event.event_type.startswith("system.") and isinstance(event.evidence.get("probe"), str):
+        return ("probe", str(event.evidence["probe"]))
     if event.target is not None:
         return ("target", event.target.casefold())
     path = event.evidence.get("path")
@@ -229,7 +248,7 @@ def _families(detection: DetectionResult) -> dict[Family, list[DetectionSignal]]
         if not signal.points:
             continue
         family: Family
-        if signal.code.startswith("ping."):
+        if signal.code.startswith(("ping.", "service.")):
             family = "availability"
         elif signal.code.startswith("port."):
             family = "exposure"
@@ -259,6 +278,10 @@ def _ports(event: SecurityEvent, field: str) -> set[int]:
 
 
 def _recovered(event: SecurityEvent, occurrence: Occurrence, config: RuleConfig) -> bool:
+    if event.event_type == "service.available":
+        return event.evidence.get("confirmed") is True
+    if event.event_type == "system.probe_recovered":
+        return True
     if event.evidence.get("outcome") in {"error", "unknown"}:
         return False
     if event.source == "ping":
@@ -271,6 +294,18 @@ def _recovered(event: SecurityEvent, occurrence: Occurrence, config: RuleConfig)
         )
     if event.source == "port_scan":
         affected = set(occurrence.affected_ports)
+        open_affected = affected & _ports(event, "open_ports")
+        if (
+            affected
+            and open_affected
+            and open_affected <= set(occurrence.exposure_policy_ports)
+            and affected <= _ports(event, "scanned_ports")
+            and open_affected <= _ports(event, "exposure_checked_ports")
+            and not affected
+            & (_ports(event, "exposure_violation_ports") | _ports(event, "unresolved_ports"))
+            and event.evidence.get("local_context_status") == "observed"
+        ):
+            return True
         return (
             bool(affected)
             and affected <= _ports(event, "scanned_ports")
@@ -297,9 +332,14 @@ async def project_observation(
 ) -> None:
     """Called only for deduplicated, flushed observations in the ingest transaction."""
     assert event.ingested_at is not None and event.rule_version is not None
-    at = event.ingested_at
+    at = event.correlation_at or event.ingested_at
     families = _families(detection)
-    if event.event_type == "system.probe_error":
+    if event.event_type in {
+        "system.probe_error",
+        "system.log_probe_error",
+        "system.log_source_missing",
+        "system.log_unsupported",
+    }:
         families["collector"] = []
     suppressions = [
         _decode(SuppressionRule, row)
@@ -346,10 +386,84 @@ async def project_observation(
             continue
         score = min(100, sum(signal.points for signal in signals if signal.code in remaining))
         await _anomaly(session, event, family, score)
-    if event.source in {"ping", "port_scan"}:
-        family = "availability" if event.source == "ping" else "exposure"
+    if (
+        event.source in {"ping", "port_scan"}
+        or event.event_type.startswith("service.")
+        or event.event_type == "system.probe_recovered"
+    ):
+        family = (
+            "collector"
+            if event.event_type == "system.probe_recovered"
+            else "exposure"
+            if event.source == "port_scan"
+            else "availability"
+        )
         if family not in families:
             await _recovery(session, event, family, config)
+
+    if event.source == "log" and "authentication" not in families and event.evidence.get("user"):
+        row = await _candidate_incident(session, _key(event, "authentication"), at)
+        if row is not None:
+            incident = _decode(Incident, row)
+            if abs((at - incident.last_seen_at).total_seconds()) <= config.window_seconds:
+                link = IncidentLink(
+                    incident_id=incident.id,
+                    event_id=event.id,
+                    occurrence_id=incident.current_occurrence_id,
+                    kind="context",
+                    reason=(
+                        "Related authentication fact for the same asset, account and actor; "
+                        "not proof of compromise"
+                    ),
+                    linked_at=at,
+                )
+                session.add(
+                    IncidentLinkRow(
+                        incident_id=str(incident.id),
+                        event_id=str(event.id),
+                        occurrence_id=str(incident.current_occurrence_id),
+                        data_json=link.model_dump_json(),
+                    )
+                )
+                await _put_incident(
+                    session, incident.model_copy(update={"revision": incident.revision + 1})
+                )
+
+
+async def project_context_observation(session: AsyncSession, event: SecurityEvent) -> None:
+    """Attach bounded adjacent raw lines after their anchor has been projected."""
+    anchor = event.evidence.get("context_for")
+    if event.event_type != "log.context" or not isinstance(anchor, str):
+        return
+    anchors = list(
+        await session.scalars(select(IncidentLinkRow).where(IncidentLinkRow.event_id == anchor))
+    )
+    for parent in anchors:
+        if await session.get(IncidentLinkRow, (parent.incident_id, str(event.id))) is not None:
+            continue
+        link = IncidentLink(
+            incident_id=UUID(parent.incident_id),
+            event_id=event.id,
+            occurrence_id=UUID(parent.occurrence_id),
+            kind="context",
+            reason="Bounded adjacent source line; not an independently confirmed security event",
+            linked_at=event.correlation_at or event.ingested_at or event.observed_at,
+        )
+        session.add(
+            IncidentLinkRow(
+                incident_id=parent.incident_id,
+                event_id=str(event.id),
+                occurrence_id=parent.occurrence_id,
+                data_json=link.model_dump_json(),
+            )
+        )
+        row = await session.get(IncidentRow, parent.incident_id)
+        if row is not None:
+            incident = _decode(Incident, row)
+            await _put_incident(
+                session, incident.model_copy(update={"revision": incident.revision + 1})
+            )
+    await session.flush()
 
 
 async def _candidate_incident(session: AsyncSession, key: str, at: datetime) -> IncidentRow | None:
@@ -368,7 +482,7 @@ async def _candidate_incident(session: AsyncSession, key: str, at: datetime) -> 
 
 async def _anomaly(session: AsyncSession, event: SecurityEvent, family: Family, score: int) -> None:
     assert event.ingested_at is not None and event.rule_version is not None
-    at = event.ingested_at
+    at = event.correlation_at or event.ingested_at
     key = _key(event, family)
     row = await _candidate_incident(session, key, at)
     incident = _decode(Incident, row) if row else None
@@ -384,7 +498,17 @@ async def _anomaly(session: AsyncSession, event: SecurityEvent, family: Family, 
         ):
             previous_id = incident.id
             incident = None
-    ports = tuple(sorted(_ports(event, "newly_opened") | _ports(event, "initial_open_ports")))
+    policy_ports = _ports(event, "exposure_violation_ports")
+    raw_violations = event.evidence.get("exposure_violations")
+    if isinstance(raw_violations, list):
+        for item in raw_violations:
+            if isinstance(item, dict):
+                port = item.get("port")
+                if isinstance(port, int) and not isinstance(port, bool):
+                    policy_ports.add(port)
+    ports = tuple(
+        sorted(_ports(event, "newly_opened") | _ports(event, "initial_open_ports") | policy_ports)
+    )
     if incident is None:
         occurrence_id = uuid4()
         incident = Incident(
@@ -406,12 +530,17 @@ async def _anomaly(session: AsyncSession, event: SecurityEvent, family: Family, 
             started_at=at,
             last_seen_at=at,
             affected_ports=ports,
+            exposure_policy_ports=tuple(sorted(policy_ports)),
         )
         await _put_incident(session, incident)
         await _put_occurrence(session, current)
         _transition(session, incident, None, "opened", "New anomalous observation", at)
     else:
         assert current is not None
+        worsened = (
+            severity_for_score(score) != incident.highest_severity
+            and score > incident.highest_score
+        )
         original_status = incident.status
         previous_resolution = incident.resolved_at
         recurrence_boundary = previous_resolution or current.recovered_at
@@ -425,6 +554,7 @@ async def _anomaly(session: AsyncSession, event: SecurityEvent, family: Family, 
             last_seen_at=max(incident.last_seen_at, at),
             observation_count=incident.observation_count + 1,
             highest_score=max(incident.highest_score, score),
+            status="open" if worsened and incident.status == "acknowledged" else incident.status,
             revision=incident.revision + 1,
         )
         if is_recurrence:
@@ -434,6 +564,7 @@ async def _anomaly(session: AsyncSession, event: SecurityEvent, family: Family, 
                 started_at=at,
                 last_seen_at=at,
                 affected_ports=ports,
+                exposure_policy_ports=tuple(sorted(policy_ports)),
             )
             updates.update(
                 current_occurrence_id=current.id,
@@ -468,11 +599,23 @@ async def _anomaly(session: AsyncSession, event: SecurityEvent, family: Family, 
                     last_seen_at=max(current.last_seen_at or at, at),
                     observation_count=current.observation_count + 1,
                     affected_ports=tuple(sorted(set(current.affected_ports) | set(ports))),
+                    exposure_policy_ports=tuple(
+                        sorted(set(current.exposure_policy_ports) | policy_ports)
+                    ),
                 )
             )
         incident = Incident.model_validate(incident.model_copy(update=updates).model_dump())
         await _put_incident(session, incident)
         await _put_occurrence(session, current)
+        if worsened and not is_recurrence:
+            _transition(
+                session,
+                incident,
+                original_status,
+                "worsened",
+                "Evidence raised the incident severity",
+                at,
+            )
         if is_recurrence:
             _transition(
                 session,
@@ -505,7 +648,8 @@ async def _recovery(
     session: AsyncSession, event: SecurityEvent, family: Family, config: RuleConfig
 ) -> None:
     assert event.ingested_at is not None
-    row = await _candidate_incident(session, _key(event, family), event.ingested_at)
+    at = event.correlation_at or event.ingested_at
+    row = await _candidate_incident(session, _key(event, family), at)
     if row is None:
         return
     incident = _decode(Incident, row)
@@ -515,11 +659,11 @@ async def _recovery(
     occurrence = _decode(Occurrence, occurrence_row)
     if (
         occurrence.recovered_at is not None
-        or (occurrence.last_seen_at is None or event.ingested_at < occurrence.last_seen_at)
+        or (occurrence.last_seen_at is None or at < occurrence.last_seen_at)
         or not _recovered(event, occurrence, config)
     ):
         return
-    occurrence = occurrence.model_copy(update={"recovered_at": event.ingested_at})
+    occurrence = occurrence.model_copy(update={"recovered_at": at})
     incident = incident.model_copy(update={"revision": incident.revision + 1})
     await _put_incident(session, incident)
     await _put_occurrence(session, occurrence)
@@ -529,7 +673,7 @@ async def _recovery(
         incident.status,
         "observed_recovery",
         "Measured recovery observed; operator status is unchanged",
-        event.ingested_at,
+        at,
     )
     link = IncidentLink(
         incident_id=incident.id,
@@ -537,7 +681,7 @@ async def _recovery(
         occurrence_id=occurrence.id,
         kind="observed_recovery",
         reason="Measured recovery; this is not operator resolution",
-        linked_at=event.ingested_at,
+        linked_at=at,
     )
     session.add(
         IncidentLinkRow(
@@ -566,16 +710,36 @@ class IncidentStore:
         active_only: bool = False,
         limit: int = 100,
         offset: int = 0,
+        text: str | None = None,
+        before_cursor: tuple[datetime, UUID] | None = None,
+        through: datetime | None = None,
     ) -> list[Incident]:
         _page(limit, offset)
         query = select(IncidentRow)
+        if text:
+            pattern = (
+                "%"
+                + text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                + "%"
+            )
+            query = query.where(func.lower(IncidentRow.data_json).like(pattern, escape="\\"))
+        if through is not None:
+            query = query.where(IncidentRow.first_seen_at <= _ts(through))
+        if before_cursor is not None:
+            stamp, identifier = before_cursor
+            query = query.where(
+                or_(
+                    IncidentRow.first_seen_at < _ts(stamp),
+                    and_(IncidentRow.first_seen_at == _ts(stamp), IncidentRow.id < str(identifier)),
+                )
+            )
         if status is not None:
             query = query.where(IncidentRow.status == status)
         if active_only:
             query = query.where(IncidentRow.status != "resolved")
         async with self.sessions() as session:
             rows = await session.scalars(
-                query.order_by(IncidentRow.last_seen_at.desc(), IncidentRow.id.desc())
+                query.order_by(IncidentRow.first_seen_at.desc(), IncidentRow.id.desc())
                 .limit(limit)
                 .offset(offset)
             )
@@ -650,11 +814,27 @@ class IncidentStore:
         *,
         expected_revision: int,
         supersedes_id: UUID | None = None,
+        note_id: UUID | None = None,
     ) -> IncidentNote:
-        note = IncidentNote(incident_id=identifier, body=body, supersedes_id=supersedes_id)
+        note = IncidentNote(
+            id=note_id or uuid4(), incident_id=identifier, body=body, supersedes_id=supersedes_id
+        )
         async with self.sessions() as session:
             await session.execute(text("BEGIN IMMEDIATE"))
-            incident = await self._current(session, identifier, expected_revision)
+            existing = await session.get(NoteRow, str(note.id))
+            if existing is not None:
+                saved = _decode(IncidentNote, existing)
+                if (
+                    saved.incident_id != identifier
+                    or saved.body != note.body
+                    or saved.supersedes_id != supersedes_id
+                ):
+                    raise ValueError("Note ID was reused with different content")
+                return saved
+            parent = await session.get(IncidentRow, str(identifier))
+            if parent is None:
+                raise KeyError(str(identifier))
+            incident = _decode(Incident, parent)
             if supersedes_id is not None:
                 previous = await session.get(NoteRow, str(supersedes_id))
                 if previous is None or previous.incident_id != str(identifier):
@@ -686,8 +866,26 @@ class IncidentStore:
         if row is None:
             raise KeyError(str(identifier))
         incident = _decode(Incident, row)
-        if incident.revision != revision:
-            raise ValueError("Incident changed; reload before applying this action")
+        if revision > incident.revision or revision < 1:
+            raise ValueError("Invalid incident revision")
+        changed = await session.scalar(
+            select(TransitionRow.id)
+            .where(
+                TransitionRow.incident_id == str(identifier),
+                TransitionRow.revision > revision,
+                or_(
+                    func.json_extract(TransitionRow.data_json, "$.actor") == "operator",
+                    func.json_extract(TransitionRow.data_json, "$.action").in_(
+                        ("reopened", "recurred")
+                    ),
+                ),
+            )
+            .limit(1)
+        )
+        if changed is not None:
+            raise ValueError(
+                "Incident operator state changed; reload and review your preserved draft"
+            )
         return incident
 
     async def occurrences(
@@ -934,7 +1132,9 @@ async def validate_incidents(session: AsyncSession) -> None:
             raise ValueError("suppression decision identity mismatch")
 
 
-async def read_history(session: AsyncSession, identifier: UUID) -> IncidentHistory | None:
+async def read_history(
+    session: AsyncSession, identifier: UUID, *, limit: int = 10000
+) -> IncidentHistory | None:
     """Read the complete history inside the caller's SQLite snapshot transaction."""
     row = await session.get(IncidentRow, str(identifier))
     if row is None:
@@ -943,21 +1143,25 @@ async def read_history(session: AsyncSession, identifier: UUID) -> IncidentHisto
         select(OccurrenceRow)
         .where(OccurrenceRow.incident_id == str(identifier))
         .order_by(OccurrenceRow.number)
+        .limit(limit)
     )
     transitions = await session.scalars(
         select(TransitionRow)
         .where(TransitionRow.incident_id == str(identifier))
         .order_by(TransitionRow.revision)
+        .limit(limit)
     )
     notes = await session.scalars(
         select(NoteRow)
         .where(NoteRow.incident_id == str(identifier))
         .order_by(NoteRow.at, NoteRow.id)
+        .limit(limit)
     )
     links = await session.scalars(
         select(IncidentLinkRow)
         .where(IncidentLinkRow.incident_id == str(identifier))
         .order_by(IncidentLinkRow.event_id)
+        .limit(limit)
     )
     return IncidentHistory(
         incident=_decode(Incident, row),

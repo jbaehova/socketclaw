@@ -374,9 +374,9 @@ def test_theme_control_characters_are_rejected() -> None:
 
 
 def test_save_revalidates_constructed_config_instances(tmp_path: Path) -> None:
-    invalid = AppConfig.model_construct(targets=[])
+    invalid = AppConfig.model_construct(targets=["-bad"])
 
-    with pytest.raises(ValidationError, match="at least one monitoring target"):
+    with pytest.raises(ValidationError, match="invalid monitoring target"):
         ConfigStore(tmp_path).save(invalid)
 
 

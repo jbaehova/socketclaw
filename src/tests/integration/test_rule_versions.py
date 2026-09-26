@@ -141,7 +141,7 @@ async def test_v2_upgrade_preserves_unknown_rule_provenance(tmp_path: Path):
     repository = Repository(path)
     try:
         await repository.initialize()
-        assert (await repository.database_info()).schema_version == 4
+        assert (await repository.database_info()).schema_version == 5
         assert (await repository.list_events())[0].rule_version is None
         with sqlite3.connect(path) as connection:
             assert (
@@ -180,7 +180,7 @@ async def test_v2_migration_failure_rolls_back_and_retry_preserves_rows(tmp_path
             ]
         monkeypatch.setattr(storage, "migrate_v2_to_v3", original)
         await repository.initialize()
-        assert (await repository.database_info()).schema_version == 4
+        assert (await repository.database_info()).schema_version == 5
     finally:
         await repository.close()
 

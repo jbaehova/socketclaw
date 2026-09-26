@@ -3,6 +3,7 @@
 import sqlite3
 from pathlib import Path
 
+from socketclaw.migrations import SCHEMA_VERSION
 from socketclaw.storage import Repository
 
 
@@ -17,7 +18,7 @@ async def test_v1_fixture_preserves_legacy_histories_and_unknown_facts(tmp_path:
     try:
         await repository.initialize()
         info = await repository.database_info()
-        assert info.schema_version == 4
+        assert info.schema_version == SCHEMA_VERSION
         events = await repository.list_events()
         assert len(events) == 1
         assert events[0].evidence == {"attempts": 12, "account": "root"}

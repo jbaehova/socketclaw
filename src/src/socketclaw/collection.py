@@ -60,7 +60,13 @@ class ProbeBatch(BaseModel):
 class LogCheckpointState(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    parser_version: int = Field(default=2, ge=1, le=2)
+    parser_version: int = Field(default=3, ge=1, le=3)
+    context_before: list[dict[str, JsonValue]] = Field(default_factory=lambda: [], max_length=3)
+    context_anchor: str | None = Field(default=None, max_length=36)
+    context_after_remaining: int = Field(default=0, ge=0, le=3)
+    last_lines_read: int = Field(default=0, ge=0)
+    last_unparsed_count: int = Field(default=0, ge=0)
+    last_partial_count: int = Field(default=0, ge=0)
     inode: int | None = Field(default=None, ge=0)
     device: int = Field(default=0, ge=0)
     generation: str = Field(default="", max_length=32)

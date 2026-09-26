@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import shutil
 import stat
 from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
@@ -25,7 +26,9 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    and_,
     case,
+    delete,
     event,
     func,
     inspect,
@@ -55,7 +58,13 @@ from .collection import (
     ProbeBatch,
 )
 from .db import Base
-from .detection import Detector
+from .detection import (
+    CorrelationIndex,
+    Detector,
+    correlation_basis,
+    correlation_key,
+    correlation_time,
+)
 from .domain import (
     Assessment,
     DetectionResult,
@@ -68,27 +77,35 @@ from .domain import (
     ResponseProposal,
     SecurityEvent,
     Severity,
+    response_actor_target,
     utc_now,
 )
 from .health import ProbeHealth
 from .incident_store import (
     IncidentLinkRow,
+    IncidentRow,
     IncidentStore,
+    SuppressionDecisionRow,
+    SuppressionRow,
+    project_context_observation,
     project_observation,
     read_history,
     validate_incidents,
 )
-from .incidents import IncidentHistory, IncidentLink
+from .incidents import IncidentHistory, IncidentLink, SuppressionDecision, SuppressionRule
 from .migrations import (
     SCHEMA_VERSION,
     migrate_v1_to_v2,
     migrate_v2_to_v3,
     migrate_v3_to_v4,
+    migrate_v4_to_v5,
     recovery_backup,
 )
+from .response_actions import ActionRecord
 from .rules import RuleConfig, RuleVersion
 
 _EVIDENCE_MAX_BYTES = 32 * 1024
+_PORT_EVIDENCE_MAX_BYTES = 512 * 1024
 _INVESTIGATION_ERROR_MAX_LENGTH = 4000
 _ERROR_TRUNCATION_MARKER = "\n[truncated]"
 _OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
@@ -175,6 +192,7 @@ class EventRow(Base):
         Index("ix_events_ingest_seq", "ingest_seq", unique=True),
         Index("ix_events_source_key", "source_key", unique=True),
         Index("ix_events_correlation", "rule_version", "source", "ingested_at"),
+        Index("ix_events_event_clock", "rule_version", "source", "correlation_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -182,6 +200,10 @@ class EventRow(Base):
     ingest_seq: Mapped[int] = mapped_column(Integer, nullable=False)
     ingested_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     source_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    collected_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    committed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    correlation_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    time_basis: Mapped[str] = mapped_column(String(40), default="legacy_collection")
     source_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
     rule_version: Mapped[str | None] = mapped_column(ForeignKey("rule_versions.id"), nullable=True)
     outcome: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
@@ -253,6 +275,18 @@ class RunRow(Base):
     clean_shutdown: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
+class ActionRecordRow(Base):
+    __tablename__ = "action_records"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id"), nullable=False)
+    data_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class RetainedSourceKeyRow(Base):
+    __tablename__ = "retained_source_keys"
+    source_key: Mapped[str] = mapped_column(String(200), primary_key=True)
+
+
 class EventQuery(BaseModel):
     """Validated event history filters."""
 
@@ -267,6 +301,9 @@ class EventQuery(BaseModel):
     before: datetime | None = None
     limit: int = Field(default=100, ge=1, le=500)
     offset: int = Field(default=0, ge=0)
+    watermark: int | None = Field(default=None, ge=0)
+    before_seq: int | None = Field(default=None, ge=1)
+    event_type: str | None = None
 
     @field_validator("after", "before")
     @classmethod
@@ -310,6 +347,16 @@ class IncidentReport(BaseModel):
     model_config = ConfigDict(frozen=True)
     history: IncidentHistory
     observations: tuple[StoredEvent, ...]
+    investigations: tuple[StoredInvestigation, ...] = ()
+    response_proposals: tuple[StoredResponseProposal, ...] = ()
+    suppressions: tuple[SuppressionDecision, ...] = ()
+    maintenance_rules: tuple[SuppressionRule, ...] = ()
+    collection_gaps: tuple[IngestGap, ...] = ()
+    action_records: tuple[ActionRecord, ...] = ()
+    rule_versions: tuple[RuleVersion, ...] = ()
+    omissions: tuple[str, ...] = ()
+    total_observations: int = 0
+    omitted_observations: int = 0
 
 
 InvestigationStatus = Literal["queued", "running", "complete", "failed"]
@@ -379,6 +426,9 @@ class StoredInvestigation(BaseModel):
 class SessionStats(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
+    attention_incidents: int = 0
+    acknowledged_incidents: int = 0
+    collector_incidents: int = 0
     total_events: int = 0
     by_severity: dict[str, int] = Field(default_factory=dict)
     completed_investigations: int = 0
@@ -444,6 +494,17 @@ class DatabaseInfo(BaseModel):
     foreign_keys: bool
 
 
+class RetentionResult(BaseModel):
+    normal_days: int
+    eligible_events: int
+    deleted_events: int = 0
+    protected_events: int
+    backup_path: str | None = None
+    database_bytes: int
+    free_bytes: int
+    has_more: bool = False
+
+
 class Repository:
     """Method-scoped async persistence with detached typed results."""
 
@@ -504,9 +565,12 @@ class Repository:
                         raise
                     before = await self._historical_counts(connection)
                     for destination in range(version + 1, SCHEMA_VERSION + 1):
-                        migration = {2: migrate_v1_to_v2, 3: migrate_v2_to_v3, 4: migrate_v3_to_v4}[
-                            destination
-                        ]
+                        migration = {
+                            2: migrate_v1_to_v2,
+                            3: migrate_v2_to_v3,
+                            4: migrate_v3_to_v4,
+                            5: migrate_v4_to_v5,
+                        }[destination]
                         await migration(connection)
                         await connection.execute(
                             sqlite_insert(MigrationRow).values(
@@ -697,6 +761,21 @@ class Repository:
                         "SocketClaw database has an invalid response proposal record"
                     ) from exc
 
+            action_rows = await session.stream_scalars(select(ActionRecordRow))
+            async for row in action_rows:
+                try:
+                    action = ActionRecord.model_validate_json(row.data_json)
+                    if str(action.id) != row.id or str(action.incident_id) != row.incident_id:
+                        raise ValueError("action projection mismatch")
+                    for evidence_id in action.evidence_ids:
+                        if (
+                            await session.get(IncidentLinkRow, (row.incident_id, str(evidence_id)))
+                            is None
+                        ):
+                            raise ValueError("action evidence is not linked to its incident")
+                except Exception as exc:
+                    raise RuntimeError("SocketClaw database has an invalid action record") from exc
+
             run_rows = await session.stream_scalars(select(RunRow))
             async for row in run_rows:
                 try:
@@ -843,37 +922,101 @@ class Repository:
             counter = await session.get(SchemaMetaRow, "ingest_sequence")
             if counter is None or not counter.value.isdecimal():
                 raise RuntimeError("Missing or invalid ingest sequence counter")
-            rule_version: UUID | None = None
-            for observation in batch.observations:
-                if observation.source_key is not None:
-                    existing = (
-                        await session.execute(
-                            select(EventRow.id).where(EventRow.source_key == observation.source_key)
+            source_keys = [
+                item.source_key for item in batch.observations if item.source_key is not None
+            ]
+            existing_keys: set[str] = set()
+            for index in range(0, len(source_keys), 500):
+                chunk = source_keys[index : index + 500]
+                existing_keys.update(
+                    str(value)
+                    for value in await session.scalars(
+                        select(EventRow.source_key).where(EventRow.source_key.in_(chunk))
+                    )
+                )
+                existing_keys.update(
+                    await session.scalars(
+                        select(RetainedSourceKeyRow.source_key).where(
+                            RetainedSourceKeyRow.source_key.in_(chunk)
                         )
-                    ).scalar_one_or_none()
-                    if existing is not None:
-                        continue
-                if rule_version is None:
-                    rule_version = await self._activate_rules(session, detector.config)
-                observation = observation.model_copy(
+                    )
+                )
+            rule_version = (
+                await self._activate_rules(session, detector.config)
+                if any(
+                    item.source_key is None or item.source_key not in existing_keys
+                    for item in batch.observations
+                )
+                else None
+            )
+            committed_at = utc_now()
+            observations: list[SecurityEvent] = []
+            for candidate_event in batch.observations:
+                if (
+                    candidate_event.source_key is not None
+                    and candidate_event.source_key in existing_keys
+                ):
+                    continue
+                normalized = candidate_event.model_copy(
                     update={
                         "ingested_at": batch.collected_at,
+                        "collected_at": batch.collected_at,
+                        "committed_at": committed_at,
                         "rule_version": rule_version,
+                        "correlation_at": None,
                     }
                 )
-                recent = await self.correlation_history(
-                    observation, detector.window, session=session
+                normalized = normalized.model_copy(
+                    update={
+                        "correlation_at": correlation_time(normalized),
+                        "time_basis": correlation_basis(normalized),
+                    }
                 )
-                detection = detector.score(observation, recent)
+                observations.append(normalized)
+            # Load each correlation window once, without repeatedly decoding the
+            # same immutable rows for every observation in a busy batch.
+            windows: dict[tuple[object, ...], tuple[datetime, datetime, SecurityEvent]] = {}
+            for observation in observations:
+                key = (
+                    observation.source.value,
+                    *(correlation_key(observation) or (str(observation.id),)),
+                )
+                at = correlation_time(observation)
+                low, high, representative = windows.get(key, (at, at, observation))
+                windows[key] = (min(low, at), max(high, at), representative)
+            history: dict[tuple[object, ...], CorrelationIndex] = {}
+            for key, (low, high, representative) in windows.items():
+                history[key] = CorrelationIndex(
+                    detector.config,
+                    await self.correlation_history(
+                        representative, detector.window, session=session, bounds=(low, high)
+                    ),
+                )
+            for observation in observations:
+                if observation.source_key is not None and observation.source_key in existing_keys:
+                    continue
+                key = (
+                    observation.source.value,
+                    *(correlation_key(observation) or (str(observation.id),)),
+                )
+                detection = detector.score(observation, history[key])
                 row = _event_row(observation, detection)
                 row.ingest_seq = int(counter.value) + 1
                 counter.value = str(row.ingest_seq)
                 session.add(row)
                 await session.flush()
                 await project_observation(session, observation, detection, detector.config)
-                stored.append(_stored_event(row))
+                saved = _stored_event(row)
+                stored.append(saved)
+                history[key].append(saved)
+                if observation.source_key is not None:
+                    existing_keys.add(observation.source_key)
+            for saved in stored:
+                await project_context_observation(session, saved)
             for candidate in batch.checkpoints:
-                state_json = json.dumps(candidate.state, separators=(",", ":"), allow_nan=False)
+                state_json = json.dumps(
+                    candidate.state, separators=(",", ":"), allow_nan=False, ensure_ascii=False
+                )
                 if len(state_json.encode()) > 64 * 1024:
                     raise ValueError("Collector checkpoint exceeds 64 KiB")
                 await session.merge(
@@ -894,32 +1037,340 @@ class Repository:
                         committed_seq=int(counter.value),
                     )
                 )
+            commit_time = utc_now()
+            if stored:
+                await session.execute(
+                    update(EventRow)
+                    .where(
+                        EventRow.ingest_seq >= stored[0].ingest_seq,
+                        EventRow.ingest_seq <= stored[-1].ingest_seq,
+                    )
+                    .values(committed_at=_timestamp(commit_time))
+                )
+                stored = [item.model_copy(update={"committed_at": commit_time}) for item in stored]
             session.add(
                 IngestBatchRow(
                     batch_id=str(batch.batch_id),
                     payload_hash=payload_hash,
                     committed_seq=int(counter.value),
-                    committed_at=_timestamp(utc_now()),
+                    committed_at=_timestamp(commit_time),
                 )
             )
             await session.commit()
         return stored
 
+    async def retain_history(
+        self,
+        *,
+        normal_days: int = 30,
+        now: datetime | None = None,
+        dry_run: bool = True,
+        limit: int = 10000,
+    ) -> RetentionResult:
+        """Archive a consistent DB before pruning only old unreferenced normal facts.
+
+        Dedup tombstones, rule provenance, batch receipts and checkpoints survive.
+        SQLite reuses freed pages; this operation does not run blocking VACUUM.
+        """
+        if not 1 <= normal_days <= 36500 or not 1 <= limit <= 100000:
+            raise ValueError("Retention needs days 1-36500 and batch size 1-100000")
+        if not dry_run and self.read_only:
+            raise RuntimeError("Retention requires the writer repository")
+        timestamp = now or utc_now()
+        if timestamp.tzinfo is None:
+            raise ValueError("Retention time requires a timezone")
+        cutoff = _timestamp(timestamp - timedelta(days=normal_days))
+        backup_path = None
+        async with self._sessions() as session:
+            await session.execute(text("BEGIN" if dry_run else "BEGIN IMMEDIATE"))
+            old = EventRow.observed_at < cutoff
+            eligible = select(EventRow).where(
+                old,
+                EventRow.score < 40,
+                ~EventRow.id.in_(select(IncidentLinkRow.event_id)),
+                ~EventRow.id.in_(select(InvestigationRow.event_id)),
+                ~EventRow.id.in_(select(ResponseProposalRow.event_id)),
+                ~EventRow.id.in_(select(SuppressionDecisionRow.event_id)),
+            )
+            count = int(
+                await session.scalar(select(func.count()).select_from(eligible.subquery())) or 0
+            )
+            old_count = int(
+                await session.scalar(select(func.count()).select_from(EventRow).where(old)) or 0
+            )
+            deleted = 0
+            if not dry_run and count:
+                backup = await asyncio.to_thread(
+                    recovery_backup, self.database_path, SCHEMA_VERSION
+                )
+                backup_path = str(backup.path)
+                rows = list(
+                    await session.scalars(eligible.order_by(EventRow.ingest_seq).limit(limit))
+                )
+                for row in rows:
+                    if row.source_key is not None:
+                        await session.execute(
+                            sqlite_insert(RetainedSourceKeyRow)
+                            .values(source_key=row.source_key)
+                            .on_conflict_do_nothing()
+                        )
+                ids = [row.id for row in rows]
+                for index in range(0, len(ids), 500):
+                    await session.execute(
+                        delete(EventRow).where(EventRow.id.in_(ids[index : index + 500]))
+                    )
+                deleted = len(ids)
+                await session.commit()
+        size = sum(
+            path.stat().st_size
+            for path in (self.database_path, Path(str(self.database_path) + "-wal"))
+            if path.exists()
+        )
+        return RetentionResult(
+            normal_days=normal_days,
+            eligible_events=count,
+            deleted_events=deleted,
+            protected_events=old_count - count,
+            backup_path=backup_path,
+            database_bytes=size,
+            free_bytes=shutil.disk_usage(self.database_path.parent).free,
+            has_more=count > limit,
+        )
+
+    async def incident_report_for_event(self, event_id: UUID) -> IncidentReport | None:
+        async with self._sessions() as session:
+            identifier = await session.scalar(
+                select(IncidentLinkRow.incident_id)
+                .where(IncidentLinkRow.event_id == str(event_id))
+                .order_by(IncidentLinkRow.incident_id)
+                .limit(1)
+            )
+        return await self.incident_report(UUID(identifier)) if identifier else None
+
     async def incident_report(self, identifier: UUID) -> IncidentReport | None:
         async with self._sessions() as session:
             await session.execute(text("BEGIN"))
-            history = await read_history(session, identifier)
+            total = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(IncidentLinkRow)
+                    .where(IncidentLinkRow.incident_id == str(identifier))
+                )
+                or 0
+            )
+            # All report collections are bounded, including the history's links.
+            history = await read_history(session, identifier, limit=10000)
             if history is None:
                 return None
-            rows = await session.scalars(
+            event_ids = select(IncidentLinkRow.event_id).where(
+                IncidentLinkRow.incident_id == str(identifier)
+            )
+            rows = await session.stream_scalars(
                 select(EventRow)
-                .join(IncidentLinkRow, IncidentLinkRow.event_id == EventRow.id)
-                .where(IncidentLinkRow.incident_id == str(identifier))
-                .order_by(EventRow.ingest_seq, EventRow.id)
+                .where(EventRow.id.in_(event_ids))
+                .order_by(EventRow.ingest_seq.desc())
+                .limit(10000)
+                .execution_options(yield_per=16)
             )
+            selected: list[StoredEvent] = []
+            evidence_bytes = 0
+            async for row in rows:
+                evidence_bytes += len(row.evidence_json.encode()) + len(row.summary.encode())
+                if evidence_bytes > 16 * 1024 * 1024 and selected:
+                    break
+                selected.append(_stored_event(row))
+            await rows.close()
+            observations = tuple(reversed(selected))
+            selected_ids = (
+                select(EventRow.id)
+                .where(EventRow.id.in_(event_ids))
+                .order_by(EventRow.ingest_seq.desc())
+                .limit(len(observations))
+            )
+            links = tuple(
+                IncidentLink.model_validate_json(row.data_json)
+                for row in await session.scalars(
+                    select(IncidentLinkRow).where(
+                        IncidentLinkRow.incident_id == str(identifier),
+                        IncidentLinkRow.event_id.in_(selected_ids),
+                    )
+                )
+            )
+            history = history.model_copy(update={"links": links})
+            paths = {
+                str(item.evidence["path"])
+                for item in observations
+                if isinstance(item.evidence.get("path"), str)
+            }
+            probe_ids = {
+                "log:" + hashlib.sha256(str(Path(path).absolute()).encode()).hexdigest()
+                for path in paths
+            }
+            gaps = tuple(
+                IngestGap.model_validate_json(row.gap_json)
+                for row in await session.scalars(
+                    select(IngestGapRow)
+                    .where(IngestGapRow.probe_id.in_(probe_ids))
+                    .order_by(IngestGapRow.committed_seq.desc())
+                    .limit(100)
+                )
+            )
+            rules_query = (
+                select(SuppressionRow)
+                .where(
+                    SuppressionRow.starts_at <= _timestamp(history.incident.last_seen_at),
+                    SuppressionRow.expires_at > _timestamp(history.incident.first_seen_at),
+                )
+                .order_by(SuppressionRow.starts_at.desc())
+                .limit(1000)
+            )
+            maintenance = tuple(
+                rule
+                for row in await session.scalars(rules_query)
+                if (rule := SuppressionRule.model_validate_json(row.data_json)).family
+                in {None, history.incident.family}
+                and (
+                    rule.target is None
+                    or rule.target.casefold() == (history.incident.target or "").casefold()
+                )
+                and (rule.log_path is None or rule.log_path in paths)
+            )
+            investigations = tuple(
+                _stored_investigation(row)
+                for row in await session.scalars(
+                    select(InvestigationRow)
+                    .where(InvestigationRow.event_id.in_(event_ids))
+                    .order_by(InvestigationRow.created_at.desc())
+                    .limit(1000)
+                )
+            )
+            proposals = tuple(
+                _stored_response_proposal(row)
+                for row in await session.scalars(
+                    select(ResponseProposalRow)
+                    .where(ResponseProposalRow.event_id.in_(event_ids))
+                    .order_by(ResponseProposalRow.created_at.desc())
+                    .limit(1000)
+                )
+            )
+            suppressions = tuple(
+                SuppressionDecision.model_validate_json(row.data_json)
+                for row in await session.scalars(
+                    select(SuppressionDecisionRow)
+                    .where(SuppressionDecisionRow.event_id.in_(event_ids))
+                    .limit(10000)
+                )
+            )
+            rules = tuple(
+                _rule_version(row)
+                for row in await session.scalars(
+                    select(RuleVersionRow).where(
+                        RuleVersionRow.id.in_(
+                            select(EventRow.rule_version).where(EventRow.id.in_(event_ids))
+                        )
+                    )
+                )
+            )
+            actions = tuple(
+                ActionRecord.model_validate_json(row.data_json)
+                for row in await session.scalars(
+                    select(ActionRecordRow)
+                    .where(ActionRecordRow.incident_id == str(identifier))
+                    .order_by(func.json_extract(ActionRecordRow.data_json, "$.created_at").desc())
+                    .limit(1000)
+                )
+            )
+            omissions = [
+                "Report limits: newest 10,000 observations within a 16 MiB evidence budget; "
+                "at most 1,000 investigations, "
+                "proposals and actions; 10,000 history items per section."
+            ]
+            if total > len(observations):
+                omissions.append(
+                    f"{total - len(observations)} older observations omitted; "
+                    "use related-observation pagination."
+                )
             return IncidentReport(
-                history=history, observations=tuple(_stored_event(row) for row in rows)
+                history=history,
+                observations=observations,
+                investigations=investigations,
+                response_proposals=proposals,
+                suppressions=suppressions,
+                maintenance_rules=maintenance,
+                collection_gaps=gaps,
+                rule_versions=rules,
+                action_records=actions,
+                omissions=tuple(omissions),
+                total_observations=total,
+                omitted_observations=total - len(observations),
             )
+
+    async def record_action(self, record: ActionRecord) -> ActionRecord:
+        record = ActionRecord.model_validate(record.model_dump())
+        async with self._sessions() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
+            existing = await session.get(ActionRecordRow, str(record.id))
+            if existing:
+                saved = ActionRecord.model_validate_json(existing.data_json)
+                if saved != record:
+                    raise ValueError("Action ID reused with different content")
+                return saved
+            if await session.get(IncidentRow, str(record.incident_id)) is None:
+                raise KeyError(str(record.incident_id))
+            if record.proposal_id is not None:
+                proposal = await session.get(ResponseProposalRow, str(record.proposal_id))
+                if (
+                    proposal is None
+                    or await session.get(
+                        IncidentLinkRow, (str(record.incident_id), proposal.event_id)
+                    )
+                    is None
+                ):
+                    raise ValueError("Proposal must belong to this incident")
+            linked_events: list[EventRow] = []
+            for evidence_id in record.evidence_ids:
+                if (
+                    await session.get(IncidentLinkRow, (str(record.incident_id), str(evidence_id)))
+                    is None
+                ):
+                    raise ValueError("Action evidence must belong to this incident")
+                event_row = await session.get(EventRow, str(evidence_id))
+                assert event_row is not None
+                linked_events.append(event_row)
+            if record.status == "verified":
+                prior = await session.scalar(
+                    select(ActionRecordRow)
+                    .where(
+                        ActionRecordRow.incident_id == str(record.incident_id),
+                        func.json_extract(ActionRecordRow.data_json, "$.status")
+                        == "user_performed",
+                        func.json_extract(ActionRecordRow.data_json, "$.created_at")
+                        <= record.created_at.isoformat(),
+                    )
+                    .order_by(func.json_extract(ActionRecordRow.data_json, "$.created_at").desc())
+                    .limit(1)
+                )
+                if prior is None:
+                    raise ValueError("Verification requires a prior user-performed action")
+                action = ActionRecord.model_validate_json(prior.data_json)
+                if not all(
+                    action.created_at
+                    <= _parse_timestamp(row.correlation_at or row.observed_at)
+                    <= record.created_at
+                    for row in linked_events
+                ):
+                    raise ValueError(
+                        "Verification evidence must follow the action and precede verification"
+                    )
+            session.add(
+                ActionRecordRow(
+                    id=str(record.id),
+                    incident_id=str(record.incident_id),
+                    data_json=record.model_dump_json(),
+                )
+            )
+            await session.commit()
+        return record
 
     async def incident_observations(
         self,
@@ -1009,8 +1460,14 @@ class Repository:
             statement = statement.where(EventRow.observed_at >= _timestamp(filters.after))
         if filters.before is not None:
             statement = statement.where(EventRow.observed_at <= _timestamp(filters.before))
+        if filters.watermark is not None:
+            statement = statement.where(EventRow.ingest_seq <= filters.watermark)
+        if filters.before_seq is not None:
+            statement = statement.where(EventRow.ingest_seq < filters.before_seq)
+        if filters.event_type is not None:
+            statement = statement.where(EventRow.event_type == filters.event_type)
         statement = (
-            statement.order_by(EventRow.observed_at.desc(), EventRow.id.desc())
+            statement.order_by(EventRow.ingest_seq.desc(), EventRow.id.desc())
             .limit(filters.limit)
             .offset(filters.offset)
         )
@@ -1019,7 +1476,12 @@ class Repository:
         return [_stored_event(row) for row in rows]
 
     async def correlation_history(
-        self, observation: SecurityEvent, window: timedelta, *, session: AsyncSession | None = None
+        self,
+        observation: SecurityEvent,
+        window: timedelta,
+        *,
+        session: AsyncSession | None = None,
+        bounds: tuple[datetime, datetime] | None = None,
     ) -> list[StoredEvent]:
         """Read the exact rule window independently of UI history limits.
 
@@ -1031,11 +1493,16 @@ class Repository:
             EventSource.LOG,
         }:
             return []
+        low, high = bounds or (correlation_time(observation), correlation_time(observation))
+        clock = func.coalesce(EventRow.correlation_at, EventRow.ingested_at)
         statement = select(EventRow).where(
             EventRow.source == observation.source.value,
             EventRow.id != str(observation.id),
-            EventRow.ingested_at >= _timestamp(observation.ingested_at - window),
-            EventRow.ingested_at <= _timestamp(observation.ingested_at),
+            clock >= _timestamp(low - window),
+            clock
+            <= _timestamp(
+                high + window if observation.time_basis in {"source", "delayed_source"} else high
+            ),
             EventRow.rule_version
             == (str(observation.rule_version) if observation.rule_version else None),
         )
@@ -1054,7 +1521,8 @@ class Repository:
         else:
             async with self._sessions() as reader:
                 rows = (await reader.execute(statement)).scalars().all()
-        return [_stored_event(row) for row in rows]
+        key = correlation_key(observation)
+        return [item for row in rows if correlation_key(item := _stored_event(row)) == key]
 
     async def queue_investigation(
         self,
@@ -1161,7 +1629,7 @@ class Repository:
                 raise RuntimeError("investigation event disappeared")
             _validate_proposal_target(
                 result.assessment.response_proposal,
-                event_row.target,
+                response_actor_target(_stored_event(event_row)),
             )
         async with self._sessions() as session:
             investigation_result = await session.execute(
@@ -1312,15 +1780,53 @@ class Repository:
         *,
         limit: int = 100,
         event_id: UUID | None = None,
+        text: str | None = None,
+        before_cursor: tuple[datetime, UUID] | None = None,
+        through: datetime | None = None,
+        offset: int = 0,
     ) -> list[StoredInvestigation]:
         _validate_limit(limit, "investigation")
         statement = select(InvestigationRow)
+        if offset < 0:
+            raise ValueError("offset must be nonnegative")
+        if text:
+            pattern = (
+                "%"
+                + text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                + "%"
+            )
+            statement = statement.join(EventRow, EventRow.id == InvestigationRow.event_id).where(
+                or_(
+                    func.lower(EventRow.title).like(pattern, escape="\\"),
+                    func.lower(func.coalesce(EventRow.target, "")).like(pattern, escape="\\"),
+                    func.lower(func.coalesce(InvestigationRow.assessment_json, "")).like(
+                        pattern, escape="\\"
+                    ),
+                )
+            )
+        if through is not None:
+            statement = statement.where(InvestigationRow.created_at <= _timestamp(through))
+        if before_cursor is not None:
+            stamp, identifier = before_cursor
+            statement = statement.where(
+                or_(
+                    InvestigationRow.created_at < _timestamp(stamp),
+                    and_(
+                        InvestigationRow.created_at == _timestamp(stamp),
+                        InvestigationRow.id < str(identifier),
+                    ),
+                )
+            )
         if event_id is not None:
             statement = statement.where(InvestigationRow.event_id == str(event_id))
-        statement = statement.order_by(
-            InvestigationRow.created_at.desc(),
-            InvestigationRow.id.desc(),
-        ).limit(limit)
+        statement = (
+            statement.order_by(
+                InvestigationRow.created_at.desc(),
+                InvestigationRow.id.desc(),
+            )
+            .limit(limit)
+            .offset(offset)
+        )
         async with self._sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
         return [_stored_investigation(row) for row in rows]
@@ -1385,7 +1891,7 @@ class Repository:
                 ):
                     raise ValueError("response proposal has inconsistent durable context")
                 event = _stored_event(event_row)
-                _validate_proposal_target(proposal, event.target)
+                _validate_proposal_target(proposal, response_actor_target(event))
                 _reject_protected_target(proposal, protected_targets)
             result = await session.execute(
                 update(ResponseProposalRow)
@@ -1542,7 +2048,23 @@ class Repository:
                 )
             ).one()
 
+        counts = await self.incidents.counts()
+        async with self._sessions() as session:
+            collector_count = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(IncidentRow)
+                    .where(
+                        IncidentRow.status == "open",
+                        func.json_extract(IncidentRow.data_json, "$.family") == "collector",
+                    )
+                )
+                or 0
+            )
         return SessionStats(
+            attention_incidents=counts.get("open", 0),
+            acknowledged_incidents=counts.get("acknowledged", 0),
+            collector_incidents=collector_count,
             total_events=total_events,
             by_severity={severity: count for severity, count in severity_rows},
             completed_investigations=int(completed),
@@ -1614,13 +2136,22 @@ def _event_row(security_event: SecurityEvent, detection: DetectionResult) -> Eve
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    if len(evidence_json.encode("utf-8")) > _EVIDENCE_MAX_BYTES:
-        raise ValueError(f"event evidence must not exceed {_EVIDENCE_MAX_BYTES} UTF-8 bytes")
+    evidence_limit = (
+        _PORT_EVIDENCE_MAX_BYTES
+        if normalized.source == EventSource.PORT_SCAN
+        else _EVIDENCE_MAX_BYTES
+    )
+    if len(evidence_json.encode("utf-8")) > evidence_limit:
+        raise ValueError(f"event evidence must not exceed {evidence_limit} UTF-8 bytes")
     return EventRow(
         id=str(normalized.id),
         observed_at=_timestamp(normalized.observed_at),
         ingested_at=_timestamp(normalized.ingested_at or utc_now()),
         source_at=_timestamp(normalized.source_at) if normalized.source_at else None,
+        collected_at=_timestamp(normalized.collected_at) if normalized.collected_at else None,
+        committed_at=_timestamp(normalized.committed_at) if normalized.committed_at else None,
+        correlation_at=_timestamp(normalized.correlation_at) if normalized.correlation_at else None,
+        time_basis=normalized.time_basis,
         source_key=normalized.source_key,
         rule_version=str(normalized.rule_version) if normalized.rule_version else None,
         outcome=normalized.outcome.value,
@@ -1655,6 +2186,10 @@ def _stored_event(row: EventRow) -> StoredEvent:
         ),
         ingested_at=_parse_timestamp(row.ingested_at) if row.ingested_at else None,
         source_at=_parse_timestamp(row.source_at) if row.source_at else None,
+        collected_at=_parse_timestamp(row.collected_at) if row.collected_at else None,
+        committed_at=_parse_timestamp(row.committed_at) if row.committed_at else None,
+        correlation_at=_parse_timestamp(row.correlation_at) if row.correlation_at else None,
+        time_basis=row.time_basis,
         source_key=row.source_key,
         rule_version=UUID(row.rule_version) if row.rule_version else None,
         outcome=ObservationOutcome(row.outcome),

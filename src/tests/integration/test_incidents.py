@@ -17,6 +17,7 @@ from socketclaw.collection import CheckpointChange, ProbeBatch
 from socketclaw.detection import Detector
 from socketclaw.domain import SecurityEvent
 from socketclaw.incidents import SuppressionRule
+from socketclaw.migrations import SCHEMA_VERSION
 from socketclaw.storage import EventRow, Repository
 
 NOW = datetime(2026, 9, 17, 12, tzinfo=UTC)
@@ -324,7 +325,12 @@ async def test_suppression_expires_without_changing_original_detection(repositor
     assert (await repository.get_event(suppressed[-1].id)) == suppressed[-1]
 
 
-async def test_rule_specific_suppression_retains_other_signal_and_audit_after_disable(repository):
+async def test_rule_specific_suppression_retains_other_signal_and_audit_after_disable(
+    repository, monkeypatch
+):
+    # The disable decision occurs between the two ingestion times, regardless of wall time.
+    disabled_at = NOW + timedelta(milliseconds=500)
+    monkeypatch.setattr("socketclaw.incident_store.utc_now", lambda: disabled_at)
     rule = SuppressionRule(
         rule_code="log.auth_burst",
         starts_at=NOW,
@@ -336,7 +342,8 @@ async def test_rule_specific_suppression_retains_other_signal_and_audit_after_di
     incident = (await repository.incidents.list())[0]
     assert incident.highest_score == 25
     assert events[-1].score == 100
-    await repository.incidents.disable_suppression(rule.id, "Exercise complete")
+    disabled = await repository.incidents.disable_suppression(rule.id, "Exercise complete")
+    assert disabled.disabled_at == disabled_at
     assert (await repository.incidents.suppression_decisions(events[-1].id))[
         0
     ].reason == rule.reason
@@ -373,14 +380,22 @@ async def test_v3_migration_preserves_rule_and_event_history(tmp_path):
     path = tmp_path / "v3.db"
     with sqlite3.connect(path) as connection:
         connection.executescript((Path(__file__).parents[1] / "fixtures/schema-v3.sql").read_text())
-        before = connection.execute("SELECT * FROM events").fetchall()
+        cursor = connection.execute("SELECT * FROM events")
+        historical_columns = [column[0] for column in cursor.description]
+        before = cursor.fetchall()
     repository = Repository(path)
     try:
         await repository.initialize()
-        assert (await repository.database_info()).schema_version == 4
+        assert (await repository.database_info()).schema_version == SCHEMA_VERSION
         assert await repository.incidents.list() == []
         with sqlite3.connect(path) as connection:
-            assert connection.execute("SELECT * FROM events").fetchall() == before
+            assert (
+                connection.execute(f"SELECT {', '.join(historical_columns)} FROM events").fetchall()
+                == before
+            )
+            assert connection.execute(
+                "SELECT collected_at, committed_at, correlation_at, time_basis FROM events"
+            ).fetchall() == [(None, None, None, "legacy_collection")] * len(before)
         manifest = next((tmp_path / "backups").glob("*.json"))
         assert json.loads(manifest.read_text())["schema_version"] == 3
     finally:
@@ -446,7 +461,9 @@ async def test_v3_upgrade_failure_rolls_back_and_retry_keeps_facts(tmp_path, mon
     path = tmp_path / "v3.db"
     with sqlite3.connect(path) as connection:
         connection.executescript((Path(__file__).parents[1] / "fixtures/schema-v3.sql").read_text())
-        before = connection.execute("SELECT * FROM events").fetchall()
+        cursor = connection.execute("SELECT * FROM events")
+        historical_columns = [column[0] for column in cursor.description]
+        before = cursor.fetchall()
         versions = connection.execute("SELECT * FROM rule_versions").fetchall()
     original = storage.migrate_v3_to_v4
 
@@ -472,7 +489,13 @@ async def test_v3_upgrade_failure_rolls_back_and_retry_keeps_facts(tmp_path, mon
         monkeypatch.setattr(storage, "migrate_v3_to_v4", original)
         await repository.initialize()
         with sqlite3.connect(path) as connection:
-            assert connection.execute("SELECT * FROM events").fetchall() == before
+            assert (
+                connection.execute(f"SELECT {', '.join(historical_columns)} FROM events").fetchall()
+                == before
+            )
+            assert connection.execute(
+                "SELECT collected_at, committed_at, correlation_at, time_basis FROM events"
+            ).fetchall() == [(None, None, None, "legacy_collection")] * len(before)
             assert connection.execute("SELECT * FROM rule_versions").fetchall() == versions
     finally:
         await repository.close()

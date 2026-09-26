@@ -20,6 +20,8 @@ Percentage = Annotated[int, Field(strict=True, ge=1, le=100)]
 class RulePoints(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    service_failed: Points = 70
+    service_unknown: Points = 40
     ping_total_loss: Points = 70
     ping_high_loss: Points = 45
     ping_degraded: Points = 25
@@ -29,7 +31,11 @@ class RulePoints(BaseModel):
     port_sensitive_opened: Points = 35
     port_open_burst: Points = 60
     port_closed: Points = 0
+    port_unexpected_exposure: Points = 55
     log_malware_indicator: Points = 80
+    log_unverified_indicator: Points = 10
+    log_sudo_execution: Points = 0
+    log_auth_after_failures: Points = 60
     log_auth_failure: Points = 25
     log_auth_burst: Points = 75
     log_privilege_escalation: Points = 45
@@ -63,7 +69,7 @@ class RuleConfig(BaseModel):
 
     def snapshot(self) -> str:
         return json.dumps(
-            {"engine_version": 2, "parser_version": PARSER_VERSION, "config": self.model_dump()},
+            {"engine_version": 3, "parser_version": PARSER_VERSION, "config": self.model_dump()},
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
@@ -91,7 +97,7 @@ class RuleVersion(BaseModel):
         snapshot = json.loads(self.snapshot_json)
         if set(snapshot) != {"engine_version", "parser_version", "config"}:
             raise ValueError("invalid rule snapshot fields")
-        if snapshot["engine_version"] != 2 or snapshot["parser_version"] != PARSER_VERSION:
+        if (snapshot["engine_version"], snapshot["parser_version"]) not in {(2, 2), (3, 3)}:
             raise ValueError("unsupported rule snapshot version")
         RuleConfig.model_validate(snapshot["config"])
         return self

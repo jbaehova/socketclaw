@@ -99,6 +99,10 @@ class SecurityEvent(BaseModel):
     observed_at: datetime = Field(default_factory=utc_now)
     ingested_at: datetime | None = None
     source_at: datetime | None = None
+    collected_at: datetime | None = None
+    committed_at: datetime | None = None
+    correlation_at: datetime | None = None
+    time_basis: str = "legacy_collection"
     rule_version: UUID | None = None
     source_key: str | None = Field(default=None, min_length=1, max_length=200)
     outcome: ObservationOutcome = ObservationOutcome.UNKNOWN
@@ -114,7 +118,7 @@ class SecurityEvent(BaseModel):
     investigation_state: InvestigationState = InvestigationState.NOT_REQUESTED
     created_at: datetime = Field(default_factory=utc_now)
 
-    @field_validator("ingested_at", "source_at")
+    @field_validator("ingested_at", "source_at", "collected_at", "committed_at", "correlation_at")
     @classmethod
     def require_optional_timezone(cls, value: datetime | None) -> datetime | None:
         if value is None:
@@ -248,3 +252,19 @@ def severity_for_score(score: int) -> Severity:
     if score >= 15:
         return Severity.LOW
     return Severity.INFO
+
+
+def response_actor_target(event: SecurityEvent) -> str | None:
+    """Select a recorded actor; never mistake a structured log's victim for it."""
+    actors = {
+        str(value)
+        for key in ("actor_ip", "source_ip")
+        if isinstance(value := event.evidence.get(key), str) and value
+    }
+    if len(actors) > 1:
+        return None
+    if actors:
+        return next(iter(actors))
+    if event.source == EventSource.LOG and event.evidence.get("asset") is not None:
+        return None
+    return event.target

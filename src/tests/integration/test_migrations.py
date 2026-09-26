@@ -21,7 +21,7 @@ import socketclaw.storage as storage
 from socketclaw.cli import _ApplicationLock, app
 from socketclaw.detection import Detector
 from socketclaw.domain import SecurityEvent
-from socketclaw.migrations import MigrationBackup
+from socketclaw.migrations import SCHEMA_VERSION, MigrationBackup
 from socketclaw.storage import Repository
 
 
@@ -59,7 +59,7 @@ async def test_migration_preserves_all_legacy_facts_and_verified_private_backup(
     repository = Repository(legacy)
     try:
         await repository.initialize()
-        assert version(legacy) == 4
+        assert version(legacy) == SCHEMA_VERSION
         events = await repository.list_events()
         assert [item.ingest_seq for item in events] == [1]
         assert events[0].ingested_at is None
@@ -111,7 +111,7 @@ async def test_failed_migration_rolls_back_and_can_be_retried(
         assert facts(legacy) == before
         monkeypatch.setattr(storage, "migrate_v1_to_v2", original)
         await repository.initialize()
-        assert version(legacy) == 4
+        assert version(legacy) == SCHEMA_VERSION
     finally:
         await repository.close()
 
@@ -197,8 +197,8 @@ def test_explicit_migration_respects_writer_ownership(
         lock.release()
     migrated = CliRunner().invoke(app, ["db", "migrate"])
     assert migrated.exit_code == 0, migrated.output
-    assert "schema 4 verified" in migrated.output
-    assert version(legacy) == 4
+    assert f"schema {SCHEMA_VERSION} verified" in migrated.output
+    assert version(legacy) == SCHEMA_VERSION
 
 
 async def test_read_only_repository_cannot_write_or_initialize(tmp_path: Path) -> None:
@@ -265,4 +265,158 @@ async def test_cancelled_backup_worker_finishes_before_migration_releases_owners
         assert version(legacy) == 1
     finally:
         release.set()
+        await repository.close()
+
+
+def _all_historical_facts(database: Path) -> dict[str, tuple[list[str], list[tuple]]]:
+    """Freeze original column values, excluding migration bookkeeping only."""
+    with closing(sqlite3.connect(database)) as connection:
+        names = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+            if row[0] not in {"schema_meta", "schema_migrations"}
+        ]
+        result = {}
+        for name in names:
+            cursor = connection.execute(f'SELECT * FROM "{name}" ORDER BY rowid')
+            result[name] = ([column[0] for column in cursor.description], cursor.fetchall())
+        return result
+
+
+def _assert_historical_facts(database: Path, before: dict) -> None:
+    with closing(sqlite3.connect(database)) as connection:
+        for name, (columns, rows) in before.items():
+            projected = ", ".join(f'"{column}"' for column in columns)
+            assert (
+                connection.execute(f'SELECT {projected} FROM "{name}" ORDER BY rowid').fetchall()
+                == rows
+            ), name
+
+
+def _clone_fixture(tmp_path: Path, schema: int) -> Path:
+    """Exercise SQLite backup from a real historical schema, not a version relabel."""
+    source = tmp_path / "historical-source.db"
+    target = tmp_path / "socketclaw.db"
+    fixture = Path(__file__).parents[1] / "fixtures" / f"schema-v{schema}.sql"
+    with closing(sqlite3.connect(source)) as original:
+        original.executescript(fixture.read_text())
+        with closing(sqlite3.connect(target)) as clone:
+            original.backup(clone)
+    assert version(target) == schema
+    return target
+
+
+@pytest.mark.parametrize("schema", [1, 2, 3, 4])
+async def test_historical_clones_backup_restart_doctor_and_export(
+    tmp_path: Path, schema: int
+) -> None:
+    from socketclaw.config import ConfigStore
+    from socketclaw.doctor import inspect_environment
+    from socketclaw.export import (
+        export_incident_json,
+        export_incident_markdown,
+        export_json,
+        export_markdown,
+    )
+
+    database = _clone_fixture(tmp_path, schema)
+    before = _all_historical_facts(database)
+    writer = Repository(database)
+    try:
+        await writer.initialize()
+        assert version(database) == SCHEMA_VERSION
+        _assert_historical_facts(database, before)
+        with closing(sqlite3.connect(database)) as connection:
+            count = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+            assert (
+                connection.execute(
+                    "SELECT collected_at, committed_at, correlation_at, time_basis FROM events"
+                ).fetchall()
+                == [(None, None, None, "legacy_collection")] * count
+            )
+            assert connection.execute("SELECT COUNT(*) FROM action_records").fetchone() == (0,)
+            assert connection.execute("SELECT COUNT(*) FROM retained_source_keys").fetchone() == (
+                0,
+            )
+        backup = next((tmp_path / "backups").glob("*.db"))
+        assert version(backup) == schema
+        _assert_historical_facts(backup, before)
+        manifest = json.loads(backup.with_suffix(".json").read_text())
+        assert manifest["sha256"] == hashlib.sha256(backup.read_bytes()).hexdigest()
+        assert manifest["schema_version"] == schema
+    finally:
+        await writer.close()
+
+    restarted = Repository(database)
+    try:
+        await restarted.initialize()
+        assert len(list((tmp_path / "backups").glob("*.db"))) == 1
+        events = await restarted.list_events()
+        assert events
+        for event in events:
+            for renderer in (export_json, export_markdown):
+                rendered = renderer(event, None)
+                assert str(event.id) in rendered
+            assert event.time_basis == "legacy_collection"
+            assert event.collected_at is None and event.committed_at is None
+        incidents = await restarted.incidents.list()
+        if schema == 4:
+            assert len(incidents) == 1
+            report = await restarted.incident_report(incidents[0].id)
+            assert report is not None
+            assert report.history.notes[0].body == "Historical operator investigation"
+            assert report.rule_versions
+            for renderer in (export_incident_json, export_incident_markdown):
+                rendered = renderer(report)
+                assert str(incidents[0].id) in rendered
+                assert str(events[0].id) in rendered
+                assert "Historical operator investigation" in rendered
+        else:
+            # Migration does not reinterpret historical observations into new incidents.
+            assert incidents == []
+    finally:
+        await restarted.close()
+    doctor = await inspect_environment(ConfigStore(tmp_path), which=lambda _: None)
+    assert doctor.check("SQLite database").status == "pass", doctor.render()
+    _assert_historical_facts(database, before)
+
+
+async def test_v4_failed_upgrade_rolls_back_ddl_and_retries_from_preserved_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = _clone_fixture(tmp_path, 4)
+    before = _all_historical_facts(database)
+    original = storage.migrate_v4_to_v5
+
+    async def fail(connection: AsyncConnection) -> None:
+        await original(connection)
+        raise RuntimeError("injected v5 failure after clock and action DDL")
+
+    monkeypatch.setattr(storage, "migrate_v4_to_v5", fail)
+    repository = Repository(database)
+    try:
+        with pytest.raises(RuntimeError, match="Migration rolled back"):
+            await repository.initialize()
+        assert version(database) == 4
+        assert _all_historical_facts(database) == before
+        with closing(sqlite3.connect(database)) as connection:
+            assert "collected_at" not in {
+                row[1] for row in connection.execute("PRAGMA table_info(events)")
+            }
+            assert (
+                connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name='action_records'"
+                ).fetchone()
+                is None
+            )
+        backup = next((tmp_path / "backups").glob("*.db"))
+        assert version(backup) == 4
+        _assert_historical_facts(backup, before)
+        monkeypatch.setattr(storage, "migrate_v4_to_v5", original)
+        await repository.initialize()
+        assert version(database) == SCHEMA_VERSION
+        _assert_historical_facts(database, before)
+    finally:
         await repository.close()

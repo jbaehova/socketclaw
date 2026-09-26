@@ -22,6 +22,7 @@ from .log_parser import PARSER_VERSION, parse_log_line
 
 _MAX_LINE_BYTES = 64 * 1024
 _MAX_EVIDENCE_CHARS = 4000
+_MAX_CONTEXT_BYTES = 1024
 _MAX_POLL_BYTES = 1024 * 1024
 _MAX_POLL_LINES = 1000
 _MAX_POLL_PATHS = 256
@@ -213,37 +214,45 @@ class LogProbe:
                     observations=tuple(observations),
                     checkpoints=tuple(candidates),
                     gaps=tuple(self._gaps),
-                    health=tuple(
-                        ProbeHealthSignal(
-                            probe_id=_probe_id(path),
-                            state="degraded"
-                            if path in self._missing_seen
-                            or path in self._errors
-                            or self._read_states[path].last_read_at is None
-                            else "healthy",
-                            error_kind="missing_source"
-                            if path in self._missing_seen
-                            else "read_error"
-                            if path in self._errors
-                            else "not_read"
-                            if self._read_states[path].last_read_at is None
-                            else None,
-                            detail=f"Missing log: {path}"[:2000]
-                            if path in self._missing_seen
-                            else self._errors.get(path)
-                            or (
-                                f"Waiting to read log: {path}"[:2000]
-                                if self._read_states[path].last_read_at is None
-                                else None
-                            ),
-                        )
-                        for path in checkpoints
-                    ),
+                    health=tuple(self._health_signal(path) for path in checkpoints),
                 )
             finally:
                 # A candidate never advances the collector's committed in-memory state.
                 self._cursors, self._missing_seen, self._errors = previous
                 self._read_states, self._gaps = previous_states, previous_gaps
+
+    def _health_signal(self, path: Path) -> ProbeHealthSignal:
+        state = self._read_states[path]
+        if path in self._missing_seen:
+            error, detail = "missing_source", f"Missing log: {path}"
+        elif path in self._errors:
+            error, detail = "read_error", self._errors[path]
+        elif state.last_read_at is None:
+            error, detail = "not_read", f"Waiting to read log: {path}"
+        elif state.last_lines_read and state.last_unparsed_count == state.last_lines_read:
+            error, detail = (
+                "unsupported_format",
+                (
+                    f"Read {state.last_lines_read} lines, but none used a supported format. "
+                    "Keyword matches and bounded surrounding context may be retained."
+                ),
+            )
+        elif state.last_partial_count or state.last_unparsed_count:
+            error, detail = (
+                "partial_format",
+                (
+                    f"Read {state.last_lines_read} lines: {state.last_partial_count} partial, "
+                    f"{state.last_unparsed_count} unsupported. Missing fields remain unknown."
+                ),
+            )
+        else:
+            error, detail = None, None
+        return ProbeHealthSignal(
+            probe_id=_probe_id(path),
+            state="degraded" if error else "healthy",
+            error_kind=error,
+            detail=detail[:2000] if detail else None,
+        )
 
     async def poll(self) -> list[SecurityEvent]:
         async with self._async_poll_lock:
@@ -387,7 +396,7 @@ class LogProbe:
                     )
                     return recovered_events, recovered_bytes, recovered_lines
                 byte_budget -= recovered_bytes
-                line_budget -= recovered_lines
+                line_budget -= max(recovered_lines, len(recovered_events))
         generation = uuid4().hex if rotated or cursor is None else cursor.generation
         head = (
             _head_at(stream, min(_TAIL_BYTES, opened_stat.st_size))
@@ -404,6 +413,15 @@ class LogProbe:
         consumed_bytes = 0
         consumed_lines = 0
         truncated_lines = 0
+        unparsed_count = partial_count = 0
+        context_state = self._read_states.get(path, LogCheckpointState())
+        context_before = [
+            SecurityEvent.model_validate(item) for item in context_state.context_before
+        ]
+        context_after = context_state.context_after_remaining
+        context_anchor = context_state.context_anchor
+        context_limit = min(3, max(0, _MAX_POLL_LINES - 1))
+        context_before = context_before[-context_limit:] if context_limit else []
         while consumed_bytes < byte_budget and consumed_lines < line_budget:
             remaining_bytes = byte_budget - consumed_bytes
             if continuing_line:
@@ -437,25 +455,83 @@ class LogProbe:
             line_bytes = chunk[:_MAX_LINE_BYTES]
             line = line_bytes.decode("utf-8", errors="replace").rstrip()
             matched = _event_for_line(path, line, rotation_pending, truncated)
+            if len(events) + (len(context_before) if matched is not None else 0) + 1 > line_budget:
+                stream.seek(start)
+                committed_offset = start
+                continuing_line = False
+                consumed_lines -= 1
+                truncated_lines -= int(truncated)
+                break
+            raw = matched or _event_for_line(path, line, rotation_pending, truncated, context=True)
+            assert raw is not None
+            quality = raw.evidence.get("parse_quality")
+            unparsed_count += int(quality == "unparsed")
+            partial_count += int(quality == "partial")
+            identity = (
+                f"{_probe_id(path)}:{opened_stat.st_dev}:{opened_stat.st_ino}:"
+                f"{generation}:{hashlib.sha256(head).hexdigest()}:{start}:{committed_offset}:{PARSER_VERSION}"
+            )
+            raw = raw.model_copy(
+                update={
+                    "source_key": hashlib.sha256(identity.encode()).hexdigest(),
+                    "outcome": ObservationOutcome.OK
+                    if quality == "structured"
+                    else ObservationOutcome.PARTIAL,
+                    "evidence": {
+                        **raw.evidence,
+                        "byte_start": start,
+                        "byte_end": committed_offset,
+                        "parser_version": PARSER_VERSION,
+                    },
+                }
+            )
             if matched is not None:
-                identity = (
-                    f"{_probe_id(path)}:{opened_stat.st_dev}:{opened_stat.st_ino}:"
-                    f"{generation}:{hashlib.sha256(head).hexdigest()}:{start}:{committed_offset}:{PARSER_VERSION}"
-                )
-                events.append(
-                    matched.model_copy(
+                context_anchor = str(raw.id)
+                events.extend(
+                    item.model_copy(
                         update={
-                            "source_key": hashlib.sha256(identity.encode()).hexdigest(),
-                            "outcome": ObservationOutcome.OK,
                             "evidence": {
-                                **matched.evidence,
-                                "byte_start": start,
-                                "byte_end": committed_offset,
-                                "parser_version": PARSER_VERSION,
-                            },
+                                **item.evidence,
+                                "context_for": context_anchor,
+                                "context_position": "before",
+                            }
+                        }
+                    )
+                    for item in context_before
+                )
+                context_before = []
+                events.append(raw)
+                context_after = 3
+            elif context_after > 0:
+                events.append(
+                    raw.model_copy(
+                        update={
+                            "evidence": {
+                                **raw.evidence,
+                                "context_for": context_anchor,
+                                "context_position": "after",
+                            }
                         }
                     )
                 )
+                context_after -= 1
+            else:
+                context_before = [*context_before, raw][-context_limit:] if context_limit else []
+
+        self._read_states[path] = context_state.model_copy(
+            update={
+                "context_before": [item.model_dump(mode="json") for item in context_before],
+                "context_after_remaining": context_after,
+                "context_anchor": context_anchor,
+                "last_lines_read": consumed_lines or context_state.last_lines_read,
+                "last_unparsed_count": unparsed_count
+                if consumed_lines
+                else context_state.last_unparsed_count,
+                "last_partial_count": partial_count
+                if consumed_lines
+                else context_state.last_partial_count,
+            }
+        )
 
         self._cursors[path] = _Cursor(
             opened_stat.st_ino,
@@ -588,30 +664,68 @@ def _event_for_line(
     line: str,
     rotated: bool,
     truncated: bool = False,
+    *,
+    context: bool = False,
 ) -> SecurityEvent | None:
-    for event_type, pattern, title in _PATTERNS:
-        if not pattern.search(line):
-            continue
-        parsed = parse_log_line(line)
-        if truncated and parsed.parse_quality == "structured":
-            parsed = parsed.model_copy(update={"parse_quality": "partial"})
-        message = line[:_MAX_EVIDENCE_CHARS]
-        return SecurityEvent(
-            source=EventSource.LOG,
-            event_type=event_type,
-            title=title,
-            summary=message[:1000],
-            target=parsed.source_ip,
-            source_at=parsed.source_at,
-            evidence={
-                **parsed.model_dump(mode="json", exclude={"source_at"}),
-                "path": str(path),
-                "message": message,
-                "rotated": rotated,
-                "truncated": truncated or len(line) > _MAX_EVIDENCE_CHARS,
-            },
+    parsed = parse_log_line(line)
+    actions = {
+        "authentication_failure": ("log.auth_failure", "Authentication failure"),
+        "authentication_success": ("log.auth_success", "Authentication succeeded"),
+        "session_opened": ("log.session_opened", "Session opened"),
+        "session_closed": ("log.session_closed", "Session closed"),
+        "sudo_execution": ("log.sudo_execution", "Approved sudo execution"),
+        "account_change": ("log.account_change", "Account changed"),
+        "malware_detected": ("log.malware_indicator", "Security tool reported a detection"),
+        "scan_clean": ("log.scan_clean", "Security tool reported a clean scan"),
+        "deny": ("log.firewall_denial", "Firewall denial"),
+    }
+    selected = actions.get(parsed.action or "")
+    if selected is None:
+        selected = next(
+            ((kind, title) for kind, pattern, title in _PATTERNS if pattern.search(line)), None
         )
-    return None
+        if selected is None:
+            if not context:
+                return None
+            selected = ("log.context", "Surrounding log context")
+        if selected[0] == "log.malware_indicator":
+            selected = ("log.unverified_indicator", "Unverified security keyword")
+        elif selected[0] == "log.privilege_escalation":
+            selected = ("log.unverified_indicator", "Unverified privileged activity")
+    if truncated and parsed.parse_quality == "structured":
+        parsed = parsed.model_copy(update={"parse_quality": "partial"})
+    message = line[:_MAX_EVIDENCE_CHARS]
+    raw_bytes = line.encode("utf-8")
+    is_context = selected[0] == "log.context"
+    context_truncated = is_context and len(raw_bytes) > _MAX_CONTEXT_BYTES
+    if is_context:
+        # Keep complete Unicode code points, and bound durable surrounding text
+        # independently of the full evidence retained for supported source facts.
+        message = raw_bytes[:_MAX_CONTEXT_BYTES].decode("utf-8", errors="ignore")
+    # Source-file identity is an explicit fallback, never an inferred victim IP.
+    asset = parsed.asset or "log:" + hashlib.sha256(str(path.absolute()).encode()).hexdigest()
+    return SecurityEvent(
+        source=EventSource.LOG,
+        event_type=selected[0],
+        title=selected[1],
+        summary=message[:1000] or "Empty log line",
+        target=asset[:253],
+        source_at=parsed.source_at,
+        evidence={
+            **parsed.model_dump(mode="json", exclude={"source_at"}),
+            "asset": asset,
+            "actor_ip": parsed.source_ip,
+            "path": str(path),
+            "message": message,
+            "rotated": rotated,
+            "truncated": truncated or len(line) > _MAX_EVIDENCE_CHARS or context_truncated,
+            **(
+                {"original_byte_length": len(raw_bytes), "context_truncated": context_truncated}
+                if is_context
+                else {}
+            ),
+        },
+    )
 
 
 def _probe_id(path: Path) -> str:

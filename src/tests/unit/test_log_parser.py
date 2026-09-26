@@ -40,7 +40,8 @@ def test_firewall_source_and_destination_are_independent_of_field_order() -> Non
     )
     assert event is not None
     assert event.event_type == "log.firewall_denial"
-    assert event.target == "192.0.2.9"
+    assert event.target.startswith("log:")
+    assert event.evidence["actor_ip"] == "192.0.2.9"
 
 
 def test_pam_rhost_is_explicit_but_a_hostname_does_not_become_an_ip() -> None:
@@ -88,7 +89,8 @@ def test_unknown_formats_keep_keyword_detection_without_actor_inference(line: st
     assert result.destination_ip is None
     event = _event_for_line(Path("/tmp/security.log"), line, False)
     assert event is not None
-    assert event.target is None
+    assert event.target.startswith("log:")
+    assert event.evidence["actor_ip"] is None
     assert event.evidence["parse_quality"] == "unparsed"
     assert event.evidence["parser_version"] == PARSER_VERSION
 

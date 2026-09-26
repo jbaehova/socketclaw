@@ -67,10 +67,13 @@ async def test_restart_resumes_committed_cursor_and_nonmatches_advance_it(
     append(path, "Failed password for root from 10.0.0.8\n")
     restarted = LogProbe([path], repository=repository)
     events = await repository.ingest_batch(await candidate(restarted), Detector())
-    assert len(events) == 1
-    assert events[0].target == "10.0.0.8"
+    assert len(events) == 2
+    assert events[0].event_type == "log.context"
+    assert events[0].evidence["context_for"] == str(events[1].id)
+    assert events[1].evidence["actor_ip"] == "10.0.0.8"
+    assert events[1].target.startswith("log:")
     assert events[0].source_key is not None
-    assert events[0].evidence["byte_start"] == before.state["offset"]
+    assert events[1].evidence["byte_start"] == before.state["offset"]
     assert (await candidate(LogProbe([path], repository=repository))).observations == ()
 
 
@@ -439,9 +442,72 @@ async def test_parser_upgrade_resumes_legacy_checkpoint_without_rewriting_histor
     batch = await candidate(probe)
     assert len(batch.observations) == 1
     assert batch.observations[0].evidence["byte_start"] == before.state["offset"]
-    assert batch.observations[0].evidence["parser_version"] == 2
+    assert batch.observations[0].evidence["parser_version"] == 3
     stored = (await repository.ingest_batch(batch, Detector()))[0]
     assert stored.source_at is not None and stored.source_at.year == 2020
     assert stored.ingested_at is not None and stored.ingested_at > stored.source_at
-    assert stored.target == "192.0.2.1"
-    assert (await repository.load_checkpoint(_probe_id(path))).state["parser_version"] == 2
+    assert stored.target == "10.0.0.2"
+    assert stored.evidence["actor_ip"] == "192.0.2.1"
+    assert (await repository.load_checkpoint(_probe_id(path))).state["parser_version"] == 3
+
+
+async def test_context_is_bounded_durable_atomic_and_not_reemitted(repository, tmp_path):
+    path = tmp_path / "auth.log"
+    await attached(repository, path)
+    append(path, "".join(f"normal before {i}\n" for i in range(5)))
+    prepared = await candidate(LogProbe([path], repository=repository))
+    assert not prepared.observations
+    await repository.ingest_batch(prepared, Detector())
+    checkpoint = await repository.load_checkpoint(_probe_id(path))
+    assert len(checkpoint.state["context_before"]) == 3
+    append(path, "Failed password for alice from 192.0.2.9\n")
+    batch = await candidate(LogProbe([path], repository=repository))
+    assert [item.event_type for item in batch.observations] == ["log.context"] * 3 + [
+        "log.auth_failure"
+    ]
+    assert [item.evidence["message"] for item in batch.observations[:3]] == [
+        f"normal before {i}" for i in (2, 3, 4)
+    ]
+    assert all(
+        item.evidence["context_for"] == str(batch.observations[-1].id)
+        for item in batch.observations[:3]
+    )
+    invalid = batch.checkpoints[0].model_copy(
+        update={"state": {**batch.checkpoints[0].state, "oversized": "x" * 70000}}
+    )
+    with pytest.raises(ValueError, match="64 KiB"):
+        await repository.ingest_batch(
+            batch.model_copy(update={"checkpoints": (invalid,)}), Detector()
+        )
+    assert (await repository.load_checkpoint(_probe_id(path))).state["offset"] == checkpoint.state[
+        "offset"
+    ]
+    await repository.ingest_batch(batch, Detector())
+    assert await repository.ingest_batch(batch, Detector()) == []
+    append(path, "".join(f"normal after {i}\n" for i in range(5)))
+    after = await candidate(LogProbe([path], repository=repository))
+    assert len(after.observations) == 3
+    assert all(
+        item.evidence["context_for"] == str(batch.observations[-1].id)
+        for item in after.observations
+    )
+    await repository.ingest_batch(after, Detector())
+    assert not (await candidate(LogProbe([path], repository=repository))).observations
+    assert len({item.source_key for item in (*batch.observations, *after.observations)}) == 7
+
+
+async def test_unsupported_coverage_is_distinct_from_read_failure_and_persists_when_idle(
+    repository, tmp_path
+):
+    path = tmp_path / "auth.log"
+    await attached(repository, path)
+    append(path, "an unsupported application record\n")
+    batch = await candidate(LogProbe([path], repository=repository))
+    assert batch.health[0].error_kind == "unsupported_format"
+    assert "Read 1 lines" in batch.health[0].detail
+    await repository.ingest_batch(batch, Detector())
+    idle = await candidate(LogProbe([path], repository=repository))
+    assert idle.health[0].error_kind == "unsupported_format"
+    append(path, "sudo: pam_unix(sudo:auth): authentication failure; rhost=bad user=alice\n")
+    partial = await candidate(LogProbe([path], repository=repository))
+    assert partial.health[0].error_kind == "partial_format"

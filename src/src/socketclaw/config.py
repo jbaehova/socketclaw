@@ -63,12 +63,59 @@ _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+class ServiceConfig(BaseModel):
+    """Explicit service intent, separate from exposure scans."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=120)
+    host: str = Field(min_length=1, max_length=253)
+    port: Port
+    protocol: Literal["tcp", "http", "https"] = "tcp"
+    path: str = Field(default="/", max_length=2048, pattern=r"^/")
+    expected_status: int = Field(default=200, ge=100, le=599)
+    body_contains: str | None = Field(default=None, max_length=1000)
+    required: bool = True
+    allowed_exposure: Literal["loopback", "private", "any"] = "loopback"
+    interval: float = Field(default=10, ge=1, le=86400)
+    timeout: float = Field(default=3, gt=0, le=60)
+    failure_threshold: int = Field(default=3, ge=1, le=100)
+    recovery_threshold: int = Field(default=2, ge=1, le=100)
+
+    @field_validator("host")
+    @classmethod
+    def valid_host(cls, value: str) -> str:
+        if not _is_host_or_address(value):
+            raise ValueError("invalid service host")
+        return value
+
+
+class NotificationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    local: bool = False
+    webhook: str | None = Field(default=None, max_length=2048)
+
+    @field_validator("webhook")
+    @classmethod
+    def valid_webhook(cls, value: str | None) -> str | None:
+        if value is not None:
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(value)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
+                raise ValueError("webhook must be an HTTP(S) URL without credentials")
+        return value
+
+
 class AppConfig(BaseModel):
     """All non-secret SocketClaw settings."""
 
     model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     rules: RuleConfig = Field(default_factory=RuleConfig)
+    profile: Literal["local", "server", "logs"] = "local"
+    services: list[ServiceConfig] = Field(default_factory=lambda: [], max_length=256)
+    notifications: NotificationConfig = Field(default_factory=NotificationConfig)
     model: ModelKey = "luna"
     targets: list[str] = Field(default_factory=lambda: ["1.1.1.1"], max_length=256)
     ping_interval: float = Field(default=5.0, ge=1.0, le=3600.0)
@@ -84,8 +131,6 @@ class AppConfig(BaseModel):
     @field_validator("targets")
     @classmethod
     def validate_targets(cls, values: list[str]) -> list[str]:
-        if not values:
-            raise ValueError("at least one monitoring target is required")
         normalized: list[str] = []
         seen: set[str] = set()
         for candidate in values:
@@ -97,6 +142,13 @@ class AppConfig(BaseModel):
                 seen.add(identity)
                 normalized.append(target)
         return normalized
+
+    @field_validator("services")
+    @classmethod
+    def unique_services(cls, values: list[ServiceConfig]) -> list[ServiceConfig]:
+        if len({service.id for service in values}) != len(values):
+            raise ValueError("service IDs must be unique")
+        return values
 
     @field_validator("ports")
     @classmethod
@@ -414,6 +466,7 @@ def _has_control_characters(value: str) -> bool:
 def _config_as_toml(config: AppConfig) -> str:
     values: dict[str, Any] = config.model_dump(mode="json")
     lines = [
+        f"profile = {_toml_value(values['profile'])}",
         f"model = {_toml_value(values['model'])}",
         f"targets = {_toml_value(values['targets'])}",
         f"ping_interval = {values['ping_interval']}",
@@ -423,6 +476,17 @@ def _config_as_toml(config: AppConfig) -> str:
         f"log_paths = {_toml_value(values['log_paths'])}",
         f"theme = {_toml_value(values['theme'])}",
     ]
+    lines.extend(["", "[notifications]"])
+    lines.extend(
+        f"{key} = {_toml_value(value)}"
+        for key, value in values["notifications"].items()
+        if value is not None
+    )
+    for service in values["services"]:
+        lines.extend(["", "[[services]]"])
+        lines.extend(
+            f"{key} = {_toml_value(value)}" for key, value in service.items() if value is not None
+        )
     lines.extend(["", "[rules]"])
     lines.extend(
         f"{key} = {_toml_value(value)}" for key, value in values["rules"].items() if key != "points"

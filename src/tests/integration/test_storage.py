@@ -21,6 +21,7 @@ from socketclaw.domain import (
     SecurityEvent,
     Severity,
 )
+from socketclaw.migrations import SCHEMA_VERSION
 from socketclaw.storage import EventQuery, Repository, StoredInvestigation
 
 NOW = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
@@ -139,7 +140,7 @@ async def test_initialize_is_idempotent_and_enables_database_safety(
     await repo.initialize()
     info = await repo.database_info()
 
-    assert info.schema_version == 4
+    assert info.schema_version == SCHEMA_VERSION
     assert info.journal_mode == "wal"
     assert info.foreign_keys is True
     assert (tmp_path / "nested" / "socketclaw.db").exists()
@@ -1061,7 +1062,7 @@ async def test_preexisting_managed_database_remains_usable(tmp_path: Path) -> No
     reopened = Repository(database_path)
     await reopened.initialize()
 
-    assert (await reopened.database_info()).schema_version == 4
+    assert (await reopened.database_info()).schema_version == SCHEMA_VERSION
     assert len(await reopened.list_events()) == 1
     await reopened.close()
 
@@ -1078,7 +1079,7 @@ async def test_concurrent_initialization_is_idempotent(tmp_path: Path) -> None:
         first.database_info(),
         second.database_info(),
     )
-    assert first_info.schema_version == second_info.schema_version == 4
+    assert first_info.schema_version == second_info.schema_version == SCHEMA_VERSION
     await asyncio.gather(first.close(), second.close())
 
 

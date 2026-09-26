@@ -75,6 +75,7 @@ class Occurrence(Fact):
     observation_count: int = Field(default=1, ge=0)
     recovered_at: datetime | None = None
     affected_ports: tuple[int, ...] = ()
+    exposure_policy_ports: tuple[int, ...] = ()
 
     @model_validator(mode="after")
     def valid_occurrence(self) -> Occurrence:
@@ -86,7 +87,9 @@ class Occurrence(Fact):
             self.last_seen_at is None or self.recovered_at < self.started_at
         ):
             raise ValueError("recovery cannot precede the occurrence start")
-        if any(not 1 <= port <= 65535 for port in self.affected_ports):
+        if any(
+            not 1 <= port <= 65535 for port in (*self.affected_ports, *self.exposure_policy_ports)
+        ):
             raise ValueError("invalid affected port")
         return self
 
@@ -95,7 +98,7 @@ class IncidentLink(Fact):
     incident_id: UUID
     event_id: UUID
     occurrence_id: UUID
-    kind: Literal["anomaly", "observed_recovery"]
+    kind: Literal["anomaly", "observed_recovery", "context"]
     reason: str = Field(min_length=1, max_length=1000)
     linked_at: datetime
 
@@ -107,7 +110,13 @@ class Transition(Fact):
     previous: IncidentStatus | None
     current: IncidentStatus
     action: Literal[
-        "opened", "acknowledged", "resolved", "reopened", "recurred", "observed_recovery"
+        "opened",
+        "acknowledged",
+        "resolved",
+        "reopened",
+        "recurred",
+        "observed_recovery",
+        "worsened",
     ]
     reason: str = Field(min_length=1, max_length=2000)
     actor: Literal["operator", "system"]

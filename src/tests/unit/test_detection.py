@@ -193,7 +193,7 @@ def test_old_or_unrelated_auth_failures_do_not_form_burst() -> None:
     assert [signal.code for signal in result.signals] == ["log.auth_failure"]
 
 
-def test_malware_indicator_is_high() -> None:
+def test_generic_malware_keyword_is_unverified() -> None:
     current = event(
         source="log",
         event_type="log.match",
@@ -202,12 +202,12 @@ def test_malware_indicator_is_high() -> None:
 
     result = Detector().score(current, [])
 
-    assert result.severity is Severity.HIGH
-    assert result.score == 80
-    assert [signal.code for signal in result.signals] == ["log.malware_indicator"]
+    assert result.severity is Severity.INFO
+    assert result.score == 10
+    assert [signal.code for signal in result.signals] == ["log.unverified_indicator"]
 
 
-def test_privilege_escalation_log_is_medium() -> None:
+def test_sudo_substring_does_not_prove_privilege_escalation() -> None:
     current = event(
         source="log",
         event_type="log.match",
@@ -216,9 +216,9 @@ def test_privilege_escalation_log_is_medium() -> None:
 
     result = Detector().score(current, [])
 
-    assert result.score == 45
-    assert result.severity is Severity.MEDIUM
-    assert [signal.code for signal in result.signals] == ["log.privilege_escalation"]
+    assert result.score == 0
+    assert result.severity is Severity.INFO
+    assert not result.signals
 
 
 def test_firewall_denial_burst_is_medium() -> None:
@@ -312,11 +312,10 @@ def test_log_line_can_emit_multiple_independent_signals() -> None:
 
     result = Detector().score(current, [])
 
-    assert result.score == 100
+    assert result.score == 35
     assert {signal.code for signal in result.signals} == {
-        "log.malware_indicator",
+        "log.unverified_indicator",
         "log.auth_failure",
-        "log.privilege_escalation",
     }
 
 
