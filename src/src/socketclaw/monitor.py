@@ -341,7 +341,15 @@ class MonitorService:
 
     async def process_batch(self, batch: ProbeBatch) -> list[StoredEvent]:
         async with self._process_lock:
-            stored = await self.repository.ingest_batch(batch, self.detector)
+            write = asyncio.create_task(self.repository.ingest_batch(batch, self.detector))
+            try:
+                stored = await asyncio.shield(write)
+            except asyncio.CancelledError:
+                # SQLite runs on a worker thread. Join the transaction before
+                # releasing the writer lock or persisting shutdown health.
+                with suppress(Exception):
+                    await write
+                raise
         for observation in stored:
             self._broadcast(observation)
         return stored
@@ -547,8 +555,13 @@ class MonitorService:
         self._quarantined_jobs.add(name)
 
     async def _persist_health(self, probe_id: str) -> None:
+        write = asyncio.create_task(self.repository.save_probe_health(self._health[probe_id]))
         try:
-            await self.repository.save_probe_health(self._health[probe_id])
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await write
+            raise
         except Exception as exc:
             self._health_write_error = f"Health state could not be saved: {_error_message(exc)}"[
                 :2000
