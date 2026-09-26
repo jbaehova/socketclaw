@@ -133,8 +133,8 @@ The four-step onboarding flow:
 1. explains the local file boundary;
 2. optionally validates an OpenAI key and Luna access without generating
    tokens, or continues offline;
-3. configures initial targets and intervals;
-4. starts the local monitor.
+3. selects a local-service, server or file-log profile using discovered readable candidates;
+4. checks the selected sources and starts the local monitor.
 
 The API key field is masked. When supplied, the key is stored as inert data in
 `~/.socketclaw/.env`; the file is never sourced as shell code. On POSIX
@@ -258,10 +258,14 @@ correlation window is 300 seconds. Authentication bursts require six failures,
 sustained high loss requires four observations, and firewall bursts require ten
 denials. A burst of new ports requires five newly opened ports in one scan.
 
-New observations use the batch's fixed collection time for their correlation
-window, regardless of the source's reported clock or arrival order. Retrying a
-stored candidate keeps that time. Only deduplicated observations from the same
-rule version and correlation key contribute. Window endpoints are inclusive.
+Logs with a parsed explicit timezone use source time for their correlation window.
+Delayed source records are labeled separately; future clocks
+fall back to collection time. Missing or ambiguous clocks also use collection
+time. A burst always fits within the configured window, including reverse arrival.
+Only deduplicated observations from the same rule version, asset, account and
+actor contribute. Window endpoints are inclusive. Suppressions use the same
+effective event clock. `collected_at`, `committed_at`, `correlation_at` and
+`time_basis` make the policy explicit. Historical `ingested_at` is unchanged.
 
 The first observation using a changed policy records an immutable rule version
 with its settings, engine/parser versions, and SHA-256 fingerprint. Subsequent
@@ -284,8 +288,10 @@ recorded separately from operator resolution, and a recurrence can open a new
 occurrence while retaining earlier notes. Press Esc to return to the list.
 
 Open **Observations** from an incident to inspect its exact linked evidence and
-return with Esc. **Export .md** includes the current state, complete activity,
-occurrences, notes, and related observations. The CLI also accepts
+return with Esc. **Export .md** includes the current state, activity, occurrences and notes. It also
+includes related observations, AI investigations, response reviews, operator action
+records, suppression decisions and immutable rule snapshots. Reports explicitly
+state collection limits; larger histories remain accessible through pagination. The CLI also accepts
 `socketclaw export --incident UUID --format json`.
 
 **Exceptions** opens maintenance rules. Create an exception with a scope,
@@ -294,14 +300,15 @@ scope fields must all match. Original observations and scores remain available;
 applicable decisions appear in observation details and exports.
 
 Use R or Refresh to load new state. Previous and Next traverse 100 incidents at
-a time; the search field filters the current page. Existing observations retain
+a time; search applies to the complete stored history. Events and investigations
+also provide cursor pagination. Existing observations retain
 their original scores. Incident history starts with observations ingested after
 the upgrade; historical observations are not retroactively grouped.
 
 ### Storage upgrades and collector recovery
 
-Launching the TUI or running `db migrate` upgrades a version 1, 2, or 3 database to
-version 4. Before changing its schema, SocketClaw creates a verified SQLite
+Launching the TUI or running `db migrate` upgrades a version 1 through 4 database to
+version 5. Before changing its schema, SocketClaw creates a verified SQLite
 snapshot, including committed WAL data, in `backups/`. Its JSON manifest records
 the schema version and SHA-256 digest. These private backups include local
 evidence but do not include the API key file. A failed migration rolls back and
@@ -323,7 +330,7 @@ match. The sibling search examines at most 256 directory entries. Deleted,
 overwritten, or otherwise unavailable generations leave a recovery gap; the
 number of lost bytes may be unknown. Press `L` to inspect committed progress.
 
-Hosts has Targets and Logs tabs. The Logs tab adds or removes watched paths and
+Hosts has Targets, Logs and Services tabs. The Logs tab adds or removes watched paths and
 shows each source's read state and backlog. Enter opens its full progress and
 error detail. Removing a source keeps its stored observations and checkpoint;
 adding it again resumes that checkpoint. Test read, also available with `R`,
@@ -331,8 +338,12 @@ reads at most 64 KiB from the file tail and shows at most 20 matching complete
 lines. It does not save observations or advance the collector. Links, devices,
 and directories are not accepted as preview files.
 
-The log parser recognizes OpenSSH failed authentication messages and PAM
-`pam_unix` failures. It also reads explicit `SRC` and `DST` fields in Linux
+The log parser recognizes OpenSSH authentication failures and successes, session
+records, sudo executions and PAM authentication failures. Process names and PIDs
+are separate fields. Successful sudo execution is contextual evidence, not a
+confirmed privilege attack. ClamAV `FOUND` results are structured detections;
+generic malware words are low-confidence clues, and clean scans stay informational.
+The collector retains bounded adjacent source lines for investigation. It also reads explicit `SRC` and `DST` fields in Linux
 firewall denial messages, including UFW BLOCK. The simple
 `authentication failure from ADDRESS` fixture format is supported. Source and
 destination addresses are validated separately; invalid or duplicate source
@@ -381,12 +392,14 @@ clock. Startup uses a stable spread of up to 10% of the interval, capped at
 overrunning operation skips elapsed ticks rather than overlapping itself.
 Scheduled and manual work share the same lock for a target and probe.
 Pausing prevents new scheduled starts while in-flight work finishes. Manual
-diagnostics remain available while paused. Removing a scheduled job first
-commits its retained measurement; a storage failure prevents that reconfiguration.
+diagnostics remain available while paused. Transient storage failures keep a pending
+measurement for atomic retry. Deterministically invalid batches are privately
+quarantined with their original checkpoints, so the job can be edited or removed.
+Use `socketclaw quarantine` to inspect retained candidates.
 
 Health also reports pending batches and dropped UI notifications. A dropped
-notification does not delete its stored observation. Complete notification-loss
-resynchronization and investigation-queue metrics are still under development.
+notification does not delete its stored observation. Mounted views poll persisted
+state as well as processing live notifications, preserving selections during reload.
 
 ## Troubleshooting
 
@@ -480,3 +493,95 @@ The root contains `README.md` and `.gitignore`, plus the private `.env`,
 All development files live in `src/`, including the package source under
 `src/src/socketclaw/`, tests, scripts, dependency metadata, and changelog.
 See [the changelog](src/CHANGELOG.md) for release history.
+
+## Required services and continuous operation
+
+Use Hosts / Services to configure a named TCP, HTTP or HTTPS endpoint. HTTP checks
+can require a status and a bounded response substring. Consecutive failure and
+recovery thresholds are separate. Confirmed connection refusal, HTTP mismatch and
+unavailable measurements remain distinct facts. Ping success never overrides a
+failed required service. A recovery is linked to the same incident and does not
+silently resolve the operator's decision. Unconfigured ports remain exposure
+observations rather than required-service outages.
+
+`socketclaw discover` lists readable file candidates and local TCP listeners.
+Listener evidence includes process and binding information when available; missing
+permissions or executable information remain explicit. Wildcard binding does not
+prove Internet reachability. File logs, journald and macOS unified logging are
+separate capabilities; native journal and unified-log collection are not supported.
+A log-only profile needs no external IP target. Overview states the configured
+coverage and the most recent collection health.
+
+Run `socketclaw monitor` for collection independent of a TUI. It owns the same
+single-writer home lock. `socketclaw attach` reads stored collector health, and
+`socketclaw attach --tui` opens a read-only viewer without starting another writer.
+Closing that viewer leaves the collector running. `socketclaw service-template`
+prints an optional launchd or systemd user-service definition. Review and install
+it yourself if you want service-manager restarts; the application does not install
+it or claim it can alert after its own process has died.
+
+Notifications are opt-in in `config.toml`:
+
+```toml
+[notifications]
+local = false
+# webhook = "https://your-configured-endpoint.example/alerts"
+```
+
+Only configured destinations receive transition metadata. Incident creation,
+worsening and observed recovery enqueue durable deliveries. Repeated observations
+do not independently send alerts. Use `socketclaw notification-status` to inspect delivery failures and retries.
+Their durable records live in `notifications.db`; they are separate from collection health. Webhook delivery is
+at least once with a stable `Idempotency-Key`. A receiver must deduplicate that key
+to handle the crash window between receiving a request and recording its receipt.
+No external heartbeat service is configured automatically.
+
+## Investigation, action and evidence boundaries
+
+An incident reader provides a local summary and a family-specific verification
+runbook without AI. Context preview shows the bounded, redacted evidence sent for
+an explicit AI investigation. Related observation IDs, source clocks and recovery
+facts accompany the selected event. Omission rules and missing collection evidence
+remain visible. Factual AI output must quote an actual evidence field and ID;
+possible explanations remain unverified. Paid model accessibility and quality
+checks remain a separate opt-in test.
+
+Proposal approval records review only. Operator action records distinguish
+`user_performed`, `failed`, `rolled_back` and `verified`. Verification requires
+linked observations occurring after a recorded action. The application never runs
+model-generated shell commands or automatically changes a firewall.
+
+Raw local evidence remains private and unchanged. AI requests and both shared
+export formats redact structured credentials, common password/token strings,
+cookies, URL credentials, private keys and recognized provider secrets. Account
+names and addresses are explicitly included for incident correlation. Pattern
+redaction cannot guarantee recognition of arbitrary embedded secrets; inspect the
+preview before sharing. Session drafts survive navigation and failed saves in
+settings, rules, maintenance and incident-reason editors. Independent new
+observations do not invalidate a note or an operator action; a genuine intervening
+operator state change asks for review while preserving the draft.
+
+## History retention and rule replay
+
+`socketclaw history-retention --days 30` previews a bounded cleanup. Add `--apply`
+to create a verified private SQLite backup and delete eligible old normal facts.
+Incident-linked evidence, investigations and suppression decisions are protected.
+Rule versions, log checkpoints, batch receipts and source-key deduplication
+records remain intact. `doctor` reports disk space and backup headroom. Cleanup reuses SQLite pages; it does not promise an
+immediate reduction of the database file or delete archive backups. Backups contain
+raw private evidence and require their own operator-managed retention. Stop all
+writers before restoring a verified backup, move aside the current database and
+its WAL/SHM sidecars, then restore the backup and run `db migrate` followed by
+`doctor` using the matching application version.
+
+Rules / Preview and `socketclaw replay` compare stored evidence against proposed
+numeric rules without changing original scores or incident history. Reports show
+added and missed alert candidates, severity changes and snapshot fingerprints.
+Incident counts are estimates: replay does not reconstruct operator decisions or
+logs that the original collector never retained.
+
+See [operation and validation evidence](src/docs/operations-validation.md) for
+measured storage, sustained-load and platform coverage. Full historical validation
+is intentionally more expensive than indexed history queries. Windows runtime,
+remote macOS architectures and live model quality are reported separately from
+local tests.
