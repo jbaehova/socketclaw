@@ -63,12 +63,16 @@ async def test_ping_probe_uses_the_explicit_resolved_executable() -> None:
 async def test_ping_probe_limits_parallel_processes_across_targets() -> None:
     active = 0
     maximum = 0
+    saturated = asyncio.Event()
 
     async def runner(_command: list[str], _timeout: float) -> CommandResult:
         nonlocal active, maximum
         active += 1
         maximum = max(maximum, active)
-        await asyncio.sleep(0.001)
+        if active == 4:
+            saturated.set()
+        await asyncio.wait_for(saturated.wait(), timeout=5)
+        await asyncio.sleep(0)
         active -= 1
         return CommandResult(returncode=0, stdout="localized success", stderr="")
 
