@@ -547,19 +547,21 @@ class MonitorService:
         self._quarantined_jobs.add(name)
 
     async def _persist_health(self, probe_id: str) -> None:
-        write = asyncio.create_task(self.repository.save_probe_health(self._health[probe_id]))
-        try:
-            await asyncio.shield(write)
-        except asyncio.CancelledError:
-            with suppress(Exception):
-                await write
-            raise
-        except Exception as exc:
-            self._health_write_error = f"Health state could not be saved: {_error_message(exc)}"[
-                :2000
-            ]
-        else:
-            self._health_write_error = None
+        # Queue health writes fairly with evidence commits. Competing SQLite writers
+        # otherwise spend probe time in busy-timeout retries and skip scheduled ticks.
+        async with self._process_lock:
+            write = asyncio.create_task(self.repository.save_probe_health(self._health[probe_id]))
+            try:
+                await asyncio.shield(write)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await write
+                raise
+            except Exception as exc:
+                detail = f"Health state could not be saved: {_error_message(exc)}"
+                self._health_write_error = detail[:2000]
+            else:
+                self._health_write_error = None
 
     def _create_runner(self) -> asyncio.Task[None]:
         runner = asyncio.create_task(
