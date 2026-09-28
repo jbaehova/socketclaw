@@ -200,9 +200,99 @@ def run(
             os.close(master)
 
 
+def run_control(command: list[str], columns: int, rows: int) -> dict[str, object]:
+    """A real attached terminal must not stop its independently running owner."""
+    with tempfile.TemporaryDirectory(prefix="sc-pty-", dir="/tmp") as directory:
+        home = Path(directory)
+        configuration = home / "config.toml"
+        configuration.write_text('targets = ["127.0.0.1"]\nports = [65534]\nping_interval = 1\n')
+        configuration.chmod(0o600)
+        env = {**os.environ, "SOCKETCLAW_HOME": directory, "TERM": "xterm-256color"}
+        env.pop("OPENAI_API_KEY", None)
+        owner = subprocess.Popen(
+            [*command, "monitor"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+        master, slave = pty.openpty()
+        _resize(slave, columns, rows)
+        viewer: subprocess.Popen[bytes] | None = None
+        try:
+            deadline = time.monotonic() + 30
+            while not (home / "control.sock").exists() and time.monotonic() < deadline:
+                if owner.poll() is not None:
+                    raise RuntimeError(f"Owner failed: {owner.communicate()[1]!r}")
+                time.sleep(0.05)
+            viewer = subprocess.Popen(
+                [*command, "attach", "--tui", "--control"],
+                env=env,
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                start_new_session=True,
+            )
+            os.close(slave)
+            slave = -1
+            output = bytearray()
+            deadline = time.monotonic() + 30
+            while "Your watch" not in _plain(output) and time.monotonic() < deadline:
+                output.extend(_read(master, 0.25))
+                if viewer.poll() is not None:
+                    raise RuntimeError(f"Control TUI exited: {_plain(output)[-3000:]}")
+            if "Your watch" not in _plain(output):
+                raise RuntimeError("Control TUI never became ready")
+            output.extend(_read(master, 0.5))
+            os.write(master, b"/")
+            output.extend(_read(master, 0.3))
+            os.write(master, b"storage")
+            output.extend(_read(master, 0.3))
+            os.write(master, b"\r")
+            frame = _read(master, 1)
+            output.extend(frame)
+            if "STORAGE AND NOTIFICATIONS" not in _plain(frame):
+                raise RuntimeError(f"Control storage did not render: {_plain(frame)[-3000:]}")
+            os.write(master, b"\x1b")
+            output.extend(_read(master, 0.3))
+            _resize(master, 120 if columns == 80 else 80, 36 if rows == 24 else 24)
+            viewer.send_signal(signal.SIGWINCH)
+            output.extend(_read(master, 0.5))
+            os.write(master, b"\x03")
+            output.extend(_read(master, 1))
+            viewer.wait(timeout=10)
+            if viewer.returncode != 0 or b"Traceback (most recent call last)" in output:
+                raise RuntimeError(f"Control TUI failed: {_plain(output)[-3000:]}")
+            if owner.poll() is not None:
+                raise RuntimeError("Closing the control viewer stopped its owner")
+            result = subprocess.run([*command, "attach"], env=env, capture_output=True, timeout=15)
+            if result.returncode != 0:
+                raise RuntimeError(f"Owner unavailable after viewer close: {result.stderr!r}")
+            stopped = subprocess.run(
+                [*command, "monitor-stop"], env=env, capture_output=True, timeout=15
+            )
+            owner.wait(timeout=15)
+            if stopped.returncode or owner.returncode:
+                raise RuntimeError("Explicit owner shutdown failed")
+            return {
+                "mode": "control",
+                "columns": columns,
+                "rows": rows,
+                "viewer_exit": viewer.returncode,
+                "owner_survived_viewer": True,
+                "owner_exit": owner.returncode,
+                "output_bytes": len(output),
+            }
+        finally:
+            for process in (viewer, owner):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait()
+            os.close(master)
+            if slave >= 0:
+                os.close(slave)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--executable", type=Path)
+    parser.add_argument("--control-only", action="store_true")
     args = parser.parse_args()
     executable: Path | None = args.executable
     command = (
@@ -211,6 +301,9 @@ def main() -> None:
         else [sys.executable, "-c", "from socketclaw.entrypoint import main; main()"]
     )
     for columns, rows in ((80, 24), (120, 36)):
+        print(json.dumps(run_control(command, columns, rows)), flush=True)
+        if args.control_only:
+            continue
         for onboarding, cancel in ((True, False), (True, True), (False, False)):
             print(
                 json.dumps(run(command, columns, rows, onboarding=onboarding, cancel=cancel)),

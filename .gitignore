@@ -45,3 +45,6 @@ artifacts/live-openai/
 !/src/artifacts/tui/investigations-detail-120x36.svg
 !/src/artifacts/tui/incidents-detail-120x36.svg
 /src/artifacts/live-openai/
+
+# Private completion validation evidence
+/src/artifacts/completion/

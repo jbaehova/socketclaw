@@ -1,0 +1,43 @@
+name: Completion profile validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Duration of 100 logs/sec loopback profile
+        type: choice
+        options: ['60', '1800']
+        default: '1800'
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          python-version: '3.11'
+      - run: uv sync --dev --locked
+      - name: Run real owner with TLS, webhook retries and online cleanup
+        env:
+          PROFILE_SECONDS: ${{ inputs.seconds }}
+        run: uv run --locked python scripts/completion_validate.py --seconds "$PROFILE_SECONDS" --rate 100
+      - name: Verify full attached terminal lifecycle
+        run: uv run --locked python scripts/pty_smoke.py --control-only
+      - name: Preserve validation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: completion-${{ matrix.os }}
+          path: src/artifacts/completion/*.json

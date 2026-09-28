@@ -21,6 +21,7 @@ from socketclaw.collection import ProbeBatch
 from socketclaw.detection import Detector
 from socketclaw.domain import EventSource, ObservationOutcome, SecurityEvent
 from socketclaw.export import export_json
+from socketclaw.maintenance import MaintenanceService, restore_database
 from socketclaw.monitor import MonitorService, ProbeJob
 from socketclaw.probes.ports import PortProbe
 from socketclaw.storage import EventQuery, Repository
@@ -130,10 +131,17 @@ async def history(path: Path, days: int, daily: int) -> None:
         exported = [export_json(event, None) for event in events]
         export = time.perf_counter() - started
         started = time.perf_counter()
-        preview = await repository.retain_history(normal_days=30, dry_run=True)
+        maintenance = MaintenanceService(repository)
+        preview = await maintenance.preview(30)
         preview_time = time.perf_counter() - started
         started = time.perf_counter()
-        result = await repository.retain_history(normal_days=30, dry_run=False)
+        job = await maintenance.create(30)
+        await maintenance.run(job.id)
+        result = await maintenance.get(job.id)
+        if result.status != "completed":
+            raise RuntimeError(result.error or result.status)
+        assert result.deleted == preview["eligible"]
+        assert result.backup is not None
         cleanup = time.perf_counter() - started
         report(
             kind="history",
@@ -146,11 +154,12 @@ async def history(path: Path, days: int, daily: int) -> None:
             exported_bytes=sum(map(len, exported)),
             preview_seconds=preview_time,
             cleanup_seconds=cleanup,
-            eligible_events=preview.eligible_events,
-            deleted_events=result.deleted_events,
-            protected_events=result.protected_events,
-            database_bytes=result.database_bytes,
-            backup_created=result.backup_path is not None,
+            eligible_events=preview["eligible"],
+            deleted_events=result.deleted,
+            protected_events=result.protected,
+            database_bytes=path.stat().st_size,
+            backup_created=True,
+            backup_count=1,
         )
     finally:
         await repository.close()
@@ -161,6 +170,11 @@ async def history(path: Path, days: int, daily: int) -> None:
     finally:
         await restarted.close()
     report(kind="restart", days=days, ok=True)
+    restore_started = time.perf_counter()
+    await asyncio.to_thread(restore_database, path, Path(result.backup), apply=True)
+    with sqlite3.connect(path) as restored:
+        assert restored.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1 + days * daily
+    report(kind="restore", days=days, ok=True, seconds=time.perf_counter() - restore_started)
 
 
 async def sustained(path: Path, seconds: int, rate: int) -> None:
