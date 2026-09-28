@@ -4,6 +4,20 @@ All notable SocketClaw changes are documented here.
 
 ## Unreleased
 
+- Add same-account Unix socket control and a full attached TUI. The owner keeps
+  collecting after a viewer closes and owns investigation and export jobs.
+- Commit notification deliveries atomically with incident transitions in schema 6.
+  Import legacy delivery IDs, hold uncertain destinations, and expose worker health.
+- Add durable command receipts to prevent repeated incident edits after reconnects.
+- Add resumable online retention with one verified backup per job, protected latest
+  service observations, backup inventory and explicit pruning.
+- Add journaled restore with rescue snapshots, generation checks and configuration
+  review before resuming collection with mismatched settings.
+- Query the latest observation per service through an index and show stale or
+  mismatched evidence explicitly. Include timeout changes in service confirmation scope.
+- Add process-boundary, full attached TUI, terminal and recovery tests plus an
+  opt-in loopback validation harness. Long-duration release gates remain separate.
+
 ## 0.6.0 - 2026-09-26
 
 - Add required TCP, HTTP and HTTPS services with persistent failure and recovery

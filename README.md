@@ -209,12 +209,12 @@ The default application home is `~/.socketclaw`. Override it with
 ├── .env                 # optional OpenAI key, private file
 ├── .instance.lock       # private single-process ownership lock
 ├── config.toml          # validated non-secret settings, private file
-├── socketclaw.db        # events, investigations, proposals, runs
-├── backups/             # verified private snapshots before schema migration
+├── socketclaw.db        # evidence, incidents, delivery queue, command receipts
+├── backups/             # verified migration, cleanup and rescue snapshots
 └── exports/             # redacted incident Markdown and JSON
 ```
 
-Only one SocketClaw TUI may own an application home at a time. A second launch
+Only one collector or standalone TUI may own an application home at a time. A second launch
 is rejected before it can recover or modify work owned by the running process.
 
 Configuration and export writes use a temporary file, `fsync`, and atomic
@@ -308,7 +308,7 @@ the upgrade; historical observations are not retroactively grouped.
 ### Storage upgrades and collector recovery
 
 Launching the TUI or running `db migrate` upgrades a version 1 through 4 database to
-version 5. Before changing its schema, SocketClaw creates a verified SQLite
+version 6. Before changing its schema, SocketClaw creates a verified SQLite
 snapshot, including committed WAL data, in `backups/`. Its JSON manifest records
 the schema version and SHA-256 digest. These private backups include local
 evidence but do not include the API key file. A failed migration rolls back and
@@ -515,7 +515,16 @@ coverage and the most recent collection health.
 Run `socketclaw monitor` for collection independent of a TUI. It owns the same
 single-writer home lock. `socketclaw attach` reads stored collector health, and
 `socketclaw attach --tui` opens a read-only viewer without starting another writer.
-Closing that viewer leaves the collector running. `socketclaw service-template`
+Use `socketclaw attach --tui --control` to edit incidents, save notes, review
+responses, manage settings and export reports through the running collector.
+Closing either viewer leaves the collector running. `/stop-monitor` asks before
+stopping collection; `socketclaw monitor-stop` explicitly stops the owner.
+Control requires the same OS account on macOS or Linux. It uses a private Unix
+socket and never opens a network listener. AI jobs belong to the owner and continue
+when a viewer disconnects. After a database restore, reopen the viewer and review
+current evidence before making changes. `/storage` opens cleanup and alert status.
+
+`socketclaw service-template`
 prints an optional launchd or systemd user-service definition. Review and install
 it yourself if you want service-manager restarts; the application does not install
 it or claim it can alert after its own process has died.
@@ -531,7 +540,15 @@ local = false
 Only configured destinations receive transition metadata. Incident creation,
 worsening and observed recovery enqueue durable deliveries. Repeated observations
 do not independently send alerts. Use `socketclaw notification-status` to inspect delivery failures and retries.
-Their durable records live in `notifications.db`; they are separate from collection health. Webhook delivery is
+Delivery records now live in `socketclaw.db`, committed atomically with incident
+transitions and restored with their evidence. Legacy `notifications.db` is backed
+up and imported once by transition ID. Unknown historical destinations remain held.
+`notification-status --details` lists pending IDs. `--reconcile send` explicitly
+permits historical delivery to the configured destination; `--reconcile skip`
+leaves uncertain history unsent. Review that choice before using it.
+`--delivery ID --cancel` cancels a held item; `--delivery ID --retry-original`
+permits retry to its recorded original address. An unknown original address cannot
+be retried this way. Destination changes never silently redirect queued alerts. Webhook delivery is
 at least once with a stable `Idempotency-Key`. A receiver must deduplicate that key
 to handle the crash window between receiving a request and recording its receipt.
 No external heartbeat service is configured automatically.
@@ -563,16 +580,27 @@ operator state change asks for review while preserving the draft.
 
 ## History retention and rule replay
 
-`socketclaw history-retention --days 30` previews a bounded cleanup. Add `--apply`
-to create a verified private SQLite backup and delete eligible old normal facts.
-Incident-linked evidence, investigations and suppression decisions are protected.
-Rule versions, log checkpoints, batch receipts and source-key deduplication
-records remain intact. `doctor` reports disk space and backup headroom. Cleanup reuses SQLite pages; it does not promise an
-immediate reduction of the database file or delete archive backups. Backups contain
-raw private evidence and require their own operator-managed retention. Stop all
-writers before restoring a verified backup, move aside the current database and
-its WAL/SHM sidecars, then restore the backup and run `db migrate` followed by
-`doctor` using the matching application version.
+`socketclaw history-retention --days 30` previews cleanup. Add `--apply`
+to create one verified private backup and start bounded deletion batches. With a
+running headless owner, cleanup runs online. Use `--status JOB_ID`, `--cancel JOB_ID` and
+`--resume JOB_ID` to inspect or control progress. Restarted jobs reuse the same
+verified backup and fixed snapshot boundary. `/storage` provides the same actions.
+Incident evidence, investigations and suppression decisions are protected, as is
+each service's latest observation. Rule versions, checkpoints, batch receipts and
+source-key deduplication records remain intact. Cleanup reuses SQLite pages and
+does not promise an immediate reduction in file size.
+
+`socketclaw backups list` lists private snapshots. `backups prune` previews removals;
+add `--apply` to remove eligible old unpinned backups. Migration and rescue backups
+stay pinned. After reviewing recovery, `backups unpin PATH` explicitly releases a
+pin while the owner is stopped. Backups referenced by unfinished cleanup jobs cannot be pruned.
+Stop the owner before restoring: `socketclaw db restore --backup PATH` previews,
+and `--apply` verifies and installs the snapshot while preserving a rescue copy.
+If interrupted, use `db restore --recover-interrupted --apply`. Run `db migrate`
+and `doctor` afterward. If settings differ, review `config.toml` and run
+`db acknowledge-restore` before starting collection. Restore can repeat notifications
+already received outside the database; webhook consumers must deduplicate delivery IDs.
+Backups contain private evidence and destination addresses. Keep them private.
 
 Rules / Preview and `socketclaw replay` compare stored evidence against proposed
 numeric rules without changing original scores or incident history. Reports show
