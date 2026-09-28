@@ -11,8 +11,8 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Checkbox, DataTable, Input, Select, Static
 
 from ..config import AppConfig, ServiceConfig
-from ..domain import EventSource
-from ..storage import EventQuery
+from ..domain import utc_now
+from ..probes.services import service_scope
 from .context import safe_text, socketclaw_app
 from .layout import ResponsiveModalScreen
 
@@ -201,11 +201,11 @@ class ServicesView(Vertical):
         app = socketclaw_app(self)
         services = tuple(app.config.services)
         selected = self.selected_service()
-        events = []
+        events = {}
         try:
             if app.services.repository is not None:
-                events = await app.services.repository.list_events(
-                    EventQuery(source=EventSource.SYSTEM, limit=500)
+                events = await app.services.repository.latest_service_observations(
+                    [service.id for service in services]
                 )
         except Exception as exc:
             self._message(f"Cannot load measured status: {exc}")
@@ -215,16 +215,7 @@ class ServicesView(Vertical):
         table = cast(DataTable[str], self.query_one("#services-table", DataTable))
         table.clear()
         for service in services:
-            event = next(
-                (
-                    event
-                    for event in events
-                    if event.evidence.get("service_id") == service.id
-                    and event.event_type
-                    in {"service.available", "service.failed", "service.unknown"}
-                ),
-                None,
-            )
+            event = events.get(service.id)
             status = "No recent observation"
             when = "-"
             if event is not None:
@@ -238,6 +229,15 @@ class ServicesView(Vertical):
                 endpoint += service.path
             if event is not None and event.evidence.get("endpoint") not in {None, endpoint}:
                 status = "Previous endpoint"
+            if event is not None:
+                scope = event.evidence.get("service_scope_hash")
+                if scope is None:
+                    status += " / legacy policy unknown"
+                elif scope != service_scope(service):
+                    status = "Previous configuration"
+                age = (utc_now() - (event.collected_at or event.observed_at)).total_seconds()
+                if age < 0 or age > max(10, 3 * service.interval):
+                    status += " / stale"
             table.add_row(
                 safe_text(service.name),
                 safe_text(endpoint),
@@ -256,7 +256,8 @@ class ServicesView(Vertical):
             self._message("No service expectations configured. Add a TCP or HTTP endpoint.")
         else:
             self._message(
-                "Recent 500 system records. No matching record means no measured state here."
+                "Latest measurement per service. Stale and previous-policy "
+                "results are not current health."
             )
 
     def selected_service(self) -> ServiceConfig | None:

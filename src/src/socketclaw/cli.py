@@ -10,7 +10,6 @@ import os
 import platform
 import shutil
 import signal
-import sqlite3
 import stat
 import sys
 import tempfile
@@ -26,8 +25,10 @@ import typer
 from click import ClickException
 
 from . import __version__
+from .application import ApplicationService
 from .collection import ProbeBatch
 from .config import AppConfig, ConfigStore, ServiceConfig
+from .control import ControlClient, ControlServer
 from .detection import Detector
 from .discovery import discover_sources
 from .doctor import inspect_environment
@@ -38,6 +39,17 @@ from .export import (
     export_json,
     export_markdown,
     write_managed_export,
+)
+from .gateway import RemoteApplication, RemoteMonitor, RemoteRepository
+from .maintenance import (
+    MaintenanceService,
+    acknowledge_restore,
+    annotate_backup,
+    backup_inventory,
+    prune_backups,
+    recover_restore,
+    require_reviewed_restore,
+    restore_database,
 )
 from .monitor import Diagnostic, MonitorService, ProbeJob
 from .notifications import NotificationOutbox
@@ -281,30 +293,170 @@ def replay_command(
 
 @app.command("history-retention")
 def retention_command(
-    days: Annotated[int, typer.Option("--days", min=1)] = 30,
-    apply: Annotated[
-        bool, typer.Option("--apply", help="Create backup and delete eligible normal observations.")
-    ] = False,
+    days: Annotated[int, typer.Option("--days", min=1, max=36500)] = 30,
+    apply: Annotated[bool, typer.Option("--apply")] = False,
+    status: Annotated[UUID | None, typer.Option("--status")] = None,
+    cancel: Annotated[UUID | None, typer.Option("--cancel")] = None,
+    resume: Annotated[UUID | None, typer.Option("--resume")] = None,
 ) -> None:
-    """Preview retention of normal history; incident evidence remains protected."""
+    """Preview cleanup, or run/resume one backed-up job without stopping the owner."""
+    if sum((apply, status is not None, cancel is not None, resume is not None)) > 1:
+        raise typer.BadParameter("Choose one of --apply, --status, --cancel, --resume")
     store = ConfigStore()
-    store.ensure_home()
-    lock = _ApplicationLock(store.home / ".instance.lock")
 
-    async def run() -> None:
-        repository = Repository(store.database_path)
+    async def run() -> object:
+        method = (
+            "retention.get"
+            if status
+            else "retention.cancel"
+            if cancel
+            else "retention.resume"
+            if resume
+            else "retention.apply"
+            if apply
+            else "retention.preview"
+        )
+        identifier = status or cancel or resume
+        params = {"identifier": str(identifier)} if identifier else {"days": days}
+        if (store.home / "control.sock").exists():
+            return await ControlClient(store.home).call(method, params)
+        mutating = apply or cancel is not None or resume is not None
+        lock = _ApplicationLock(store.home / ".instance.lock")
+        repository = Repository(store.database_path, read_only=not mutating)
+        maintenance = MaintenanceService(repository)
         try:
-            await repository.initialize()
-            result = await repository.retain_history(normal_days=days, dry_run=not apply)
-            typer.echo(result.model_dump_json(indent=2))
+            if mutating:
+                store.ensure_home()
+                lock.acquire()
+                await repository.initialize()
+            else:
+                await repository.require_current_schema()
+            if status:
+                return (await maintenance.get(status)).model_dump(mode="json")
+            if cancel:
+                return (await maintenance.cancel(cancel)).model_dump(mode="json")
+            if resume:
+                await maintenance.resume(resume)
+                return (await maintenance.wait(resume)).model_dump(mode="json")
+            if apply:
+                job = await maintenance.create(days)
+                await maintenance.run(job.id)
+                return (await maintenance.get(job.id)).model_dump(mode="json")
+            return await maintenance.preview(days)
         finally:
+            await maintenance.close()
             await repository.close()
+            lock.release()
 
     try:
-        lock.acquire()
-        asyncio.run(run())
+        typer.echo(json.dumps(asyncio.run(run()), indent=2))
     except Exception as exc:
-        raise ClickException(f"Cannot apply retention: {_error_detail(exc)}") from exc
+        raise ClickException(f"Cannot manage history: {_error_detail(exc)}") from exc
+
+
+backups_app = typer.Typer(help="Inspect and explicitly prune verified recovery backups.")
+app.add_typer(backups_app, name="backups")
+
+
+@backups_app.command("list")
+def backups_list_command() -> None:
+    try:
+        typer.echo(json.dumps(backup_inventory(ConfigStore().database_path), indent=2))
+    except Exception as exc:
+        raise ClickException(_error_detail(exc)) from exc
+
+
+@backups_app.command("prune")
+def backups_prune_command(
+    keep_last: Annotated[int, typer.Option("--keep-last", min=1)] = 3,
+    older_than_days: Annotated[int, typer.Option("--older-than-days", min=1)] = 30,
+    apply: Annotated[bool, typer.Option("--apply")] = False,
+) -> None:
+    store = ConfigStore()
+    lock = _ApplicationLock(store.home / ".instance.lock")
+    try:
+        if (store.home / "control.sock").exists():
+            result = asyncio.run(
+                ControlClient(store.home).call(
+                    "backups.prune",
+                    {"keep_last": keep_last, "older_than_days": older_than_days, "apply": apply},
+                )
+            )
+        else:
+            if apply:
+                lock.acquire()
+            result = prune_backups(
+                store.database_path,
+                keep_last=keep_last,
+                older_than_days=older_than_days,
+                apply=apply,
+            )
+        typer.echo(json.dumps({"applied": apply, "backups": result}, indent=2))
+    except Exception as exc:
+        raise ClickException(_error_detail(exc)) from exc
+    finally:
+        lock.release()
+
+
+@backups_app.command("unpin")
+def backups_unpin_command(backup: Path) -> None:
+    """Explicitly release a recovery backup after verifying the restored/migrated home."""
+    store = ConfigStore()
+    lock = _ApplicationLock(store.home / ".instance.lock")
+    try:
+        lock.acquire()
+        records = backup_inventory(store.database_path)
+        selected = next((r for r in records if Path(r["path"]).resolve() == backup.resolve()), None)
+        if selected is None or selected["referenced"]:
+            raise ValueError("Backup is not managed here or is referenced by an unfinished cleanup")
+        annotate_backup(backup, purpose=selected["purpose"], pinned=False)
+        typer.echo("Backup unpinned; prune remains a separate explicit operation.")
+    except Exception as exc:
+        raise ClickException(_error_detail(exc)) from exc
+    finally:
+        lock.release()
+
+
+@db_app.command("restore")
+def db_restore_command(
+    backup: Annotated[Path | None, typer.Option("--backup")] = None,
+    apply: Annotated[bool, typer.Option("--apply")] = False,
+    recover: Annotated[bool, typer.Option("--recover-interrupted")] = False,
+) -> None:
+    """Preview/restore a verified snapshot while all writers are stopped."""
+    store = ConfigStore()
+    lock = _ApplicationLock(store.home / ".instance.lock")
+    try:
+        if recover:
+            if backup is not None or not apply:
+                raise ValueError("Use --recover-interrupted --apply without --backup")
+            lock.acquire()
+            result = recover_restore(store.database_path)
+        else:
+            if backup is None:
+                raise ValueError("--backup PATH is required")
+            if apply:
+                lock.acquire()
+            result = restore_database(store.database_path, backup, apply=apply)
+        typer.echo(json.dumps(result, indent=2))
+    except Exception as exc:
+        raise ClickException(f"Cannot restore storage: {_error_detail(exc)}") from exc
+    finally:
+        lock.release()
+
+
+@db_app.command("acknowledge-restore")
+def acknowledge_restore_command() -> None:
+    """Confirm that config.toml has been reviewed after restoring different evidence."""
+    store = ConfigStore()
+    lock = _ApplicationLock(store.home / ".instance.lock")
+    try:
+        lock.acquire()
+        store.load()
+        acknowledge_restore(store.database_path)
+        typer.echo("Current configuration acknowledged; the collector may now start.")
+    except Exception as exc:
+        raise ClickException(_error_detail(exc)) from exc
     finally:
         lock.release()
 
@@ -338,6 +490,8 @@ async def _run_monitor(store: ConfigStore, stop: asyncio.Event | None = None) ->
     monitor = None
     run_id = None
     notifications = None
+    application = None
+    control_server = None
     clean_shutdown = False
     stop = stop or asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -350,8 +504,39 @@ async def _run_monitor(store: ConfigStore, stop: asyncio.Event | None = None) ->
             pass
     try:
         await repository.initialize()
+        require_reviewed_restore(store.database_path)
         run_id = (await repository.start_run(__version__)).id
-        monitor = _build_monitor(config, repository)
+        planner = _ProbePlanner(repository=repository)
+        monitor = _build_monitor(config, repository, planner=planner)
+
+        async def reconfigure(candidate: AppConfig) -> None:
+            nonlocal config, notifications
+            await planner.activate(monitor, planner.prepare(candidate))
+            await asyncio.to_thread(
+                NotificationOutbox(store.database_path, candidate.notifications).configure
+            )
+            if notifications is not None:
+                notifications.cancel()
+                with suppress(asyncio.CancelledError):
+                    await notifications
+            notifications = (
+                asyncio.create_task(
+                    NotificationOutbox(store.database_path, candidate.notifications).run()
+                )
+                if candidate.notifications.local or candidate.notifications.webhook
+                else None
+            )
+            config = candidate
+
+        application = ApplicationService(store, repository, monitor, reconfigure, stop)
+        await repository.recover_incomplete_investigations()
+        control_server = ControlServer(application)
+        await application.recover_jobs()
+        if not stop.is_set():
+            await control_server.start()
+        await asyncio.to_thread(
+            NotificationOutbox(store.database_path, config.notifications).configure
+        )
         await monitor.start()
         if config.notifications.local or config.notifications.webhook:
             notifications = asyncio.create_task(
@@ -361,6 +546,10 @@ async def _run_monitor(store: ConfigStore, stop: asyncio.Event | None = None) ->
         await stop.wait()
         clean_shutdown = True
     finally:
+        if control_server is not None:
+            await control_server.close()
+        if application is not None:
+            await application.close()
         if notifications is not None:
             notifications.cancel()
             with suppress(asyncio.CancelledError):
@@ -376,12 +565,41 @@ async def _run_monitor(store: ConfigStore, stop: asyncio.Event | None = None) ->
 
 @app.command("attach")
 def attach_command(
-    tui: Annotated[bool, typer.Option("--tui", help="Open an independent read-only TUI.")] = False,
+    tui: Annotated[bool, typer.Option("--tui", help="Open an independent TUI.")] = False,
+    control: Annotated[
+        bool,
+        typer.Option(
+            "--control", help="Operate through the running owner without stopping collection."
+        ),
+    ] = False,
 ) -> None:
     """Read the active collector's stored health without owning or starting a writer."""
 
     async def inspect() -> None:
         store = ConfigStore()
+        if control:
+            if not tui:
+                raise ValueError("--control requires --tui")
+            from typing import cast
+
+            from .ui.app import DataRepository, Monitor
+
+            client = ControlClient(store.home)
+            await client.connect()
+            remote_repository = RemoteRepository(client)
+            remote = RemoteApplication(client, remote_repository)
+            viewer = SocketClawApp(
+                AppServices(
+                    config_store=store,
+                    monitor=cast(Monitor, RemoteMonitor(client)),
+                    repository=cast(DataRepository, remote_repository),
+                    investigate=remote.investigate,
+                    application=remote,
+                    attached=True,
+                )
+            )
+            await viewer.run_async(inline=True, inline_no_clear=True)
+            return
         repository = Repository(store.database_path, read_only=True)
         try:
             plan = _ProbePlanner(repository=repository).prepare(store.load())
@@ -403,15 +621,69 @@ def attach_command(
         raise ClickException(f"Cannot attach read-only: {_error_detail(exc)}") from exc
 
 
-@app.command("notification-status")
-def notification_status_command() -> None:
-    """Inspect delivery failures separately from detector and collector health."""
-    store = ConfigStore()
-    outbox = NotificationOutbox(store.database_path, store.load().notifications)
+@app.command("monitor-stop")
+def monitor_stop_command() -> None:
+    """Ask the owner to stop cleanly. Closing a viewer does not stop it."""
     try:
-        typer.echo(json.dumps(outbox.status(), indent=2))
-    except (OSError, ValueError, sqlite3.Error) as exc:
+        asyncio.run(ControlClient(ConfigStore().home).call("owner.stop"))
+        typer.echo("Collector shutdown requested.")
+    except Exception as exc:
+        raise ClickException(_error_detail(exc)) from exc
+
+
+@app.command("notification-status")
+def notification_status_command(
+    details: Annotated[bool, typer.Option("--details")] = False,
+    reconcile: Annotated[
+        str | None, typer.Option("--reconcile", help="send or skip uncertain historical alerts")
+    ] = None,
+    delivery: Annotated[str | None, typer.Option("--delivery")] = None,
+    cancel: Annotated[bool, typer.Option("--cancel")] = False,
+    retry_original: Annotated[bool, typer.Option("--retry-original")] = False,
+) -> None:
+    """Inspect deliveries or explicitly resolve uncertain/held notifications."""
+    store = ConfigStore()
+    lock = _ApplicationLock(store.home / ".instance.lock")
+    try:
+        outbox = NotificationOutbox(store.database_path, store.load().notifications)
+        if reconcile not in {None, "send", "skip"}:
+            raise ValueError("--reconcile must be send or skip")
+        if reconcile is not None and delivery is not None:
+            raise ValueError("Choose a history decision or a delivery decision")
+        if (cancel or retry_original) and delivery is None:
+            raise ValueError("Select --delivery first")
+        if delivery is not None and cancel == retry_original:
+            raise ValueError("Choose exactly one of --cancel or --retry-original")
+        method = (
+            "notification.reconcile"
+            if reconcile is not None
+            else "notification.resolve"
+            if delivery
+            else None
+        )
+        params = (
+            {"send_history": reconcile == "send"}
+            if reconcile is not None
+            else {"identifier": delivery, "cancel": cancel}
+        )
+        if method:
+            if (store.home / "control.sock").exists():
+                asyncio.run(ControlClient(store.home).call(method, params))
+            else:
+                lock.acquire()
+                if reconcile is not None:
+                    outbox.reconcile(send_history=reconcile == "send")
+                else:
+                    assert delivery is not None
+                    outbox.resolve_delivery(delivery, cancel=cancel)
+        result = outbox.status()
+        if details:
+            result["deliveries"] = outbox.details()
+        typer.echo(json.dumps(result, indent=2))
+    except Exception as exc:
         raise ClickException(f"Cannot inspect notification delivery: {_error_detail(exc)}") from exc
+    finally:
+        lock.release()
 
 
 @app.command("service-template")
@@ -507,10 +779,12 @@ async def _run_tui(store: ConfigStore) -> None:
     monitor: MonitorService | None = None
     clean_shutdown = False
     notifications: asyncio.Task[None] | None = None
+    application: ApplicationService | None = None
     failure: BaseException | None = None
     try:
         active_config = store.load()
         await repository.initialize()
+        require_reviewed_restore(store.database_path)
         run_id = (await repository.start_run(__version__)).id
         planner = _ProbePlanner(repository=repository)
         monitor = _build_monitor(active_config, repository, planner=planner)
@@ -521,6 +795,9 @@ async def _run_tui(store: ConfigStore) -> None:
                 candidate = planner.prepare(config)
                 await planner.activate(monitor, candidate)
             if config.notifications != active_config.notifications:
+                await asyncio.to_thread(
+                    NotificationOutbox(store.database_path, config.notifications).configure
+                )
                 if notifications is not None:
                     notifications.cancel()
                     with suppress(asyncio.CancelledError):
@@ -534,16 +811,23 @@ async def _run_tui(store: ConfigStore) -> None:
                 )
             active_config = config
 
+        await asyncio.to_thread(
+            NotificationOutbox(store.database_path, active_config.notifications).configure
+        )
         if active_config.notifications.local or active_config.notifications.webhook:
             notifications = asyncio.create_task(
                 NotificationOutbox(store.database_path, active_config.notifications).run()
             )
+        application = ApplicationService(store, repository, monitor, reconfigure)
+        await application.recover_jobs()
         socketclaw = SocketClawApp(
             AppServices(
                 config_store=store,
                 monitor=monitor,
                 repository=repository,
                 reconfigure=reconfigure,
+                application=application,
+                investigate=application.investigate,
             )
         )
         await socketclaw.run_async(inline=True, inline_no_clear=True)
@@ -552,6 +836,8 @@ async def _run_tui(store: ConfigStore) -> None:
         failure = exc
 
     cleanup_error: BaseException | None = None
+    if application is not None:
+        await application.close()
     if notifications is not None:
         notifications.cancel()
         with suppress(asyncio.CancelledError):

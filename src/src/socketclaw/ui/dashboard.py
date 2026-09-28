@@ -266,6 +266,10 @@ class DashboardScreen(ResponsiveScreen[None]):
         }
         if value in destinations:
             self.show_view(destinations[value])
+        elif value == "/stop-monitor":
+            app.action_stop_collector()
+        elif value == "/storage":
+            app.action_storage()
         elif value == "/logs":
             await app.action_log_status()
         elif value == "/pause":
@@ -315,6 +319,10 @@ class DashboardScreen(ResponsiveScreen[None]):
             marker = "● LIVE"
             state_class = ""
         widget = self.query_one("#run-state", Static)
+        if self.services.attached:
+            marker = "CONTROL / " + marker
+            if status.last_error and not status.running:
+                marker = "CONTROL / DISCONNECTED"
         widget.update(marker)
         widget.set_classes(state_class)
 

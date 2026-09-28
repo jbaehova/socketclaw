@@ -141,6 +141,14 @@ class FakeRepository:
             ]
         return rows[query.offset : query.offset + query.limit]
 
+    async def latest_service_observations(self, service_ids):
+        result = {}
+        for event in sorted(self.events_data, key=lambda item: item.observed_at, reverse=True):
+            identifier = event.evidence.get("service_id")
+            if identifier in service_ids and identifier not in result:
+                result[identifier] = event
+        return result
+
     async def get_event(self, event_id: UUID) -> StoredEvent | None:
         return next((row for row in self.events_data if row.id == event_id), None)
 

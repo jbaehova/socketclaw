@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import ClassVar, Protocol, cast
 
-from textual import on
+from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.widgets import Button, DataTable, Static
@@ -41,6 +41,8 @@ class HealthScreen(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         yield Static("HEALTH / Enter inspects a probe / Esc returns", markup=False)
         yield Static("", id="health-summary", markup=False)
+        if socketclaw_app(self).services.application is not None:
+            yield Static("Notification status loading", id="notification-health", markup=False)
         yield DataTable(id="health-table", cursor_type="row", zebra_stripes=True)
         yield Static(
             "Stale: no successful poll within 3 intervals (minimum 10 seconds).\n"
@@ -57,6 +59,29 @@ class HealthScreen(ModalScreen[None]):
         self.refresh_health()
         table.focus()
         self.set_interval(1, self.refresh_health)
+        if socketclaw_app(self).services.application is not None:
+            self.refresh_notifications()
+            self.set_interval(2, self.refresh_notifications)
+
+    @work(exclusive=True, group="notification-health")
+    async def refresh_notifications(self) -> None:
+        application = socketclaw_app(self).services.application
+        if application is None:
+            return
+        try:
+            health = await application.execute("health.get", {})
+            state = health["notifications"]
+            message = (
+                f"Alerts: {state['worker_state']} / pending {state['pending']} / "
+                f"failed {state['failed']} / held {state['held']} / "
+                f"history {state['reconciliation']}"
+            )
+            if health.get("configuration_error"):
+                message += "\n" + health["configuration_error"]
+        except Exception as exc:
+            message = f"Alerts: unavailable ({type(exc).__name__}); delivery status is unknown"
+        if self.is_mounted:
+            self.query_one("#notification-health", Static).update(safe_text(message))
 
     def refresh_health(self) -> None:
         if socketclaw_app(self).screen is not self:

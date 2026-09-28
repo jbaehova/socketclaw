@@ -194,7 +194,7 @@ class SettingsView(Vertical):
             }
             if replacement_key:
                 await app.services.validate_key(replacement_key)
-                app.services.config_store.save_api_key(replacement_key)
+                await app.save_api_key(replacement_key)
             try:
 
                 def merge(current: AppConfig) -> AppConfig:
@@ -212,9 +212,9 @@ class SettingsView(Vertical):
             except BaseException:
                 if replacement_key:
                     if previous_key is None:
-                        app.services.config_store.clear_api_key()
+                        await app.save_api_key(None)
                     else:
-                        app.services.config_store.save_api_key(previous_key)
+                        await app.save_api_key(previous_key)
                 raise
         except SettingsConflict as exc:
             self._show_state(str(exc), error=True)

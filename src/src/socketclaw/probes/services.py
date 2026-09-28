@@ -20,6 +20,11 @@ ServiceState = Literal["available", "closed", "unknown", "http_mismatch"]
 ServiceCheck = Callable[[ServiceConfig], Awaitable[tuple[ServiceState, str]]]
 
 
+def service_scope(service: ServiceConfig) -> str:
+    policy = service.model_dump(mode="json", exclude={"name", "interval"})
+    return hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
+
+
 class ServiceProbe:
     def __init__(self, repository: Repository, *, check: ServiceCheck | None = None) -> None:
         self.repository = repository
@@ -27,8 +32,7 @@ class ServiceProbe:
 
     async def collect(self, service: ServiceConfig) -> ProbeBatch:
         checkpoint = await self.repository.load_checkpoint(f"service:{service.id}")
-        policy = service.model_dump(mode="json", exclude={"name", "interval", "timeout"})
-        scope = hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
+        scope = service_scope(service)
         prior = checkpoint.state if checkpoint.state.get("scope") == scope else {}
         status, detail = await self.check(service)
         available = status == "available"
@@ -59,6 +63,7 @@ class ServiceProbe:
             else ObservationOutcome.UNREACHABLE,
             evidence={
                 "service_id": service.id,
+                "service_scope_hash": scope,
                 "service_name": service.name,
                 "endpoint": endpoint,
                 "status": status,

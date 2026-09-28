@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import ClassVar, Protocol
 from uuid import UUID
 
+from textual import work
 from textual.app import App, SystemCommand
 from textual.binding import Binding, BindingType
 from textual.events import Resize
@@ -23,6 +24,7 @@ from ..config import AppConfig, ConfigStore
 from ..context import IncidentContext, build_incident_context
 from ..domain import InvestigationResult, SecurityEvent
 from ..export import export_incident_markdown, export_markdown, write_managed_export
+from ..gateway import ApplicationGateway
 from ..incident_store import IncidentStore
 from ..monitor import MonitorStatus
 from ..openai import ModelAccess, OpenAIClient, redact_secrets
@@ -71,6 +73,10 @@ class DataRepository(Protocol):
     async def load_checkpoint(self, probe_id: str) -> CheckpointChange: ...
 
     async def list_events(self, query: EventQuery | None = None) -> list[StoredEvent]: ...
+
+    async def latest_service_observations(
+        self, service_ids: Collection[str]
+    ) -> dict[str, StoredEvent]: ...
 
     async def get_event(self, event_id: UUID) -> StoredEvent | None: ...
 
@@ -160,6 +166,8 @@ class AppServices:
     repository: DataRepository | None = None
     investigate: InvestigationRunner | None = None
     reconfigure: ConfigReconfigurer | None = None
+    application: ApplicationGateway | None = None
+    attached: bool = False
 
 
 class SocketClawApp(App[None]):
@@ -272,9 +280,11 @@ class SocketClawApp(App[None]):
     async def on_mount(self) -> None:
         onboarding_complete = self.services.config_store.config_path.exists()
         self.config = self.services.config_store.load()
+        if self.services.attached:
+            self.sub_title = "CONTROL CONNECTION / closing this window keeps collection running"
         self._apply_theme(self.config.theme)
         recovery_error: str | None = None
-        if self.services.repository is not None:
+        if self.services.repository is not None and not self.services.attached:
             try:
                 await self.services.repository.recover_incomplete_investigations()
             except Exception as exc:
@@ -292,6 +302,25 @@ class SocketClawApp(App[None]):
             )
             return
         await self._open_dashboard(startup_warning=recovery_error)
+        if self.services.attached:
+            self.set_interval(2, self._refresh_owner_config)
+
+    @work(exclusive=True, group="owner-config-refresh")
+    async def _refresh_owner_config(self) -> None:
+        application = self.services.application
+        if application is None:
+            return
+        try:
+            saved = await application.execute("config.get", {})
+            candidate = AppConfig.model_validate(saved["config"])
+            if candidate != self.config:
+                self.config = candidate
+                self._apply_theme(candidate.theme)
+                for screen in self.screen_stack:
+                    if isinstance(screen, DashboardScreen):
+                        screen.apply_config(candidate)
+        except Exception:
+            pass  # Owner connection state is shown by RemoteMonitor.
 
     async def complete_onboarding(self, config: AppConfig, api_key: str | None) -> None:
         previous = self.config
@@ -344,22 +373,33 @@ class SocketClawApp(App[None]):
     async def _save_config_locked(self, config: AppConfig) -> None:
         previous = self.config
         config_existed = self.services.config_store.config_path.exists()
-        self.services.config_store.save(config)
-        if self.services.reconfigure is not None:
-            try:
-                await self.services.reconfigure(config)
-            except BaseException:
-                if config_existed:
-                    self.services.config_store.save(previous)
-                else:
-                    self.services.config_store.config_path.unlink(missing_ok=True)
-                with suppress(BaseException):
-                    await self.services.reconfigure(previous)
-                raise
+        if self.services.application is not None:
+            config = await self.services.application.save_config(config, previous)
+        else:
+            self.services.config_store.save(config)
+            if self.services.reconfigure is not None:
+                try:
+                    await self.services.reconfigure(config)
+                except BaseException:
+                    if config_existed:
+                        self.services.config_store.save(previous)
+                    else:
+                        self.services.config_store.config_path.unlink(missing_ok=True)
+                    with suppress(BaseException):
+                        await self.services.reconfigure(previous)
+                    raise
         self.config = config
         self._apply_theme(config.theme)
         if isinstance(self.screen, DashboardScreen):
             self.screen.apply_config(config)
+
+    async def save_api_key(self, key: str | None) -> None:
+        if self.services.application is not None:
+            await self.services.application.execute("credential.set", {"key": key})
+        elif key is None:
+            self.services.config_store.clear_api_key()
+        else:
+            self.services.config_store.save_api_key(key)
 
     async def investigation_context(self, event_id: UUID) -> IncidentContext:
         repository = self.services.repository
@@ -505,6 +545,11 @@ class SocketClawApp(App[None]):
         return None
 
     async def export_incident(self, identifier: UUID) -> Path:
+        if self.services.application is not None:
+            result = await self.services.application.execute(
+                "export.request", {"identifier": str(identifier)}
+            )
+            return Path(await self.services.application.wait_operation(result))
         repository = self.services.repository
         if repository is None:
             raise RuntimeError("Incident storage is unavailable")
@@ -521,6 +566,11 @@ class SocketClawApp(App[None]):
         )
 
     async def export_event(self, event_id: UUID) -> Path:
+        if self.services.application is not None:
+            result = await self.services.application.execute(
+                "export.request", {"identifier": str(event_id), "incident": False}
+            )
+            return Path(await self.services.application.wait_operation(result))
         repository = self.services.repository
         if repository is None:
             raise RuntimeError("Event storage is unavailable")
@@ -605,6 +655,12 @@ class SocketClawApp(App[None]):
     def get_system_commands(self, screen: Screen[object]) -> Iterable[SystemCommand]:
         yield from super().get_system_commands(screen)  # pyright: ignore[reportUnknownMemberType]
         if isinstance(screen, DashboardScreen):
+            if self.services.application is not None:
+                yield SystemCommand(
+                    "Storage and notifications",
+                    "Preview cleanup, manage jobs and inspect deliveries",
+                    self.action_storage,
+                )
             yield SystemCommand(
                 "Incident desk", "Review and resolve correlated incidents", self.action_incidents
             )
@@ -622,6 +678,33 @@ class SocketClawApp(App[None]):
             yield SystemCommand(
                 "Log sources", "Inspect committed log progress", self.action_log_status
             )
+
+    def action_stop_collector(self) -> None:
+        from .operations import StopCollectorScreen
+
+        def confirm(value: bool | None) -> None:
+            self._confirm_stop_collector(value)
+
+        self.push_screen(StopCollectorScreen(), confirm)
+
+    @work(group="stop-owner")
+    async def _confirm_stop_collector(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            return
+        if self.services.attached and self.services.application is not None:
+            try:
+                await self.services.application.execute("owner.stop", {})
+                self.notify("Collector shutdown requested. This viewer can be closed.")
+            except Exception as exc:
+                self.notify(str(exc), severity="error")
+        else:
+            await self.action_quit()
+
+    def action_storage(self) -> None:
+        from .operations import OperationsScreen
+
+        if self.services.application is not None:
+            self.push_screen(OperationsScreen())
 
     def action_maintenance(self) -> None:
         from .suppressions import MaintenanceScreen

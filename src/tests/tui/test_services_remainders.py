@@ -125,7 +125,8 @@ async def test_service_measured_state_and_repeated_check_guard(app_factory) -> N
         await pilot.pause()
         view = await open_services(fixture.app, pilot)
         row = view.query_one("#services-table", DataTable).get_row_at(0)
-        assert "closed confirmed" in row
+        assert row[2].startswith("closed confirmed")
+        assert "legacy policy unknown" in row[2]
         view.check_service()
         await started.wait()
         view.check_service()

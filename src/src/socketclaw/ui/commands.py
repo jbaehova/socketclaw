@@ -21,11 +21,13 @@ COMMANDS = (
     ("/investigations", "Read AI investigations"),
     ("/settings", "Edit configuration"),
     ("/health", "Check collection health"),
+    ("/storage", "History cleanup and notification status"),
     ("/rules", "Edit detection rules"),
     ("/theme terminal", "Use your terminal colors"),
     ("/theme light", "Light appearance"),
     ("/theme dark", "Dark appearance"),
     ("/pause", "Pause or resume monitoring"),
+    ("/stop-monitor", "Confirm collector shutdown"),
     ("/help", "Keyboard reference"),
     ("/quit", "End this session"),
 )

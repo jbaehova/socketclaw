@@ -441,6 +441,11 @@ def test_launch_records_clean_run_and_reconfigures_existing_monitor(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    from unittest.mock import AsyncMock
+
+    from socketclaw.application import ApplicationService
+
+    monkeypatch.setattr(ApplicationService, "recover_jobs", AsyncMock())
     operations: list[str] = []
     run_id = uuid4()
 
@@ -508,6 +513,11 @@ def test_launch_records_unclean_run_and_closes_repository(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    from unittest.mock import AsyncMock
+
+    from socketclaw.application import ApplicationService
+
+    monkeypatch.setattr(ApplicationService, "recover_jobs", AsyncMock())
     operations: list[str] = []
     run_id = uuid4()
 
@@ -563,6 +573,11 @@ def test_monitor_stop_failure_still_terminates_run_and_closes_repository(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    from unittest.mock import AsyncMock
+
+    from socketclaw.application import ApplicationService
+
+    monkeypatch.setattr(ApplicationService, "recover_jobs", AsyncMock())
     operations: list[str] = []
     run_id = uuid4()
 
