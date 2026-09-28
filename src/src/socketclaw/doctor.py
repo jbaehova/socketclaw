@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Literal
 
 from .config import ConfigError, ConfigStore
+from .notifications import NotificationOutbox
 from .openai import redact_secrets
 from .storage import Repository
 
@@ -124,6 +125,34 @@ async def inspect_environment(
             )
         )
         checks.append(_log_paths_check(config.log_paths))
+        if config.notifications.local or config.notifications.webhook:
+            try:
+                notification = await asyncio.to_thread(
+                    NotificationOutbox(store.database_path, config.notifications).status
+                )
+                needs_attention = (
+                    notification["worker_state"] != "running"
+                    or notification["failed"]
+                    or notification["reconciliation"] == "required"
+                )
+                checks.append(
+                    DiagnosticCheck(
+                        "Notifications",
+                        "warn" if needs_attention else "pass",
+                        f"worker={notification['worker_state']}; "
+                        f"pending={notification['pending']}; "
+                        f"failed={notification['failed']}; "
+                        f"history={notification['reconciliation']}",
+                    )
+                )
+            except Exception:
+                checks.append(
+                    DiagnosticCheck(
+                        "Notifications",
+                        "warn",
+                        "Delivery status unavailable; inspect notification-status",
+                    )
+                )
 
     try:
         key = store.load_api_key()
@@ -166,6 +195,15 @@ async def inspect_environment(
                 blocking=True,
             )
     checks.append(database_check)
+    if (store.home / "restore-journal.json").exists():
+        checks.append(
+            DiagnosticCheck(
+                "Restore recovery",
+                "fail",
+                "Interrupted restore; run db restore --recover-interrupted --apply",
+                blocking=True,
+            )
+        )
     checks.append(_inspect_command("ping", which))
     return DoctorReport(tuple(checks))
 

@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from . import __version__
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +81,13 @@ def recovery_backup(database: Path, version: int) -> MigrationBackup:
             "sha256": digest,
             "includes_private_evidence": True,
             "includes_api_key_file": False,
+            "config_sha256": hashlib.sha256(
+                (database.parent / "config.toml").read_bytes()
+            ).hexdigest()
+            if (database.parent / "config.toml").is_file()
+            else None,
+            "purpose": "migration",
+            "pinned": True,
         }
         # Exclusive creation prevents an existing file or symlink being overwritten.
         fd = os.open(manifest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -231,3 +238,21 @@ async def migrate_v4_to_v5(connection: AsyncConnection) -> None:
     await connection.exec_driver_sql(
         "CREATE TABLE retained_source_keys (source_key VARCHAR(200) PRIMARY KEY NOT NULL)"
     )
+
+
+async def migrate_v5_to_v6(connection: AsyncConnection) -> None:
+    """Add owner operations without changing historical evidence or scores."""
+    from .completion_schema import install_completion_schema
+
+    await connection.exec_driver_sql("ALTER TABLE events ADD COLUMN service_id VARCHAR(80)")
+    await connection.exec_driver_sql("ALTER TABLE events ADD COLUMN service_scope_hash VARCHAR(64)")
+    await connection.exec_driver_sql(
+        "UPDATE events SET service_id=json_extract(evidence_json, '$.service_id') "
+        "WHERE event_type IN ('service.available','service.failed','service.unknown') "
+        "AND json_type(evidence_json, '$.service_id')='text' "
+        "AND length(json_extract(evidence_json, '$.service_id')) BETWEEN 1 AND 80"
+    )
+    await connection.exec_driver_sql(
+        "CREATE INDEX ix_events_service_seq ON events(service_id, ingest_seq DESC)"
+    )
+    await install_completion_schema(connection)

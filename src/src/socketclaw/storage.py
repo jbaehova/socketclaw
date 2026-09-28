@@ -99,10 +99,12 @@ from .migrations import (
     migrate_v2_to_v3,
     migrate_v3_to_v4,
     migrate_v4_to_v5,
+    migrate_v5_to_v6,
     recovery_backup,
 )
 from .response_actions import ActionRecord
 from .rules import RuleConfig, RuleVersion
+from .unit_of_work import CommandSession
 
 _EVIDENCE_MAX_BYTES = 32 * 1024
 _PORT_EVIDENCE_MAX_BYTES = 512 * 1024
@@ -188,6 +190,7 @@ class EventRow(Base):
         Index("ix_events_observed_at", "observed_at"),
         Index("ix_events_severity", "severity"),
         Index("ix_events_source", "source"),
+        Index("ix_events_service_seq", "service_id", "ingest_seq"),
         Index("ix_events_target", "target"),
         Index("ix_events_ingest_seq", "ingest_seq", unique=True),
         Index("ix_events_source_key", "source_key", unique=True),
@@ -196,6 +199,8 @@ class EventRow(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    service_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    service_scope_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     observed_at: Mapped[str] = mapped_column(String(40), nullable=False)
     ingest_seq: Mapped[int] = mapped_column(Integer, nullable=False)
     ingested_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
@@ -522,12 +527,23 @@ class Repository:
             url,
             echo=False,
         )
-        self._sessions = async_sessionmaker(self._engine, expire_on_commit=False)
+        self._sessions: async_sessionmaker[AsyncSession] = async_sessionmaker(
+            self._engine, expire_on_commit=False, class_=CommandSession
+        )
         self.incidents = IncidentStore(self._sessions)
         event.listen(self._engine.sync_engine, "connect", _configure_sqlite)
 
+    @property
+    def sessions(self) -> async_sessionmaker[AsyncSession]:
+        """Owner command unit-of-work factory; clients never receive this object."""
+        return self._sessions
+
     async def initialize(self) -> None:
         """Initialize a new home or migrate existing data under the owner's lock."""
+        if (self.database_path.parent / "restore-journal.json").exists():
+            raise RuntimeError(
+                "Interrupted restore: run db restore --recover-interrupted --apply before starting"
+            )
         if self.read_only:
             raise RuntimeError("Cannot initialize or migrate a read-only repository")
         _validate_database_files(self.database_path)
@@ -547,6 +563,9 @@ class Repository:
                 version = await self._schema_version(connection)
                 if version is None:
                     await connection.run_sync(Base.metadata.create_all)
+                    from .completion_schema import install_completion_schema
+
+                    await install_completion_schema(connection)
                     await connection.execute(
                         sqlite_insert(SchemaMetaRow),
                         [
@@ -570,6 +589,7 @@ class Repository:
                             3: migrate_v2_to_v3,
                             4: migrate_v3_to_v4,
                             5: migrate_v4_to_v5,
+                            6: migrate_v5_to_v6,
                         }[destination]
                         await migration(connection)
                         await connection.execute(
@@ -1420,6 +1440,24 @@ class Repository:
                 next_before=items[-1].event.ingest_seq if more else None,
             )
 
+    async def latest_service_observations(
+        self, service_ids: Collection[str]
+    ) -> dict[str, StoredEvent]:
+        """Read the latest measurement for each service independently of other traffic."""
+        if not service_ids:
+            return {}
+        await self.require_current_schema()
+        latest = (
+            select(func.max(EventRow.ingest_seq).label("seq"))
+            .where(EventRow.service_id.in_(service_ids))
+            .group_by(EventRow.service_id)
+        )
+        async with self._sessions() as session:
+            rows = await session.scalars(select(EventRow).where(EventRow.ingest_seq.in_(latest)))
+            return {
+                row.service_id: _stored_event(row) for row in rows if row.service_id is not None
+            }
+
     async def get_event(self, event_id: UUID) -> StoredEvent | None:
         async with self._sessions() as session:
             row = await session.get(EventRow, str(event_id))
@@ -1774,6 +1812,11 @@ class Repository:
             )
             await session.commit()
             return len(rows)
+
+    async def get_investigation(self, identifier: UUID) -> StoredInvestigation | None:
+        async with self._sessions() as session:
+            row = await session.get(InvestigationRow, str(identifier))
+            return _stored_investigation(row) if row else None
 
     async def list_investigations(
         self,
@@ -2145,6 +2188,13 @@ def _event_row(security_event: SecurityEvent, detection: DetectionResult) -> Eve
         raise ValueError(f"event evidence must not exceed {evidence_limit} UTF-8 bytes")
     return EventRow(
         id=str(normalized.id),
+        service_id=str(normalized.evidence["service_id"])
+        if normalized.event_type in {"service.available", "service.failed", "service.unknown"}
+        and isinstance(normalized.evidence.get("service_id"), str)
+        else None,
+        service_scope_hash=str(normalized.evidence["service_scope_hash"])
+        if isinstance(normalized.evidence.get("service_scope_hash"), str)
+        else None,
         observed_at=_timestamp(normalized.observed_at),
         ingested_at=_timestamp(normalized.ingested_at or utc_now()),
         source_at=_timestamp(normalized.source_at) if normalized.source_at else None,
